@@ -330,7 +330,7 @@ for _ch_data in DIGIDOM_CHANNELS.values():
 # ============================================
 DATABASE_URL = os.environ.get('DATABASE_URL', 'postgresql://postgres:TyV4viBBvAiZiN7y@db.ywfwjvzdbbwgsisdpvlf.supabase.co:5432/postgres')
 # Connection pooler URL (more reliable on serverless/Railway — uses pgBouncer on port 6543)
-DATABASE_POOLER_URL = os.environ.get('DATABASE_POOLER_URL', 'postgresql://postgres.ywfwjvzdbbwgsisdpvlf:TyV4viBBvAiZiN7y@aws-0-us-east-1.pooler.supabase.com:6543/postgres')
+DATABASE_POOLER_URL = os.environ.get('DATABASE_POOLER_URL', 'postgresql://postgres.ywfwjvzdbbwgsisdpvlf:TyV4viBBvAiZiN7y@aws-1-ap-southeast-1.pooler.supabase.com:5432/postgres')
 # Supabase REST API (always-available fallback when direct Postgres fails)
 SUPABASE_REST_URL = os.environ.get('SUPABASE_URL', 'https://ywfwjvzdbbwgsisdpvlf.supabase.co')
 SUPABASE_REST_KEY = os.environ.get('SUPABASE_KEY', 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inl3ZndqdnpkYmJ3Z3Npc2RwdmxmIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzA1MzMyMTksImV4cCI6MjA4NjEwOTIxOX0.M50YzCj8-tkVBblGDjHXGpbEcEGZYvZuZk4PHmpJf8o')
