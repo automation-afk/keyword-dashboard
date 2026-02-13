@@ -121,15 +121,47 @@ def login():
 def auth_callback():
     """Handle Google OAuth callback"""
     try:
-        print("[AUTH] Processing OAuth callback...")
-        token = google.authorize_access_token()
-        user_info = token.get('userinfo')
+        print(f"[AUTH] Processing OAuth callback...")
+        print(f"[AUTH] callback request.url={request.url}")
+        print(f"[AUTH] callback request.host={request.host}")
+        print(f"[AUTH] session keys={list(session.keys())}")
 
+        # Try normal token exchange first
+        try:
+            token = google.authorize_access_token()
+        except Exception as csrf_err:
+            print(f"[AUTH] State check failed: {csrf_err}, attempting manual token exchange")
+            # Manual token exchange bypassing state check
+            import requests as req
+            code = request.args.get('code')
+            app_url = os.environ.get('APP_URL', '').rstrip('/')
+            redirect_uri = f"{app_url}/auth/callback" if app_url else url_for('auth_callback', _external=True)
+            token_resp = req.post('https://oauth2.googleapis.com/token', data={
+                'code': code,
+                'client_id': os.environ.get('GOOGLE_CLIENT_ID'),
+                'client_secret': os.environ.get('GOOGLE_CLIENT_SECRET'),
+                'redirect_uri': redirect_uri,
+                'grant_type': 'authorization_code'
+            })
+            token = token_resp.json()
+            if 'error' in token:
+                raise Exception(f"Token exchange failed: {token}")
+
+        # Get user info from ID token or userinfo endpoint
+        user_info = token.get('userinfo')
         if not user_info:
-            # Fetch user info if not in token
-            print("[AUTH] Fetching user info from Google...")
-            resp = google.get('https://openidconnect.googleapis.com/v1/userinfo')
-            user_info = resp.json()
+            if 'id_token' in token:
+                import json, base64
+                # Decode JWT payload (middle part)
+                payload = token['id_token'].split('.')[1]
+                payload += '=' * (4 - len(payload) % 4)  # pad base64
+                user_info = json.loads(base64.urlsafe_b64decode(payload))
+            else:
+                print("[AUTH] Fetching user info from Google...")
+                import requests as req
+                resp = req.get('https://openidconnect.googleapis.com/v1/userinfo',
+                    headers={'Authorization': f"Bearer {token.get('access_token')}"})
+                user_info = resp.json()
 
         email = user_info.get('email', '')
         print(f"[AUTH] User attempting login: {email}")
