@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Access Denied - Keyword Dashboard</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #e2e8f0;
+        }
+        .container {
+            text-align: center;
+            padding: 40px;
+            max-width: 500px;
+        }
+        .icon {
+            font-size: 64px;
+            margin-bottom: 24px;
+        }
+        h1 {
+            font-size: 2rem;
+            margin-bottom: 16px;
+            color: #f87171;
+        }
+        p {
+            color: #94a3b8;
+            margin-bottom: 12px;
+            line-height: 1.6;
+        }
+        .email {
+            background: rgba(248, 113, 113, 0.1);
+            border: 1px solid rgba(248, 113, 113, 0.3);
+            padding: 8px 16px;
+            border-radius: 8px;
+            color: #f87171;
+            font-family: monospace;
+            display: inline-block;
+            margin: 16px 0;
+        }
+        .allowed-domains {
+            background: rgba(71, 85, 105, 0.3);
+            padding: 16px;
+            border-radius: 12px;
+            margin: 24px 0;
+            text-align: left;
+        }
+        .allowed-domains h3 {
+            font-size: 0.9rem;
+            color: #94a3b8;
+            margin-bottom: 12px;
+        }
+        .allowed-domains ul {
+            list-style: none;
+        }
+        .allowed-domains li {
+            color: #4ade80;
+            padding: 4px 0;
+            font-family: monospace;
+        }
+        .allowed-domains li::before {
+            content: "✓ ";
+        }
+        .btn {
+            display: inline-block;
+            padding: 12px 24px;
+            background: linear-gradient(135deg, #3b82f6, #2563eb);
+            color: white;
+            text-decoration: none;
+            border-radius: 8px;
+            font-weight: 600;
+            margin-top: 24px;
+            transition: transform 0.2s;
+        }
+        .btn:hover {
+            transform: translateY(-2px);
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="icon">🔒</div>
+        <h1>Access Denied</h1>
+        <p>Your email address is not authorized to access this application.</p>
+
+        <div class="email">{{ email }}</div>
+
+        {% if allowed_domains %}
+        <div class="allowed-domains">
+            <h3>Authorized domains:</h3>
+            <ul>
+                {% for domain in allowed_domains %}
+                <li>@{{ domain }}</li>
+                {% endfor %}
+            </ul>
+        </div>
+        {% endif %}
+
+        <p>Please sign in with an authorized account or contact your administrator.</p>
+
+        <a href="/logout" class="btn">Try Different Account</a>
+    </div>
+</body>
+</html>

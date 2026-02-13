@@ -1,0 +1,7371 @@
+from flask import Flask, render_template, jsonify, request, Response, redirect, url_for, session
+import csv
+import json
+import os
+import requests
+import base64
+import time
+import urllib.request
+from datetime import datetime
+import psycopg2
+import psycopg2.extras
+from functools import wraps
+from authlib.integrations.flask_client import OAuth
+from werkzeug.middleware.proxy_fix import ProxyFix
+from apscheduler.schedulers.background import BackgroundScheduler
+
+app = Flask(__name__)
+
+# Fix for running behind Railway's proxy - ensures correct URL generation
+app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
+
+# ============================================
+# SESSION & SECURITY CONFIG
+# ============================================
+app.secret_key = os.environ.get('FLASK_SECRET_KEY', os.urandom(24).hex())
+
+# ============================================
+# GOOGLE OAUTH CONFIG
+# ============================================
+# Set these in Railway environment variables:
+# GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, ALLOWED_DOMAINS
+
+oauth = OAuth(app)
+google = oauth.register(
+    name='google',
+    client_id=os.environ.get('GOOGLE_CLIENT_ID'),
+    client_secret=os.environ.get('GOOGLE_CLIENT_SECRET'),
+    server_metadata_url='https://accounts.google.com/.well-known/openid-configuration',
+    client_kwargs={
+        'scope': 'openid email profile'
+    },
+    authorize_params={
+        'prompt': 'select_account',
+        'access_type': 'offline'
+    }
+)
+
+# Allowed email domains (comma-separated in env var)
+# Example: ALLOWED_DOMAINS=mycompany.com,partner.com
+_raw_domains = os.environ.get('ALLOWED_DOMAINS', '').strip('"\'')  # Strip quotes if accidentally included
+ALLOWED_DOMAINS = [d.strip().lower().strip('"\'') for d in _raw_domains.split(',') if d.strip()]
+print(f"[AUTH] Allowed domains: {ALLOWED_DOMAINS}")
+
+# ============================================
+# AUTH HELPERS
+# ============================================
+def login_required(f):
+    """Decorator to require login for routes"""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        # Skip auth if no OAuth configured (for local dev)
+        if not os.environ.get('GOOGLE_CLIENT_ID'):
+            return f(*args, **kwargs)
+
+        if 'user' not in session:
+            # For API routes, return 401
+            if request.path.startswith('/api/'):
+                return jsonify({'success': False, 'error': 'Authentication required'}), 401
+            # For page routes, redirect to login
+            return redirect(url_for('login'))
+        return f(*args, **kwargs)
+    return decorated_function
+
+def is_domain_allowed(email):
+    """Check if email domain is in allowed list"""
+    if not ALLOWED_DOMAINS:
+        print(f"[AUTH] No domain restrictions configured, allowing all")
+        return True  # No restrictions if not configured
+    domain = email.split('@')[-1].lower().strip()
+    allowed = domain in ALLOWED_DOMAINS
+    print(f"[AUTH] Checking domain '{domain}' against {ALLOWED_DOMAINS} -> {'ALLOWED' if allowed else 'DENIED'}")
+    return allowed
+
+def get_current_user():
+    """Get current logged-in user info"""
+    return session.get('user', None)
+
+# ============================================
+# AUTH ROUTES
+# ============================================
+@app.route('/login')
+def login():
+    """Initiate Google OAuth login"""
+    if not os.environ.get('GOOGLE_CLIENT_ID'):
+        # No OAuth configured, auto-login for dev
+        return redirect(url_for('index'))
+
+    # Use explicit APP_URL if set, otherwise generate from request
+    app_url = os.environ.get('APP_URL', '').rstrip('/')
+    if app_url:
+        redirect_uri = f"{app_url}/auth/callback"
+    else:
+        redirect_uri = url_for('auth_callback', _external=True)
+
+    return google.authorize_redirect(redirect_uri)
+
+@app.route('/auth/callback')
+def auth_callback():
+    """Handle Google OAuth callback"""
+    try:
+        print("[AUTH] Processing OAuth callback...")
+        token = google.authorize_access_token()
+        user_info = token.get('userinfo')
+
+        if not user_info:
+            # Fetch user info if not in token
+            print("[AUTH] Fetching user info from Google...")
+            resp = google.get('https://openidconnect.googleapis.com/v1/userinfo')
+            user_info = resp.json()
+
+        email = user_info.get('email', '')
+        print(f"[AUTH] User attempting login: {email}")
+
+        # Check domain restriction
+        if not is_domain_allowed(email):
+            print(f"[AUTH] ACCESS DENIED for {email}")
+            return render_template('unauthorized.html',
+                email=email,
+                allowed_domains=ALLOWED_DOMAINS
+            ), 403
+
+        print(f"[AUTH] ACCESS GRANTED for {email}")
+
+        # Store user in session
+        session['user'] = {
+            'email': email,
+            'name': user_info.get('name', ''),
+            'picture': user_info.get('picture', '')
+        }
+
+        return redirect(url_for('index'))
+
+    except Exception as e:
+        import traceback
+        print(f"[AUTH] ERROR during authentication: {str(e)}")
+        print(f"[AUTH] Traceback: {traceback.format_exc()}")
+        return f"Authentication error: {str(e)}", 500
+
+@app.route('/logout')
+def logout():
+    """Log out user"""
+    session.pop('user', None)
+    return redirect(url_for('login'))
+
+@app.route('/api/auth/user')
+def get_user():
+    """Get current user info for frontend"""
+    user = get_current_user()
+    if user:
+        return jsonify({'authenticated': True, 'user': user})
+    return jsonify({'authenticated': False})
+
+# ============================================
+# API KEYS (set via environment variables in production)
+# ============================================
+AHREFS_API_KEY = os.environ.get('AHREFS_API_KEY', '').strip()
+KEYWORDS_EVERYWHERE_API_KEY = os.environ.get('KEYWORDS_EVERYWHERE_API_KEY', '').strip()
+SERPAPI_API_KEY = os.environ.get('SERPAPI_API_KEY', '72d5e93dbd8956798d692e1d03b8a912c4380a07902a99888942f45756a1d756').strip()
+DATAFORSEO_LOGIN = os.environ.get('DATAFORSEO_LOGIN', '').strip()
+DATAFORSEO_PASSWORD = os.environ.get('DATAFORSEO_PASSWORD', '').strip()
+YOUTUBE_API_KEY = os.environ.get('YOUTUBE_API_KEY', '').strip()  # For comprehensive channel video fetching
+
+# Log API key status on startup (without revealing the actual key)
+print(f"Keywords Everywhere API key configured: {bool(KEYWORDS_EVERYWHERE_API_KEY)} (length: {len(KEYWORDS_EVERYWHERE_API_KEY)})")
+print(f"DataForSEO configured: {bool(DATAFORSEO_LOGIN and DATAFORSEO_PASSWORD)}")
+print(f"YouTube Data API key configured: {bool(YOUTUBE_API_KEY)}")
+
+# ============================================
+# DATABASE SETUP (Supabase Postgres)
+# ============================================
+DATABASE_URL = os.environ.get('DATABASE_URL', 'postgresql://postgres:bky!o!TK6*8G@db.nqleuhmuhsnkcvherbku.supabase.co:5432/postgres')
+# Connection pooler URL (more reliable on serverless/Railway — uses pgBouncer on port 6543)
+DATABASE_POOLER_URL = os.environ.get('DATABASE_POOLER_URL', '')
+# Supabase REST API (always-available fallback when direct Postgres fails)
+SUPABASE_REST_URL = os.environ.get('SUPABASE_URL', 'https://nqleuhmuhsnkcvherbku.supabase.co')
+SUPABASE_REST_KEY = os.environ.get('SUPABASE_KEY', 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im5xbGV1aG11aHNua2N2aGVyYmt1Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzA4NTY4NTgsImV4cCI6MjA4NjQzMjg1OH0.fmToqAxwAyb_a5YA8zYAH6Y-B_hklgNHWmrq23JOVHA')
+# Keep DB_PATH for migration script reference
+DB_PATH = os.path.join(os.path.dirname(__file__), 'data', 'keyword_data.db')
+
+_last_db_error = None
+_db_unreachable_since = None  # Timestamp of first failure; skip retries for 60s
+
+
+def supabase_rest_select(table, select='*', filters=None, order=None, limit=None, offset=None):
+    """Query Supabase via REST API. Returns list of dicts or None on error."""
+    try:
+        url = f"{SUPABASE_REST_URL}/rest/v1/{table}?select={select}"
+        if filters:
+            for k, v in filters.items():
+                url += f"&{k}={v}"
+        if order:
+            url += f"&order={order}"
+        if limit:
+            url += f"&limit={limit}"
+        if offset:
+            url += f"&offset={offset}"
+
+        req = urllib.request.Request(url, headers={
+            'apikey': SUPABASE_REST_KEY,
+            'Authorization': f'Bearer {SUPABASE_REST_KEY}',
+            'Content-Type': 'application/json'
+        })
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read().decode())
+    except Exception as e:
+        print(f"[SUPABASE-REST] SELECT {table} error: {e}")
+        return None
+
+
+def supabase_rest_insert(table, rows, upsert=False):
+    """Insert rows into Supabase via REST API. rows = list of dicts. Returns True/False."""
+    try:
+        url = f"{SUPABASE_REST_URL}/rest/v1/{table}"
+        data = json.dumps(rows).encode()
+        headers = {
+            'apikey': SUPABASE_REST_KEY,
+            'Authorization': f'Bearer {SUPABASE_REST_KEY}',
+            'Content-Type': 'application/json',
+            'Prefer': 'return=minimal'
+        }
+        if upsert:
+            headers['Prefer'] = 'resolution=merge-duplicates,return=minimal'
+        req = urllib.request.Request(url, data=data, headers=headers, method='POST')
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return resp.status in (200, 201)
+    except Exception as e:
+        print(f"[SUPABASE-REST] INSERT {table} error: {e}")
+        return False
+
+def get_db():
+    """Get a Postgres database connection.
+    Tries: parsed direct URL → raw direct URL → pooler URL."""
+    global _last_db_error, _db_unreachable_since
+    from urllib.parse import urlparse, unquote
+
+    # Skip retries if DB was unreachable in the last 60 seconds (fast startup)
+    if _db_unreachable_since and (datetime.now() - _db_unreachable_since).total_seconds() < 60:
+        raise ConnectionError(f"[DB] Skipping (unreachable since {_db_unreachable_since.strftime('%H:%M:%S')}): {_last_db_error}")
+
+    errors = []
+
+    # Attempt 1: Parse and connect to direct URL
+    try:
+        parsed = urlparse(DATABASE_URL)
+        conn = psycopg2.connect(
+            host=parsed.hostname,
+            port=parsed.port or 5432,
+            dbname=parsed.path.lstrip('/') or 'postgres',
+            user=unquote(parsed.username or 'postgres'),
+            password=unquote(parsed.password or ''),
+            connect_timeout=5
+        )
+        conn.autocommit = False
+        _last_db_error = None
+        _db_unreachable_since = None
+        return conn
+    except Exception as e1:
+        errors.append(f"direct(parsed): {e1}")
+
+    # Attempt 2: Raw direct URL
+    try:
+        conn = psycopg2.connect(DATABASE_URL, connect_timeout=5)
+        conn.autocommit = False
+        _last_db_error = None
+        _db_unreachable_since = None
+        return conn
+    except Exception as e2:
+        errors.append(f"direct(raw): {e2}")
+
+    # Attempt 3: Connection pooler URL (pgBouncer port 6543)
+    if DATABASE_POOLER_URL:
+        try:
+            parsed = urlparse(DATABASE_POOLER_URL)
+            conn = psycopg2.connect(
+                host=parsed.hostname,
+                port=parsed.port or 6543,
+                dbname=parsed.path.lstrip('/') or 'postgres',
+                user=unquote(parsed.username or 'postgres'),
+                password=unquote(parsed.password or ''),
+                connect_timeout=5
+            )
+            conn.autocommit = False
+            _last_db_error = None
+            _db_unreachable_since = None
+            return conn
+        except Exception as e3:
+            errors.append(f"pooler: {e3}")
+
+    # All attempts failed
+    _last_db_error = '; '.join(errors)
+    _db_unreachable_since = datetime.now()
+    raise ConnectionError(f"[DB] All connection attempts failed: {_last_db_error}")
+
+def init_db():
+    """Initialize Postgres database tables"""
+    conn = get_db()
+    c = conn.cursor()
+
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS keyword_labels (
+            id SERIAL PRIMARY KEY,
+            keyword TEXT UNIQUE NOT NULL,
+            label TEXT DEFAULT 'none',
+            is_favorite BOOLEAN DEFAULT FALSE,
+            notes TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            label_updated_by TEXT,
+            favorite_updated_by TEXT,
+            notes_updated_by TEXT
+        )
+    ''')
+
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS researched_keywords (
+            id SERIAL PRIMARY KEY,
+            keyword TEXT NOT NULL,
+            seed_keyword TEXT,
+            source TEXT,
+            search_volume INTEGER,
+            keyword_difficulty DOUBLE PRECISION,
+            cpc DOUBLE PRECISION,
+            competition TEXT,
+            yt_total_views INTEGER,
+            yt_avg_views INTEGER,
+            yt_video_count INTEGER,
+            yt_top_channel TEXT,
+            yt_view_pattern TEXT,
+            revenue_potential DOUBLE PRECISION,
+            priority_score DOUBLE PRECISION,
+            opportunity_tier TEXT,
+            niche TEXT,
+            funnel_stage TEXT,
+            researched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(keyword, source)
+        )
+    ''')
+
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS revenue_data (
+            id SERIAL PRIMARY KEY,
+            keyword TEXT NOT NULL,
+            video_url TEXT,
+            video_views INTEGER,
+            affiliate_clicks INTEGER,
+            conversions INTEGER,
+            revenue DOUBLE PRECISION,
+            period_start DATE,
+            period_end DATE,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS ranking_history (
+            id SERIAL PRIMARY KEY,
+            keyword TEXT NOT NULL,
+            revenue DOUBLE PRECISION,
+            domination_score DOUBLE PRECISION,
+            positions_owned TEXT,
+            snapshot_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS domination_audits (
+            id SERIAL PRIMARY KEY,
+            audit_json TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS keyword_dom_targets (
+            keyword TEXT PRIMARY KEY,
+            target_dom_score INTEGER DEFAULT 100,
+            updated_by TEXT,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS keyword_yt_data (
+            id SERIAL PRIMARY KEY,
+            keyword TEXT UNIQUE NOT NULL,
+            yt_avg_views INTEGER,
+            yt_view_pattern TEXT,
+            yt_top_video_title TEXT,
+            yt_top_video_views INTEGER,
+            yt_top_video_channel TEXT,
+            yt_total_views INTEGER,
+            yt_video_count INTEGER,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS keyword_votes (
+            id SERIAL PRIMARY KEY,
+            keyword TEXT NOT NULL,
+            user_email TEXT NOT NULL,
+            user_name TEXT,
+            vote INTEGER NOT NULL DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(keyword, user_email)
+        )
+    ''')
+
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS keyword_comments (
+            id SERIAL PRIMARY KEY,
+            keyword TEXT NOT NULL,
+            user_email TEXT NOT NULL,
+            user_name TEXT,
+            comment TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS keyword_additions (
+            id SERIAL PRIMARY KEY,
+            keyword TEXT NOT NULL,
+            user_email TEXT NOT NULL,
+            user_name TEXT,
+            source TEXT DEFAULT 'manual',
+            source_detail TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(keyword, user_email)
+        )
+    ''')
+
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS keyword_trends (
+            id SERIAL PRIMARY KEY,
+            keyword TEXT UNIQUE NOT NULL,
+            trend TEXT DEFAULT 'unknown',
+            trend_change_pct DOUBLE PRECISION DEFAULT 0,
+            current_interest INTEGER DEFAULT 0,
+            data_points INTEGER DEFAULT 0,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS keywords_master (
+            id SERIAL PRIMARY KEY,
+            keyword TEXT UNIQUE NOT NULL,
+            niche TEXT DEFAULT '',
+            funnel TEXT DEFAULT '',
+            intent_type TEXT DEFAULT '',
+            volume INTEGER DEFAULT 0,
+            commission DOUBLE PRECISION DEFAULT 0,
+            revenue_potential DOUBLE PRECISION DEFAULT 0,
+            buying_intent INTEGER DEFAULT 0,
+            yt_avg_monthly_views INTEGER DEFAULT 0,
+            yt_view_pattern TEXT DEFAULT '',
+            priority_score DOUBLE PRECISION DEFAULT 0,
+            opportunity_tier TEXT DEFAULT '',
+            competition TEXT DEFAULT '',
+            content_angle TEXT DEFAULT '',
+            rationale TEXT DEFAULT '',
+            conversion_likelihood TEXT DEFAULT '',
+            time_to_convert TEXT DEFAULT '',
+            problem_type TEXT DEFAULT '',
+            urgency_score INTEGER DEFAULT 0,
+            yt_top_video_title TEXT DEFAULT '',
+            yt_top_video_views INTEGER DEFAULT 0,
+            yt_top_video_channel TEXT DEFAULT '',
+            added_by_email TEXT DEFAULT 'system',
+            added_by_name TEXT DEFAULT 'CSV Import',
+            source TEXT DEFAULT 'csv',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+
+    conn.commit()
+    conn.close()
+
+try:
+    init_db()
+except Exception as e:
+    print(f"[DB] Warning: Could not initialize DB (tables may already exist): {e}")
+
+# ============================================
+# CSV → DB MIGRATION (one-time import into Supabase)
+# ============================================
+def migrate_csv_to_db():
+    """Import CSV keywords into keywords_master table if not already done"""
+    try:
+        conn = get_db()
+    except Exception as e:
+        print(f"[MIGRATION] Cannot connect to DB, skipping: {e}")
+        return
+    c = conn.cursor()
+
+    c.execute('SELECT COUNT(*) FROM keywords_master')
+    if c.fetchone()[0] > 0:
+        print("[MIGRATION] keywords_master already populated, skipping CSV import")
+        conn.close()
+        return
+
+    csv_path = os.path.join(os.path.dirname(__file__), 'data', 'keywords.csv')
+    if not os.path.exists(csv_path):
+        print("[MIGRATION] CSV file not found, skipping")
+        conn.close()
+        return
+
+    imported = 0
+    with open(csv_path, 'r', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            keyword = row.get('keyword', '').strip()
+            if not keyword:
+                continue
+            try:
+                c.execute('''
+                    INSERT INTO keywords_master
+                    (keyword, niche, funnel, intent_type, volume, commission,
+                     revenue_potential, buying_intent, yt_avg_monthly_views, yt_view_pattern,
+                     priority_score, opportunity_tier, competition, content_angle, rationale,
+                     conversion_likelihood, time_to_convert, problem_type, urgency_score,
+                     yt_top_video_title, yt_top_video_views, yt_top_video_channel,
+                     added_by_email, added_by_name, source)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (keyword) DO NOTHING
+                ''', (
+                    keyword,
+                    row.get('niche', ''),
+                    row.get('funnel', ''),
+                    row.get('intent_type', ''),
+                    int(float(row.get('volume', 0) or 0)),
+                    float(row.get('commission', 0) or 0),
+                    float(row.get('revenue_potential', 0) or 0),
+                    int(float(row.get('buying_intent', 0) or 0)),
+                    int(float(row.get('yt_avg_monthly_views', 0) or 0)),
+                    row.get('yt_view_pattern', ''),
+                    float(row.get('priority_score', 0) or 0),
+                    row.get('opportunity_tier', ''),
+                    row.get('competition', ''),
+                    row.get('content_angle', ''),
+                    row.get('rationale', ''),
+                    row.get('conversion_likelihood', ''),
+                    row.get('time_to_convert', ''),
+                    row.get('problem_type', ''),
+                    int(float(row.get('urgency_score', 0) or 0)),
+                    row.get('yt_top_video_title', ''),
+                    int(float(row.get('yt_top_video_views', 0) or 0)),
+                    row.get('yt_top_video_channel', ''),
+                    'system', 'CSV Import', 'csv'
+                ))
+                imported += 1
+            except Exception as e:
+                print(f"[MIGRATION] Error importing '{keyword}': {e}")
+
+    conn.commit()
+    conn.close()
+    print(f"[MIGRATION] Imported {imported} keywords from CSV into keywords_master")
+
+migrate_csv_to_db()
+
+# ============================================
+# LOAD KEYWORDS FROM DATABASE (keywords_master)
+# ============================================
+def _load_keywords_from_csv():
+    """Load keywords from CSV file as fallback."""
+    keywords = []
+    csv_path = os.path.join(os.path.dirname(__file__), 'data', 'keywords.csv')
+    if os.path.exists(csv_path):
+        with open(csv_path, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row.get('keyword'):
+                    keywords.append({
+                        'keyword': row.get('keyword', ''),
+                        'niche': row.get('niche', ''),
+                        'funnel': row.get('funnel', ''),
+                        'intent': row.get('intent_type', ''),
+                        'volume': int(float(row.get('volume', 0) or 0)),
+                        'commission': float(row.get('commission', 0) or 0),
+                        'revenue': float(row.get('revenue_potential', 0) or 0),
+                        'buyingIntent': int(float(row.get('buying_intent', 0) or 0)),
+                        'ytViews': int(float(row.get('yt_avg_monthly_views', 0) or 0)),
+                        'ytPattern': row.get('yt_view_pattern', ''),
+                        'priority': float(row.get('priority_score', 0) or 0),
+                        'tier': row.get('opportunity_tier', ''),
+                        'competition': row.get('competition', ''),
+                        'contentAngle': row.get('content_angle', ''),
+                        'rationale': row.get('rationale', ''),
+                        'conversionLikelihood': row.get('conversion_likelihood', ''),
+                        'timeToConvert': row.get('time_to_convert', ''),
+                        'problemType': row.get('problem_type', ''),
+                        'urgencyScore': int(float(row.get('urgency_score', 0) or 0)),
+                        'ytTopVideo': row.get('yt_top_video_title', ''),
+                        'ytTopViews': int(float(row.get('yt_top_video_views', 0) or 0)),
+                        'ytTopChannel': row.get('yt_top_video_channel', ''),
+                        'addedByEmail': 'system',
+                        'addedByName': 'CSV Import',
+                        'source': 'csv',
+                    })
+    return keywords
+
+
+def _row_to_keyword(row):
+    """Convert a DB row (25 columns) to keyword dict."""
+    return {
+        'keyword': row[0] or '',
+        'niche': row[1] or '',
+        'funnel': row[2] or '',
+        'intent': row[3] or '',
+        'volume': row[4] or 0,
+        'commission': row[5] or 0,
+        'revenue': row[6] or 0,
+        'buyingIntent': row[7] or 0,
+        'ytViews': row[8] or 0,
+        'ytPattern': row[9] or '',
+        'priority': row[10] or 0,
+        'tier': row[11] or '',
+        'competition': row[12] or '',
+        'contentAngle': row[13] or '',
+        'rationale': row[14] or '',
+        'conversionLikelihood': row[15] or '',
+        'timeToConvert': row[16] or '',
+        'problemType': row[17] or '',
+        'urgencyScore': row[18] or 0,
+        'ytTopVideo': row[19] or '',
+        'ytTopViews': row[20] or 0,
+        'ytTopChannel': row[21] or '',
+        'addedByEmail': row[22] or 'system',
+        'addedByName': row[23] or '',
+        'source': row[24] or 'csv',
+    }
+
+
+def _load_keywords_from_rest_api():
+    """Load keywords from Supabase REST API when direct Postgres fails."""
+    import time as _time
+    start_time = _time.time()
+    max_seconds = 60  # Bail out after 60s to avoid gunicorn timeout
+    select = 'keyword,niche,funnel,intent_type,volume,commission,revenue_potential,buying_intent,yt_avg_monthly_views,yt_view_pattern,priority_score,opportunity_tier,competition,content_angle,rationale,conversion_likelihood,time_to_convert,problem_type,urgency_score,yt_top_video_title,yt_top_video_views,yt_top_video_channel,added_by_email,added_by_name,source'
+    # Supabase REST API has a default limit of 1000 rows — paginate to get all
+    keywords = []
+    offset = 0
+    page_size = 1000
+    while True:
+        if _time.time() - start_time > max_seconds:
+            print(f"[SUPABASE-REST] Timeout after {max_seconds}s, loaded {len(keywords)} keywords so far")
+            break
+        rows = supabase_rest_select('keywords_master', select=select, limit=page_size,
+                                     offset=offset)
+        if rows is None:
+            break
+        for r in rows:
+            keywords.append({
+                'keyword': r.get('keyword', ''),
+                'niche': r.get('niche', ''),
+                'funnel': r.get('funnel', ''),
+                'intent': r.get('intent_type', ''),
+                'volume': r.get('volume') or 0,
+                'commission': r.get('commission') or 0,
+                'revenue': r.get('revenue_potential') or 0,
+                'buyingIntent': r.get('buying_intent') or 0,
+                'ytViews': r.get('yt_avg_monthly_views') or 0,
+                'ytPattern': r.get('yt_view_pattern') or '',
+                'priority': r.get('priority_score') or 0,
+                'tier': r.get('opportunity_tier') or '',
+                'competition': r.get('competition') or '',
+                'contentAngle': r.get('content_angle') or '',
+                'rationale': r.get('rationale') or '',
+                'conversionLikelihood': r.get('conversion_likelihood') or '',
+                'timeToConvert': r.get('time_to_convert') or '',
+                'problemType': r.get('problem_type') or '',
+                'urgencyScore': r.get('urgency_score') or 0,
+                'ytTopVideo': r.get('yt_top_video_title') or '',
+                'ytTopViews': r.get('yt_top_video_views') or 0,
+                'ytTopChannel': r.get('yt_top_video_channel') or '',
+                'addedByEmail': r.get('added_by_email') or 'system',
+                'addedByName': r.get('added_by_name') or '',
+                'source': r.get('source') or 'csv',
+            })
+        if len(rows) < page_size:
+            break
+        offset += page_size
+    return keywords
+
+
+def load_keywords():
+    """Load all keywords from the keywords_master database table.
+    Fallback chain: direct Postgres → Supabase REST API → CSV file."""
+    keywords = []
+
+    # Attempt 1: Direct Postgres
+    try:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute('''
+            SELECT keyword, niche, funnel, intent_type, volume, commission,
+                   revenue_potential, buying_intent, yt_avg_monthly_views, yt_view_pattern,
+                   priority_score, opportunity_tier, competition, content_angle, rationale,
+                   conversion_likelihood, time_to_convert, problem_type, urgency_score,
+                   yt_top_video_title, yt_top_video_views, yt_top_video_channel,
+                   added_by_email, added_by_name, source
+            FROM keywords_master
+        ''')
+        for row in c.fetchall():
+            keywords.append(_row_to_keyword(row))
+        conn.close()
+        if keywords:
+            print(f"[KEYWORDS] Loaded {len(keywords)} keywords from Postgres")
+            return keywords
+    except Exception as e:
+        print(f"[KEYWORDS] Postgres failed: {e}")
+
+    # Attempt 2: Supabase REST API
+    if not keywords:
+        print("[KEYWORDS] Trying Supabase REST API...")
+        keywords = _load_keywords_from_rest_api()
+        if keywords:
+            print(f"[KEYWORDS] Loaded {len(keywords)} keywords from REST API")
+            return keywords
+
+    # Attempt 3: CSV file
+    print("[KEYWORDS] REST API returned 0, falling back to CSV")
+    keywords = _load_keywords_from_csv()
+    if keywords:
+        print(f"[KEYWORDS] Loaded {len(keywords)} keywords from CSV fallback")
+
+    return keywords
+
+KEYWORDS = load_keywords()
+print(f"[KEYWORDS] Total keywords available: {len(KEYWORDS)}")
+
+
+def ensure_tracking_keywords_in_master():
+    """Import keyword_tracking.json primary + secondary keywords into keywords_master.
+    Ensures the 26 priority keywords (and their secondaries) always appear in the library."""
+    tracking_path = os.path.join(os.path.dirname(__file__), 'data', 'keyword_tracking.json')
+    if not os.path.exists(tracking_path):
+        print("[TRACKING-IMPORT] keyword_tracking.json not found, skipping")
+        return 0
+
+    try:
+        with open(tracking_path, 'r') as f:
+            config = json.load(f)
+    except Exception as e:
+        print(f"[TRACKING-IMPORT] Error reading tracking config: {e}")
+        return 0
+
+    try:
+        conn = get_db()
+        c = conn.cursor()
+        inserted = 0
+
+        for silo in config.get('silos', []):
+            silo_id = silo.get('id', '')
+            niche = silo_id.replace('_', ' ')
+            for group in silo.get('groups', []):
+                for kw_entry in group.get('keywords', []):
+                    # Insert primary keyword
+                    keyword = kw_entry['keyword']
+                    try:
+                        c.execute('''
+                            INSERT INTO keywords_master (keyword, niche, source, added_by_email, added_by_name)
+                            VALUES (%s, %s, 'tracking', 'system', 'Tracking Config')
+                            ON CONFLICT (keyword) DO NOTHING
+                        ''', (keyword, niche))
+                        if c.rowcount > 0:
+                            inserted += 1
+                    except Exception:
+                        pass
+
+                    # Insert secondary keywords
+                    for sec in kw_entry.get('secondary', []):
+                        try:
+                            c.execute('''
+                                INSERT INTO keywords_master (keyword, niche, source, added_by_email, added_by_name)
+                                VALUES (%s, %s, 'tracking_secondary', 'system', 'Tracking Config')
+                                ON CONFLICT (keyword) DO NOTHING
+                            ''', (sec, niche))
+                            if c.rowcount > 0:
+                                inserted += 1
+                        except Exception:
+                            pass
+
+        conn.commit()
+        conn.close()
+        if inserted > 0:
+            print(f"[TRACKING-IMPORT] Inserted {inserted} new keywords from tracking config into keywords_master")
+            # Reload global KEYWORDS list to include newly added keywords
+            global KEYWORDS
+            KEYWORDS = load_keywords()
+            print(f"[TRACKING-IMPORT] Reloaded KEYWORDS, now {len(KEYWORDS)} total")
+        else:
+            print("[TRACKING-IMPORT] All tracking keywords already in keywords_master")
+        return inserted
+    except Exception as e:
+        print(f"[TRACKING-IMPORT] Error importing tracking keywords: {e}")
+        return 0
+
+
+try:
+    ensure_tracking_keywords_in_master()
+except Exception as e:
+    print(f"[TRACKING-IMPORT] Warning: {e}")
+
+
+# ============================================
+# API INTEGRATIONS
+# ============================================
+
+# Log API key status on startup
+print(f"Ahrefs API key configured: {bool(AHREFS_API_KEY)} (length: {len(AHREFS_API_KEY)})")
+
+def get_ahrefs_keyword_data(keywords):
+    """
+    Get keyword data from Ahrefs API v3 Keywords Explorer.
+    Returns search volume, difficulty, CPC for keywords.
+    """
+    try:
+        if isinstance(keywords, str):
+            keywords = [keywords]
+
+        if not AHREFS_API_KEY:
+            return {'success': False, 'error': 'Ahrefs API key not configured', 'source': 'ahrefs'}
+
+        results = []
+
+        # Ahrefs API processes keywords one at a time or in batches
+        for keyword in keywords:
+            url = "https://api.ahrefs.com/v3/keywords-explorer/overview"
+            headers = {
+                "Authorization": f"Bearer {AHREFS_API_KEY}",
+                "Accept": "application/json"
+            }
+            params = {
+                "keyword": keyword,
+                "country": "us"
+            }
+
+            print(f"Calling Ahrefs API for keyword: {keyword}")
+            response = requests.get(url, headers=headers, params=params, timeout=30)
+
+            if response.status_code == 200:
+                data = response.json()
+                # Extract relevant metrics from Ahrefs response
+                keyword_data = {
+                    'keyword': keyword,
+                    'vol': data.get('volume', 0),
+                    'cpc': {'currency': '$', 'value': str(data.get('cpc', 0))},
+                    'competition': data.get('difficulty', 0) / 100 if data.get('difficulty') else 0,
+                    'difficulty': data.get('difficulty', 0),
+                    'trend': data.get('trend', [])
+                }
+                results.append(keyword_data)
+            elif response.status_code == 401:
+                return {'success': False, 'error': 'Ahrefs API key is invalid or expired', 'source': 'ahrefs'}
+            elif response.status_code == 403:
+                return {'success': False, 'error': 'Ahrefs API access denied - requires Enterprise plan', 'source': 'ahrefs'}
+            else:
+                print(f"Ahrefs API error for {keyword}: {response.status_code} - {response.text[:200]}")
+
+        if results:
+            return {'success': True, 'data': results, 'source': 'ahrefs'}
+        else:
+            return {'success': False, 'error': 'No data returned from Ahrefs', 'source': 'ahrefs'}
+
+    except Exception as e:
+        print(f"Ahrefs API exception: {e}")
+        return {'success': False, 'error': str(e), 'source': 'ahrefs'}
+
+def get_ahrefs_related_keywords(keyword):
+    """Get related keywords from Ahrefs API v3"""
+    try:
+        if not AHREFS_API_KEY:
+            return {'success': False, 'error': 'Ahrefs API key not configured', 'source': 'ahrefs'}
+
+        url = "https://api.ahrefs.com/v3/keywords-explorer/related-terms"
+        headers = {
+            "Authorization": f"Bearer {AHREFS_API_KEY}",
+            "Accept": "application/json"
+        }
+        params = {
+            "keyword": keyword,
+            "country": "us",
+            "limit": 50
+        }
+
+        response = requests.get(url, headers=headers, params=params, timeout=30)
+
+        if response.status_code == 200:
+            data = response.json()
+            related = data.get('keywords', [])
+            return {'success': True, 'related': related, 'source': 'ahrefs'}
+        elif response.status_code == 401:
+            return {'success': False, 'error': 'Ahrefs API key is invalid', 'source': 'ahrefs'}
+        elif response.status_code == 403:
+            return {'success': False, 'error': 'Ahrefs API access denied', 'source': 'ahrefs'}
+        else:
+            return {'success': False, 'error': f'Ahrefs API error: {response.status_code}', 'source': 'ahrefs'}
+
+    except Exception as e:
+        return {'success': False, 'error': str(e), 'source': 'ahrefs'}
+
+def get_dataforseo_keyword_data(keywords):
+    """
+    Get keyword data from DataForSEO API.
+    Returns search volume, CPC, competition for keywords.
+    Uses Google Ads Search Volume endpoint.
+    """
+    try:
+        if isinstance(keywords, str):
+            keywords = [keywords]
+
+        if not DATAFORSEO_LOGIN or not DATAFORSEO_PASSWORD:
+            return {'success': False, 'error': 'DataForSEO credentials not configured', 'source': 'dataforseo'}
+
+        import base64
+
+        # DataForSEO uses Basic Auth
+        credentials = base64.b64encode(f"{DATAFORSEO_LOGIN}:{DATAFORSEO_PASSWORD}".encode()).decode()
+
+        url = "https://api.dataforseo.com/v3/keywords_data/google_ads/search_volume/live"
+        headers = {
+            "Authorization": f"Basic {credentials}",
+            "Content-Type": "application/json"
+        }
+
+        # Build request payload
+        payload = [{
+            "keywords": keywords[:700],  # Max 700 keywords per request
+            "language_code": "en",
+            "location_code": 2840  # United States
+        }]
+
+        print(f"Calling DataForSEO API for {len(keywords)} keywords: {keywords}")
+        response = requests.post(url, headers=headers, json=payload, timeout=60)
+
+        print(f"DataForSEO response status: {response.status_code}")
+
+        if response.status_code == 200:
+            data = response.json()
+            print(f"DataForSEO response: status_code={data.get('status_code')}, status_message={data.get('status_message')}")
+
+            # Check for API-level errors
+            if data.get('status_code') != 20000:
+                return {
+                    'success': False,
+                    'error': f"DataForSEO error: {data.get('status_message', 'Unknown error')} (code: {data.get('status_code')})",
+                    'source': 'dataforseo'
+                }
+
+            # Extract keyword data from response
+            results = []
+            tasks = data.get('tasks', [])
+            print(f"DataForSEO tasks count: {len(tasks)}")
+
+            for task in tasks:
+                print(f"Task status: {task.get('status_code')}, message: {task.get('status_message')}")
+                if task.get('status_code') == 20000:
+                    task_result = task.get('result', [])
+                    print(f"Task result count: {len(task_result) if task_result else 0}")
+
+                    if task_result:
+                        for item in task_result:
+                            print(f"Item keys: {item.keys() if item else 'None'}")
+
+                            # Convert competition to numeric (DataForSEO returns "LOW", "MEDIUM", "HIGH" or null)
+                            competition_raw = item.get('competition')
+                            competition_index = item.get('competition_index', 0) or 0
+
+                            # Use competition_index if available, otherwise convert string
+                            if isinstance(competition_index, (int, float)) and competition_index > 0:
+                                competition = competition_index / 100  # Normalize to 0-1
+                            elif isinstance(competition_raw, str):
+                                # Convert string to numeric
+                                comp_map = {'LOW': 0.2, 'MEDIUM': 0.5, 'HIGH': 0.8}
+                                competition = comp_map.get(competition_raw.upper(), 0.5)
+                            elif isinstance(competition_raw, (int, float)):
+                                competition = float(competition_raw)
+                            else:
+                                competition = 0
+
+                            results.append({
+                                'keyword': item.get('keyword', ''),
+                                'vol': item.get('search_volume', 0) or 0,
+                                'cpc': {
+                                    'currency': '$',
+                                    'value': str(round(float(item.get('cpc', 0) or 0), 2))
+                                },
+                                'competition': competition,
+                                'competition_index': competition_index,
+                                'low_top_of_page_bid': item.get('low_top_of_page_bid', 0) or 0,
+                                'high_top_of_page_bid': item.get('high_top_of_page_bid', 0) or 0,
+                                'monthly_searches': item.get('monthly_searches', []),
+                                'source': 'dataforseo'
+                            })
+
+            print(f"DataForSEO success: got data for {len(results)} keywords")
+
+            if not results:
+                # Return more info about what went wrong
+                return {
+                    'success': False,
+                    'error': f"DataForSEO returned empty results. Tasks: {len(tasks)}, Response: {str(data)[:500]}",
+                    'source': 'dataforseo'
+                }
+
+            return {'success': True, 'data': results, 'source': 'dataforseo'}
+
+        elif response.status_code == 401:
+            return {'success': False, 'error': 'DataForSEO credentials invalid', 'source': 'dataforseo'}
+        else:
+            error_msg = f"DataForSEO API error: {response.status_code}"
+            try:
+                error_data = response.json()
+                error_msg += f" - {error_data.get('status_message', '')}"
+            except:
+                error_msg += f" - {response.text[:200]}"
+            return {'success': False, 'error': error_msg, 'source': 'dataforseo'}
+
+    except Exception as e:
+        print(f"DataForSEO exception: {e}")
+        return {'success': False, 'error': str(e), 'source': 'dataforseo'}
+
+def get_dataforseo_related_keywords(keyword):
+    """
+    Get related keywords from DataForSEO using keyword suggestions endpoint.
+    """
+    try:
+        if not DATAFORSEO_LOGIN or not DATAFORSEO_PASSWORD:
+            return {'success': False, 'error': 'DataForSEO credentials not configured', 'source': 'dataforseo'}
+
+        import base64
+        credentials = base64.b64encode(f"{DATAFORSEO_LOGIN}:{DATAFORSEO_PASSWORD}".encode()).decode()
+
+        url = "https://api.dataforseo.com/v3/keywords_data/google_ads/keywords_for_keywords/live"
+        headers = {
+            "Authorization": f"Basic {credentials}",
+            "Content-Type": "application/json"
+        }
+
+        payload = [{
+            "keywords": [keyword],
+            "language_code": "en",
+            "location_code": 2840  # United States
+        }]
+
+        response = requests.post(url, headers=headers, json=payload, timeout=60)
+
+        if response.status_code == 200:
+            data = response.json()
+
+            if data.get('status_code') != 20000:
+                return {'success': False, 'error': f"DataForSEO error: {data.get('status_message')}", 'source': 'dataforseo'}
+
+            related = []
+            tasks = data.get('tasks', [])
+
+            for task in tasks:
+                if task.get('status_code') == 20000:
+                    task_result = task.get('result', [])
+                    for item in task_result:
+                        related.append({
+                            'keyword': item.get('keyword', ''),
+                            'vol': item.get('search_volume', 0),
+                            'cpc': item.get('cpc', 0),
+                            'competition': item.get('competition', 0),
+                            'source': 'dataforseo'
+                        })
+
+            return {'success': True, 'related': related[:50], 'source': 'dataforseo'}
+
+        elif response.status_code == 401:
+            return {'success': False, 'error': 'DataForSEO credentials invalid', 'source': 'dataforseo'}
+        else:
+            return {'success': False, 'error': f'DataForSEO error: {response.status_code}', 'source': 'dataforseo'}
+
+    except Exception as e:
+        return {'success': False, 'error': str(e), 'source': 'dataforseo'}
+
+def get_keyword_data_with_fallback(keywords):
+    """
+    Fallback chain: DataForSEO → Ahrefs → Keywords Everywhere → SerpAPI
+    DataForSEO is preferred as it provides accurate search volume at low cost.
+    """
+    # Try DataForSEO first (best value - accurate data, pay per use)
+    if DATAFORSEO_LOGIN and DATAFORSEO_PASSWORD:
+        print("Trying DataForSEO API first...")
+        dfs_result = get_dataforseo_keyword_data(keywords)
+        if dfs_result.get('success'):
+            return dfs_result
+        else:
+            print(f"DataForSEO failed: {dfs_result.get('error')}, trying next...")
+
+    # Try Ahrefs (if configured)
+    if AHREFS_API_KEY:
+        print("Trying Ahrefs API...")
+        ahrefs_result = get_ahrefs_keyword_data(keywords)
+        if ahrefs_result.get('success'):
+            return ahrefs_result
+        else:
+            print(f"Ahrefs failed: {ahrefs_result.get('error')}, trying next...")
+
+    # Fall back to Keywords Everywhere
+    if KEYWORDS_EVERYWHERE_API_KEY:
+        print("Trying Keywords Everywhere API...")
+        ke_result = get_keywords_everywhere_data(keywords)
+        if ke_result.get('success'):
+            return ke_result
+        else:
+            print(f"Keywords Everywhere failed: {ke_result.get('error')}, trying SerpAPI...")
+
+    # Final fallback: SerpAPI (trends data, no exact volume)
+    if SERPAPI_API_KEY:
+        print("Using SerpAPI for keyword trends (no exact volume)...")
+        if isinstance(keywords, str):
+            keywords = [keywords]
+
+        serpapi_data = []
+        for kw in keywords[:10]:  # Limit to avoid too many API calls
+            trend_data = get_serpapi_google_trends(kw)
+            serpapi_data.append({
+                'keyword': kw,
+                'vol': trend_data.get('current_interest', 0) * 100,  # Scale 0-100 to estimated volume
+                'trend': trend_data.get('trend', 'unknown'),
+                'trend_change_pct': trend_data.get('trend_change_pct', 0),
+                'cpc': {'currency': '$', 'value': '0'},  # Not available from SerpAPI
+                'competition': 0,  # Not available from SerpAPI
+                'source': 'serpapi_trends'
+            })
+
+        return {
+            'success': True,
+            'data': serpapi_data,
+            'source': 'serpapi_trends',
+            'note': 'Using Google Trends data - volume is relative interest (0-100 scaled), not exact monthly searches'
+        }
+
+    # Nothing configured
+    return {
+        'success': False,
+        'error': 'No keyword API configured. Please add DATAFORSEO credentials, AHREFS_API_KEY, KEYWORDS_EVERYWHERE_API_KEY, or SERPAPI_API_KEY.',
+        'source': 'none'
+    }
+
+def get_related_keywords_with_fallback(keyword):
+    """
+    Fallback chain: DataForSEO → Ahrefs → Keywords Everywhere → SerpAPI
+    """
+    # Try DataForSEO first (best value)
+    if DATAFORSEO_LOGIN and DATAFORSEO_PASSWORD:
+        dfs_result = get_dataforseo_related_keywords(keyword)
+        if dfs_result.get('success'):
+            return dfs_result
+
+    # Try Ahrefs
+    if AHREFS_API_KEY:
+        ahrefs_result = get_ahrefs_related_keywords(keyword)
+        if ahrefs_result.get('success'):
+            return ahrefs_result
+
+    # Fall back to Keywords Everywhere
+    if KEYWORDS_EVERYWHERE_API_KEY:
+        ke_result = get_keywords_everywhere_related(keyword)
+        if ke_result.get('success'):
+            return ke_result
+
+    # Final fallback: SerpAPI (autocomplete + related queries)
+    if SERPAPI_API_KEY:
+        print("Using SerpAPI for related keywords...")
+
+        all_related = []
+
+        # Get autocomplete suggestions
+        autocomplete = get_serpapi_autocomplete(keyword)
+        if autocomplete.get('success'):
+            for s in autocomplete.get('suggestions', []):
+                all_related.append({
+                    'keyword': s.get('keyword', ''),
+                    'source': 'autocomplete'
+                })
+
+        # Get Google Trends related queries
+        related_queries = get_serpapi_related_queries(keyword)
+        if related_queries.get('success'):
+            for r in related_queries.get('related', []):
+                all_related.append({
+                    'keyword': r.get('keyword', ''),
+                    'trend_type': r.get('trend_type', ''),
+                    'source': 'trends_related'
+                })
+
+        return {
+            'success': True,
+            'related': all_related,
+            'source': 'serpapi'
+        }
+
+    return {'success': False, 'error': 'No keyword API configured', 'source': 'none'}
+
+def get_keywords_everywhere_data(keywords):
+    try:
+        if isinstance(keywords, str):
+            keywords = [keywords]
+
+        if not KEYWORDS_EVERYWHERE_API_KEY:
+            return {'success': False, 'error': 'Keywords Everywhere API key not configured. Please add KEYWORDS_EVERYWHERE_API_KEY to your Railway environment variables.', 'source': 'keywords_everywhere'}
+
+        url = "https://api.keywordseverywhere.com/v1/get_keyword_data"
+        headers = {
+            "Authorization": f"Bearer {KEYWORDS_EVERYWHERE_API_KEY}",
+            "Accept": "application/json"
+        }
+
+        # Build form data with proper kw[] format for multiple keywords
+        data = [
+            ("country", "us"),
+            ("currency", "usd"),
+            ("dataSource", "gkp"),
+        ]
+        # Add each keyword as separate kw[] parameter
+        for kw in keywords:
+            data.append(("kw[]", kw))
+
+        print(f"Calling Keywords Everywhere API for {len(keywords)} keywords...")
+        response = requests.post(url, headers=headers, data=data, timeout=30)
+
+        if response.status_code == 200:
+            result = response.json()
+            print(f"Keywords Everywhere API success: got data for {len(result.get('data', []))} keywords")
+            return {'success': True, 'data': result.get('data', []), 'source': 'keywords_everywhere'}
+        elif response.status_code == 401:
+            # Specific handling for authentication errors
+            return {'success': False, 'error': 'Keywords Everywhere API key is invalid or expired. Please get a fresh API key from keywordseverywhere.com/settings.html and update the KEYWORDS_EVERYWHERE_API_KEY in Railway.', 'source': 'keywords_everywhere'}
+        else:
+            # Log the actual error for debugging
+            error_msg = f"Keywords Everywhere API error: {response.status_code}"
+            try:
+                error_detail = response.json()
+                error_msg += f" - {error_detail.get('message', response.text[:200])}"
+            except:
+                error_msg += f" - {response.text[:200]}"
+            print(f"Keywords Everywhere API error: {error_msg}")
+            return {'success': False, 'error': error_msg, 'source': 'keywords_everywhere'}
+    except Exception as e:
+        print(f"Keywords Everywhere exception: {e}")
+        return {'success': False, 'error': str(e), 'source': 'keywords_everywhere'}
+
+def get_keywords_everywhere_related(keyword):
+    try:
+        if not KEYWORDS_EVERYWHERE_API_KEY:
+            return {'success': False, 'error': 'Keywords Everywhere API key not configured. Please add KEYWORDS_EVERYWHERE_API_KEY to Railway.', 'source': 'keywords_everywhere'}
+
+        url = "https://api.keywordseverywhere.com/v1/get_related_keywords"
+        headers = {
+            "Authorization": f"Bearer {KEYWORDS_EVERYWHERE_API_KEY}",
+            "Accept": "application/json"
+        }
+        data = [
+            ("country", "us"),
+            ("currency", "usd"),
+            ("kw[]", keyword)
+        ]
+
+        response = requests.post(url, headers=headers, data=data, timeout=30)
+
+        if response.status_code == 200:
+            result = response.json()
+            return {'success': True, 'related': result.get('data', []), 'source': 'keywords_everywhere'}
+        elif response.status_code == 401:
+            return {'success': False, 'error': 'Keywords Everywhere API key is invalid or expired. Please update KEYWORDS_EVERYWHERE_API_KEY in Railway.', 'source': 'keywords_everywhere'}
+        else:
+            error_msg = f"Keywords Everywhere API error: {response.status_code}"
+            try:
+                error_detail = response.json()
+                error_msg += f" - {error_detail.get('message', response.text[:200])}"
+            except:
+                error_msg += f" - {response.text[:200]}"
+            return {'success': False, 'error': error_msg, 'source': 'keywords_everywhere'}
+    except Exception as e:
+        return {'success': False, 'error': str(e), 'source': 'keywords_everywhere'}
+
+def get_serpapi_youtube_data(keyword):
+    try:
+        if not SERPAPI_API_KEY:
+            return {'success': False, 'error': 'SerpAPI key not configured', 'source': 'serpapi'}
+
+        url = "https://serpapi.com/search.json"
+        params = {"engine": "youtube", "search_query": keyword, "api_key": SERPAPI_API_KEY}
+
+        response = requests.get(url, params=params, timeout=30)
+
+        if response.status_code == 200:
+            data = response.json()
+            videos = data.get('video_results', [])
+
+            total_views = 0
+            view_counts = []
+            channels = {}
+
+            for video in videos[:10]:
+                views = parse_view_count(video.get('views', '0'))
+                total_views += views
+                view_counts.append(views)
+                channel = video.get('channel', {}).get('name', 'Unknown')
+                if channel not in channels:
+                    channels[channel] = 0
+                channels[channel] += views
+
+            avg_views = total_views // len(videos) if videos else 0
+            pattern = determine_view_pattern(view_counts) if view_counts else 'no_data'
+            top_channel = max(channels.items(), key=lambda x: x[1])[0] if channels else 'Unknown'
+
+            return {
+                'success': True, 'total_views': total_views, 'avg_views': avg_views,
+                'video_count': len(videos), 'top_channel': top_channel,
+                'view_pattern': pattern, 'videos': videos[:5], 'source': 'serpapi'
+            }
+        else:
+            return {'success': False, 'error': f"SerpAPI error: {response.status_code}", 'source': 'serpapi'}
+    except Exception as e:
+        return {'success': False, 'error': str(e), 'source': 'serpapi'}
+
+def get_serpapi_autocomplete(keyword):
+    """
+    Get keyword suggestions from Google Autocomplete via SerpAPI.
+    Returns up to 10 keyword suggestions.
+    """
+    try:
+        if not SERPAPI_API_KEY:
+            return {'success': False, 'error': 'SerpAPI key not configured', 'source': 'serpapi'}
+
+        url = "https://serpapi.com/search.json"
+        params = {
+            "engine": "google_autocomplete",
+            "q": keyword,
+            "api_key": SERPAPI_API_KEY,
+            "gl": "us",
+            "hl": "en"
+        }
+
+        response = requests.get(url, params=params, timeout=30)
+
+        if response.status_code == 200:
+            data = response.json()
+            suggestions = data.get('suggestions', [])
+
+            keywords = []
+            for s in suggestions:
+                kw = s.get('value', '')
+                if kw and kw.lower() != keyword.lower():
+                    keywords.append({
+                        'keyword': kw,
+                        'type': s.get('type', 'suggestion'),
+                        'source': 'google_autocomplete'
+                    })
+
+            return {'success': True, 'suggestions': keywords, 'source': 'serpapi_autocomplete'}
+        else:
+            return {'success': False, 'error': f"SerpAPI Autocomplete error: {response.status_code}", 'source': 'serpapi'}
+    except Exception as e:
+        return {'success': False, 'error': str(e), 'source': 'serpapi'}
+
+def get_serpapi_google_trends(keyword):
+    """
+    Get Google Trends data via SerpAPI.
+    Returns interest over time and whether keyword is rising/declining.
+    """
+    try:
+        if not SERPAPI_API_KEY:
+            return {'success': False, 'error': 'SerpAPI key not configured', 'source': 'serpapi'}
+
+        url = "https://serpapi.com/search.json"
+        params = {
+            "engine": "google_trends",
+            "q": keyword,
+            "api_key": SERPAPI_API_KEY,
+            "geo": "US",
+            "data_type": "TIMESERIES"  # Interest over time
+        }
+
+        response = requests.get(url, params=params, timeout=30)
+
+        if response.status_code == 200:
+            data = response.json()
+
+            # Get interest over time data
+            interest_over_time = data.get('interest_over_time', {})
+            timeline_data = interest_over_time.get('timeline_data', [])
+
+            # Calculate trend direction
+            trend = 'stable'
+            trend_change = 0
+            if len(timeline_data) >= 4:
+                # Compare recent vs older data
+                recent = timeline_data[-4:]  # Last 4 data points
+                older = timeline_data[:4]    # First 4 data points
+
+                recent_avg = sum(d.get('values', [{}])[0].get('extracted_value', 0) for d in recent) / len(recent)
+                older_avg = sum(d.get('values', [{}])[0].get('extracted_value', 0) for d in older) / len(older)
+
+                if older_avg > 0:
+                    trend_change = ((recent_avg - older_avg) / older_avg) * 100
+
+                if trend_change > 20:
+                    trend = 'rising'
+                elif trend_change < -20:
+                    trend = 'declining'
+                else:
+                    trend = 'stable'
+
+            # Get current interest score (0-100)
+            current_interest = 0
+            if timeline_data:
+                last_point = timeline_data[-1]
+                values = last_point.get('values', [{}])
+                if values:
+                    current_interest = values[0].get('extracted_value', 0)
+
+            return {
+                'success': True,
+                'trend': trend,
+                'trend_change_pct': round(trend_change, 1),
+                'current_interest': current_interest,
+                'data_points': len(timeline_data),
+                'source': 'google_trends'
+            }
+        else:
+            return {'success': False, 'error': f"SerpAPI Trends error: {response.status_code}", 'source': 'serpapi'}
+    except Exception as e:
+        return {'success': False, 'error': str(e), 'source': 'serpapi'}
+
+def get_serpapi_related_queries(keyword):
+    """
+    Get related queries from Google Trends via SerpAPI.
+    Returns rising and top related keywords.
+    """
+    try:
+        if not SERPAPI_API_KEY:
+            return {'success': False, 'error': 'SerpAPI key not configured', 'source': 'serpapi'}
+
+        url = "https://serpapi.com/search.json"
+        params = {
+            "engine": "google_trends",
+            "q": keyword,
+            "api_key": SERPAPI_API_KEY,
+            "geo": "US",
+            "data_type": "RELATED_QUERIES"
+        }
+
+        response = requests.get(url, params=params, timeout=30)
+
+        if response.status_code == 200:
+            data = response.json()
+
+            related_queries = data.get('related_queries', {})
+            rising = related_queries.get('rising', [])
+            top = related_queries.get('top', [])
+
+            keywords = []
+
+            # Add rising queries (high potential)
+            for q in rising[:10]:
+                keywords.append({
+                    'keyword': q.get('query', ''),
+                    'trend_type': 'rising',
+                    'value': q.get('extracted_value', q.get('value', 'Breakout')),
+                    'source': 'google_trends_related'
+                })
+
+            # Add top queries
+            for q in top[:10]:
+                keywords.append({
+                    'keyword': q.get('query', ''),
+                    'trend_type': 'top',
+                    'value': q.get('extracted_value', q.get('value', 0)),
+                    'source': 'google_trends_related'
+                })
+
+            return {
+                'success': True,
+                'related': keywords,
+                'rising_count': len(rising),
+                'top_count': len(top),
+                'source': 'google_trends_related'
+            }
+        else:
+            return {'success': False, 'error': f"SerpAPI Related error: {response.status_code}", 'source': 'serpapi'}
+    except Exception as e:
+        return {'success': False, 'error': str(e), 'source': 'serpapi'}
+
+def get_serpapi_keyword_data(keyword):
+    """
+    Combined SerpAPI keyword research - gets autocomplete, trends, and related queries.
+    Use this as an alternative to Keywords Everywhere.
+    """
+    results = {
+        'keyword': keyword,
+        'success': True,
+        'suggestions': [],
+        'related': [],
+        'trend': 'unknown',
+        'trend_change_pct': 0,
+        'current_interest': 0,
+        'errors': []
+    }
+
+    # Get autocomplete suggestions
+    autocomplete = get_serpapi_autocomplete(keyword)
+    if autocomplete.get('success'):
+        results['suggestions'] = autocomplete.get('suggestions', [])
+    else:
+        results['errors'].append(autocomplete.get('error', 'Autocomplete failed'))
+
+    # Get trend data
+    trends = get_serpapi_google_trends(keyword)
+    if trends.get('success'):
+        results['trend'] = trends.get('trend', 'unknown')
+        results['trend_change_pct'] = trends.get('trend_change_pct', 0)
+        results['current_interest'] = trends.get('current_interest', 0)
+    else:
+        results['errors'].append(trends.get('error', 'Trends failed'))
+
+    # Get related queries
+    related = get_serpapi_related_queries(keyword)
+    if related.get('success'):
+        results['related'] = related.get('related', [])
+    else:
+        results['errors'].append(related.get('error', 'Related queries failed'))
+
+    return results
+
+def parse_view_count(view_string):
+    if not view_string:
+        return 0
+    view_string = str(view_string).lower().replace(',', '').replace(' views', '').strip()
+    try:
+        if 'k' in view_string:
+            return int(float(view_string.replace('k', '')) * 1000)
+        elif 'm' in view_string:
+            return int(float(view_string.replace('m', '')) * 1000000)
+        elif 'b' in view_string:
+            return int(float(view_string.replace('b', '')) * 1000000000)
+        else:
+            return int(float(view_string))
+    except:
+        return 0
+
+def determine_view_pattern(view_counts):
+    if not view_counts or len(view_counts) < 3:
+        return 'no_data'
+    total = sum(view_counts)
+    if total == 0:
+        return 'no_data'
+    top_share = view_counts[0] / total
+    top3_share = sum(view_counts[:3]) / total
+    if top_share > 0.5:
+        return 'winner_take_all'
+    elif top3_share > 0.7:
+        return 'top_heavy'
+    else:
+        return 'distributed'
+
+def calculate_opportunity_score(keyword_data, yt_data):
+    score = 50
+    volume = keyword_data.get('volume', 0)
+    if volume > 10000: score += 20
+    elif volume > 5000: score += 15
+    elif volume > 1000: score += 10
+    elif volume > 500: score += 5
+
+    pattern = yt_data.get('view_pattern', 'no_data')
+    if pattern == 'distributed': score += 30
+    elif pattern == 'top_heavy': score += 15
+    elif pattern == 'winner_take_all': score += 5
+
+    avg_views = yt_data.get('avg_views', 0)
+    if avg_views > 100000: score += 20
+    elif avg_views > 50000: score += 15
+    elif avg_views > 10000: score += 10
+    elif avg_views > 1000: score += 5
+
+    difficulty = keyword_data.get('keyword_difficulty', 50)
+    if difficulty > 70: score -= 20
+    elif difficulty > 50: score -= 10
+    elif difficulty > 30: score -= 5
+
+    return min(100, max(0, score))
+
+def determine_tier(score):
+    if score >= 75: return 'A - Top Priority'
+    elif score >= 55: return 'B - High Value'
+    elif score >= 35: return 'C - Growth'
+    else: return 'D - Nurture'
+
+def classify_keyword_type(keyword):
+    """Classify keyword type based on patterns - calibrated from real revenue data"""
+    kw_lower = keyword.lower()
+    if ' vs ' in kw_lower:
+        return 'comparison'
+    elif 'review' in kw_lower or 'reviews' in kw_lower:
+        return 'review'
+    elif kw_lower.startswith('best ') or ' best ' in kw_lower:
+        return 'best_of'
+    elif any(term in kw_lower for term in ['coupon', 'discount', 'code', 'deal', 'promo']):
+        return 'deal'
+    elif any(term in kw_lower for term in ['how to', 'what is', 'why', 'when', 'guide']):
+        return 'informational'
+    else:
+        return 'other'
+
+def estimate_willingness_to_spend(keyword, keyword_type='other', niche='other'):
+    """
+    Estimate the percentage of searchers willing to pay for a solution.
+
+    This affects revenue potential - keywords where people want FREE solutions
+    will convert much worse than keywords where people are ready to buy.
+
+    Returns: float between 0.0 and 1.0 (percentage as decimal)
+    """
+    kw_lower = keyword.lower()
+
+    # Start with base willingness by keyword type
+    base_willingness = {
+        'deal': 0.95,        # Looking for coupon = definitely buying
+        'comparison': 0.80,  # Comparing X vs Y = close to decision
+        'review': 0.70,      # Researching specific product = likely buying
+        'best_of': 0.60,     # Looking for recommendations = considering purchase
+        'informational': 0.25,  # Just learning = low intent
+        'other': 0.50
+    }
+    willingness = base_willingness.get(keyword_type, 0.50)
+
+    # NEGATIVE signals - reduce willingness significantly
+    if 'free' in kw_lower:
+        willingness *= 0.15  # "best free vpn" = mostly want free
+    if 'cheap' in kw_lower or 'budget' in kw_lower or 'affordable' in kw_lower:
+        willingness *= 0.60  # Price sensitive but willing to pay something
+    if any(term in kw_lower for term in ['hack', 'hacked', 'crack', 'cracked', 'pirate', 'torrent']):
+        willingness *= 0.05  # Want to steal it
+    if any(term in kw_lower for term in ['not working', 'error', 'problem', 'issue', 'fix', 'broken']):
+        willingness *= 0.20  # Support query, want free help
+    if any(term in kw_lower for term in ['alternative to', 'alternatives', 'like']):
+        willingness *= 0.70  # Looking for options, might want free
+    if any(term in kw_lower for term in ['cancel', 'refund', 'unsubscribe', 'delete account']):
+        willingness *= 0.10  # Trying to leave, not buy
+    if any(term in kw_lower for term in ['what is', 'how does', 'meaning', 'definition']):
+        willingness *= 0.30  # Educational, early stage
+
+    # POSITIVE signals - increase willingness
+    if any(term in kw_lower for term in ['buy', 'purchase', 'subscribe', 'pricing', 'cost', 'price']):
+        willingness = min(0.95, willingness * 1.5)  # Ready to buy
+    if any(term in kw_lower for term in ['coupon', 'discount', 'promo code', 'deal', 'sale']):
+        willingness = 0.95  # Actively looking to purchase with discount
+    if any(term in kw_lower for term in ['premium', 'pro', 'enterprise', 'business']):
+        willingness = min(0.90, willingness * 1.3)  # Looking for paid tier
+    if 'worth it' in kw_lower or 'is it worth' in kw_lower:
+        willingness = min(0.85, willingness * 1.2)  # Evaluating purchase
+
+    # Niche adjustments - some niches have higher buyer intent
+    niche_multipliers = {
+        'vpn': 1.1,           # People expect to pay for VPN
+        'mattress': 1.2,      # Definitely buying a mattress
+        'llc_formation': 1.3, # Business expense, will pay
+        'web_hosting': 1.1,   # Expect to pay
+        'antivirus': 0.9,     # Lots of free options available
+        'parental_control': 1.0,
+        'identity_theft': 1.1,
+        'pet_tech': 1.0,
+    }
+    niche_mult = niche_multipliers.get(niche, 1.0)
+    willingness *= niche_mult
+
+    # Cap between 5% and 95%
+    return round(max(0.05, min(0.95, willingness)), 2)
+
+def suggest_ideal_brand(keyword, niche='other'):
+    """
+    Suggest the ideal brand/product that people searching this keyword would buy.
+    Based on niche, keyword signals, and market leaders.
+    """
+    kw_lower = keyword.lower()
+
+    # Top brands by niche (ordered by typical affiliate commission & conversion)
+    NICHE_BRANDS = {
+        'vpn': {
+            'default': 'NordVPN',
+            'brands': {
+                'streaming': 'ExpressVPN',
+                'gaming': 'NordVPN',
+                'cheap': 'Surfshark',
+                'budget': 'Surfshark',
+                'free': 'ProtonVPN',
+                'privacy': 'ExpressVPN',
+                'torrenting': 'NordVPN',
+                'china': 'ExpressVPN',
+                'business': 'NordVPN Teams',
+                'router': 'ExpressVPN',
+                'firestick': 'NordVPN',
+                'android': 'NordVPN',
+                'iphone': 'ExpressVPN',
+                'mac': 'ExpressVPN',
+                'windows': 'NordVPN',
+            }
+        },
+        'mattress': {
+            'default': 'Helix',
+            'brands': {
+                'back pain': 'Saatva',
+                'side sleeper': 'Helix Midnight',
+                'stomach': 'WinkBed',
+                'cooling': 'Purple',
+                'memory foam': 'Nectar',
+                'hybrid': 'Helix',
+                'luxury': 'Saatva',
+                'budget': 'Nectar',
+                'cheap': 'Nectar',
+                'couples': 'Helix',
+                'heavy': 'WinkBed Plus',
+                'firm': 'Saatva',
+                'soft': 'Layla',
+            }
+        },
+        'antivirus': {
+            'default': 'Norton 360',
+            'brands': {
+                'free': 'Avast',
+                'mac': 'Intego',
+                'windows': 'Bitdefender',
+                'gaming': 'Norton 360',
+                'business': 'Bitdefender GravityZone',
+                'family': 'Norton 360 Deluxe',
+                'lightweight': 'ESET',
+                'android': 'Bitdefender Mobile',
+            }
+        },
+        'identity_theft': {
+            'default': 'Aura',
+            'brands': {
+                'family': 'Aura Family',
+                'credit': 'IdentityGuard',
+                'comprehensive': 'LifeLock',
+                'budget': 'Identity Defense',
+                'senior': 'Aura',
+            }
+        },
+        'parental_control': {
+            'default': 'Qustodio',
+            'brands': {
+                'iphone': 'Bark',
+                'android': 'Qustodio',
+                'screen time': 'OurPact',
+                'monitoring': 'Bark',
+                'location': 'Life360',
+                'router': 'Circle',
+                'free': 'Google Family Link',
+            }
+        },
+        'web_hosting': {
+            'default': 'SiteGround',
+            'brands': {
+                'wordpress': 'SiteGround',
+                'cheap': 'Hostinger',
+                'budget': 'Hostinger',
+                'beginner': 'Bluehost',
+                'ecommerce': 'Cloudways',
+                'woocommerce': 'SiteGround',
+                'vps': 'Cloudways',
+                'managed': 'Kinsta',
+                'agency': 'Cloudways',
+                'fast': 'Kinsta',
+            }
+        },
+        'email_marketing': {
+            'default': 'ConvertKit',
+            'brands': {
+                'beginner': 'Mailchimp',
+                'free': 'Mailchimp',
+                'blogger': 'ConvertKit',
+                'ecommerce': 'Klaviyo',
+                'automation': 'ActiveCampaign',
+                'cheap': 'MailerLite',
+                'enterprise': 'HubSpot',
+            }
+        },
+        'home_security': {
+            'default': 'SimpliSafe',
+            'brands': {
+                'diy': 'SimpliSafe',
+                'professional': 'ADT',
+                'camera': 'Ring',
+                'doorbell': 'Ring',
+                'smart home': 'Vivint',
+                'no contract': 'SimpliSafe',
+                'apartment': 'Ring',
+                'budget': 'Wyze',
+            }
+        },
+        'pet_tech': {
+            'default': 'Fi Collar',
+            'brands': {
+                'gps': 'Fi Collar',
+                'tracker': 'Fi Collar',
+                'camera': 'Furbo',
+                'fence': 'SpotOn',
+                'training': 'SpotOn',
+                'feeder': 'Petlibro',
+                'dog': 'Fi Collar',
+                'cat': 'Tractive',
+            }
+        },
+        'llc_formation': {
+            'default': 'ZenBusiness',
+            'brands': {
+                'cheap': 'IncFile',
+                'budget': 'IncFile',
+                'fast': 'ZenBusiness',
+                'registered agent': 'Northwest',
+                'premium': 'LegalZoom',
+                'nonprofit': 'LegalZoom',
+                'comprehensive': 'ZenBusiness',
+            }
+        },
+        'data_broker_removal': {
+            'default': 'DeleteMe',
+            'brands': {
+                'comprehensive': 'DeleteMe',
+                'privacy': 'DeleteMe',
+                'automated': 'Incogni',
+                'cheap': 'Incogni',
+                'bundle': 'Aura',
+            }
+        },
+    }
+
+    # Check if a specific brand is mentioned in the keyword
+    all_brands = [
+        'nordvpn', 'expressvpn', 'surfshark', 'cyberghost', 'protonvpn', 'pia',
+        'norton', 'bitdefender', 'mcafee', 'kaspersky', 'avast', 'avg',
+        'purple', 'casper', 'nectar', 'saatva', 'helix', 'tempurpedic',
+        'aura', 'lifelock', 'identityguard',
+        'qustodio', 'bark', 'ourpact', 'life360',
+        'siteground', 'bluehost', 'hostinger', 'cloudways', 'kinsta',
+        'convertkit', 'mailchimp', 'klaviyo', 'activecampaign',
+        'simplisafe', 'adt', 'ring', 'vivint',
+        'zenbusiness', 'incfile', 'legalzoom', 'northwest',
+        'deleteme', 'incogni',
+    ]
+
+    # If keyword mentions a specific brand, that's likely what they'll buy
+    for brand in all_brands:
+        if brand in kw_lower:
+            # Return properly capitalized brand name
+            brand_names = {
+                'nordvpn': 'NordVPN', 'expressvpn': 'ExpressVPN', 'surfshark': 'Surfshark',
+                'cyberghost': 'CyberGhost', 'protonvpn': 'ProtonVPN', 'pia': 'Private Internet Access',
+                'norton': 'Norton 360', 'bitdefender': 'Bitdefender', 'mcafee': 'McAfee',
+                'kaspersky': 'Kaspersky', 'avast': 'Avast', 'avg': 'AVG',
+                'purple': 'Purple', 'casper': 'Casper', 'nectar': 'Nectar',
+                'saatva': 'Saatva', 'helix': 'Helix', 'tempurpedic': 'Tempur-Pedic',
+                'aura': 'Aura', 'lifelock': 'LifeLock', 'identityguard': 'IdentityGuard',
+                'qustodio': 'Qustodio', 'bark': 'Bark', 'ourpact': 'OurPact', 'life360': 'Life360',
+                'siteground': 'SiteGround', 'bluehost': 'Bluehost', 'hostinger': 'Hostinger',
+                'cloudways': 'Cloudways', 'kinsta': 'Kinsta',
+                'convertkit': 'ConvertKit', 'mailchimp': 'Mailchimp', 'klaviyo': 'Klaviyo',
+                'activecampaign': 'ActiveCampaign',
+                'simplisafe': 'SimpliSafe', 'adt': 'ADT', 'ring': 'Ring', 'vivint': 'Vivint',
+                'zenbusiness': 'ZenBusiness', 'incfile': 'IncFile', 'legalzoom': 'LegalZoom',
+                'northwest': 'Northwest', 'deleteme': 'DeleteMe', 'incogni': 'Incogni',
+            }
+            return brand_names.get(brand, brand.title())
+
+    # Look up niche-specific recommendations
+    if niche in NICHE_BRANDS:
+        niche_data = NICHE_BRANDS[niche]
+        # Check for keyword signals
+        for signal, brand in niche_data.get('brands', {}).items():
+            if signal in kw_lower:
+                return brand
+        # Return default for niche
+        return niche_data['default']
+
+    # Generic fallback
+    return '-'
+
+def estimate_revenue_potential(keyword_data, yt_data, niche='general', keyword=''):
+    """
+    CALIBRATED REVENUE MODEL - Based on ALL-TIME revenue data (356 keywords)
+
+    Key insights from real data:
+    - Median keyword earns ~$36/month (all-time avg)
+    - 75th percentile: ~$156/month
+    - 90th percentile: ~$659/month
+    - Top performers: $10K-20K/month
+
+    EPV by keyword type (median values from all-time data):
+    - Deal: $1.18 (75th pct: $4.69)
+    - Comparison: $0.53 (75th pct: $1.27)
+    - Review: $0.31 (75th pct: $0.72)
+    - Best_of: $0.16 (75th pct: $0.42)
+    """
+    volume = keyword_data.get('volume', 0)
+    pattern = yt_data.get('view_pattern', 'no_data')
+    video_count = yt_data.get('video_count', 0)
+
+    # EPV (Earnings Per Visitor) by keyword type - CALIBRATED FROM ALL-TIME DATA
+    keyword_type = classify_keyword_type(keyword)
+    epv_by_type = {
+        'deal': 1.18,         # Median from all-time data (356 kws)
+        'comparison': 0.53,   # Median from all-time data
+        'review': 0.31,       # Median from all-time data
+        'best_of': 0.16,      # Median from all-time data
+        'informational': 0.31,
+        'other': 0.17         # Median from all-time data
+    }
+    base_epv = epv_by_type.get(keyword_type, 0.25)
+
+    # Traffic capture rate based on competition (view pattern)
+    capture_rates = {
+        'distributed': 0.15,      # Low competition - can capture 15%
+        'top_heavy': 0.08,        # Medium competition - 8%
+        'winner_take_all': 0.03,  # High competition - only 3%
+        'no_data': 0.10           # Unknown - assume moderate
+    }
+    capture_rate = capture_rates.get(pattern, 0.10)
+
+    # Adjust capture rate based on video count
+    if video_count < 5:
+        capture_rate *= 1.5  # Low competition bonus
+    elif video_count > 20:
+        capture_rate *= 0.7  # High competition penalty
+
+    # Niche EPV multiplier - some niches convert better
+    niche_multipliers = {
+        'vpn': 1.5,
+        'identity_theft': 1.4,
+        'data_broker_removal': 1.3,
+        'antivirus': 1.2,
+        'web_hosting': 1.3,
+        'email_marketing': 1.2,
+        'parental_control': 1.1,
+        'home_security': 1.0,
+        'pet_tech': 1.0,
+        'general': 1.0
+    }
+    niche_mult = niche_multipliers.get(niche, 1.0)
+
+    # Calculate revenue estimates
+    monthly_traffic = volume * capture_rate
+    adjusted_epv = base_epv * niche_mult
+
+    conservative = monthly_traffic * adjusted_epv * 0.5  # 50% of estimate
+    moderate = monthly_traffic * adjusted_epv            # Full estimate
+    optimistic = monthly_traffic * adjusted_epv * 1.8    # 180% of estimate
+
+    return {
+        'conservative': round(conservative, 2),
+        'moderate': round(moderate, 2),
+        'optimistic': round(optimistic, 2),
+        'keyword_type': keyword_type,
+        'epv': round(adjusted_epv, 2),
+        'capture_rate': round(capture_rate * 100, 1),
+        'estimated_traffic': round(monthly_traffic, 0)
+    }
+
+# ============================================
+# ROUTES
+# ============================================
+
+@app.route('/')
+@login_required
+def index():
+    user = get_current_user()
+    return render_template('index.html', user=user)
+
+@app.route('/api/keywords/refresh', methods=['POST'])
+@login_required
+def refresh_keywords():
+    """Reload keywords from DB into memory. Also imports tracking keywords if missing."""
+    global KEYWORDS
+    try:
+        ensure_tracking_keywords_in_master()
+        KEYWORDS = load_keywords()
+        return jsonify({'success': True, 'count': len(KEYWORDS), 'message': f'Reloaded {len(KEYWORDS)} keywords from database'})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/keywords')
+@login_required
+def get_keywords():
+    user = get_current_user()
+    user_email = user.get('email', 'anonymous') if user else 'anonymous'
+
+    # Try to load enrichment data from DB; gracefully degrade if DB is unreachable
+    labels = {}
+    yt_data = {}
+    vote_data = {}
+    user_votes = {}
+    comment_counts = {}
+    additions = {}
+    trends_data = {}
+    db_available = False
+
+    try:
+        conn = get_db()
+        c = conn.cursor()
+
+        # Get labels (with attribution)
+        c.execute('SELECT keyword, label, is_favorite, notes, label_updated_by, favorite_updated_by, notes_updated_by FROM keyword_labels')
+        for row in c.fetchall():
+            labels[row[0]] = {
+                'label': row[1], 'favorite': bool(row[2]), 'notes': row[3],
+                'labelBy': row[4] or '', 'favoriteBy': row[5] or '', 'notesBy': row[6] or ''
+            }
+
+        # Get YT data from database (collected via cron)
+        c.execute('SELECT keyword, yt_avg_views, yt_view_pattern, yt_top_video_title, yt_top_video_views, yt_top_video_channel FROM keyword_yt_data')
+        yt_data = {row[0].lower(): {
+            'ytViews': row[1],
+            'ytPattern': row[2],
+            'ytTopVideo': row[3],
+            'ytTopViews': row[4],
+            'ytTopChannel': row[5]
+        } for row in c.fetchall()}
+
+        # Get vote counts per keyword
+        c.execute('''
+            SELECT keyword,
+                   COALESCE(SUM(CASE WHEN vote = 1 THEN 1 ELSE 0 END), 0) as upvotes,
+                   COALESCE(SUM(CASE WHEN vote = -1 THEN 1 ELSE 0 END), 0) as downvotes
+            FROM keyword_votes GROUP BY keyword
+        ''')
+        vote_data = {row[0]: {'upvotes': row[1], 'downvotes': row[2], 'score': row[1] - row[2]} for row in c.fetchall()}
+
+        # Get current user's votes
+        c.execute('SELECT keyword, vote FROM keyword_votes WHERE user_email = %s', (user_email,))
+        user_votes = {row[0]: row[1] for row in c.fetchall()}
+
+        # Get comment counts per keyword
+        c.execute('SELECT keyword, COUNT(*) FROM keyword_comments GROUP BY keyword')
+        comment_counts = {row[0]: row[1] for row in c.fetchall()}
+
+        # Get who added each keyword
+        c.execute('SELECT keyword, user_name, user_email, source FROM keyword_additions')
+        for row in c.fetchall():
+            if row[0] not in additions:
+                additions[row[0]] = []
+            additions[row[0]].append({'name': row[1] or row[2], 'source': row[3]})
+
+        # Get cached Google Trends data
+        c.execute('SELECT keyword, trend, trend_change_pct, current_interest FROM keyword_trends')
+        trends_data = {row[0].lower(): {
+            'trend': row[1],
+            'trendChange': row[2],
+            'trendInterest': row[3]
+        } for row in c.fetchall()}
+
+        conn.close()
+        db_available = True
+    except Exception as db_err:
+        print(f"[API/keywords] DB unavailable, serving {len(KEYWORDS)} keywords from memory: {db_err}")
+
+    result = []
+    for k in KEYWORDS:
+        kw = k.copy()
+
+        # Add labels
+        label_data = labels.get(k['keyword'], {'label': 'none', 'favorite': False, 'notes': '', 'labelBy': '', 'favoriteBy': '', 'notesBy': ''})
+        kw['label'] = label_data['label']
+        kw['favorite'] = label_data['favorite']
+        kw['notes'] = label_data['notes']
+        kw['labelBy'] = label_data['labelBy']
+        kw['favoriteBy'] = label_data['favoriteBy']
+        kw['notesBy'] = label_data['notesBy']
+
+        # Merge YT data from database if CSV data is missing
+        keyword_lower = k['keyword'].lower()
+        if keyword_lower in yt_data and (not kw.get('ytViews') or kw.get('ytViews') == 0):
+            db_yt = yt_data[keyword_lower]
+            kw['ytViews'] = db_yt['ytViews'] or 0
+            kw['ytPattern'] = db_yt['ytPattern'] or 'no_data'
+            kw['ytTopVideo'] = db_yt.get('ytTopVideo', '')
+            kw['ytTopViews'] = db_yt.get('ytTopViews', 0)
+            kw['ytTopChannel'] = db_yt.get('ytTopChannel', '')
+
+        # Calculate willingness to spend
+        keyword_type = classify_keyword_type(k['keyword'])
+        willingness = estimate_willingness_to_spend(k['keyword'], keyword_type, k.get('niche', 'other'))
+        kw['willingness'] = willingness
+
+        # Adjust revenue by willingness (original revenue assumed 100% willingness)
+        kw['revenue_original'] = kw.get('revenue', 0)
+        kw['revenue'] = round(kw.get('revenue', 0) * willingness, 2)
+
+        # Suggest ideal brand for this keyword
+        kw['idealBrand'] = suggest_ideal_brand(k['keyword'], k.get('niche', 'other'))
+
+        # Add vote data
+        kw_votes = vote_data.get(k['keyword'], {'upvotes': 0, 'downvotes': 0, 'score': 0})
+        kw['upvotes'] = kw_votes['upvotes']
+        kw['downvotes'] = kw_votes['downvotes']
+        kw['voteScore'] = kw_votes['score']
+        kw['userVote'] = user_votes.get(k['keyword'], 0)
+
+        # Add comment count
+        kw['commentCount'] = comment_counts.get(k['keyword'], 0)
+
+        # Add Google Trends data
+        kw_trend = trends_data.get(keyword_lower, {'trend': 'unknown', 'trendChange': 0, 'trendInterest': 0})
+        kw['trend'] = kw_trend['trend']
+        kw['trendChange'] = kw_trend['trendChange']
+        kw['trendInterest'] = kw_trend['trendInterest']
+
+        # Add who added this keyword
+        kw['addedBy'] = additions.get(k['keyword'], [])
+
+        result.append(kw)
+
+    return jsonify(result)
+
+@app.route('/api/stats')
+@login_required
+def get_stats():
+    total = len(KEYWORDS)
+    total_revenue = sum(k['revenue'] for k in KEYWORDS)
+    a_tier = sum(1 for k in KEYWORDS if 'A -' in k['tier'])
+    avg_priority = sum(k['priority'] for k in KEYWORDS) / total if total > 0 else 0
+
+    niches = {}
+    for k in KEYWORDS:
+        niche = k['niche']
+        if niche not in niches:
+            niches[niche] = {'count': 0, 'revenue': 0}
+        niches[niche]['count'] += 1
+        niches[niche]['revenue'] += k['revenue']
+
+    return jsonify({'total': total, 'totalRevenue': total_revenue, 'aTier': a_tier, 'avgPriority': round(avg_priority, 1), 'niches': niches})
+
+@app.route('/api/export')
+def export_csv():
+    niche = request.args.get('niche', '')
+    funnel = request.args.get('funnel', '')
+    tier = request.args.get('tier', '')
+    pattern = request.args.get('pattern', '')
+    search = request.args.get('search', '').lower()
+
+    filtered = KEYWORDS
+    if niche: filtered = [k for k in filtered if k['niche'] == niche]
+    if funnel: filtered = [k for k in filtered if k['funnel'] == funnel]
+    if tier: filtered = [k for k in filtered if k['tier'] == tier]
+    if pattern: filtered = [k for k in filtered if k['ytPattern'] == pattern]
+    if search: filtered = [k for k in filtered if search in k['keyword'].lower()]
+
+    output = []
+    headers = ['keyword', 'niche', 'funnel', 'intent', 'volume', 'commission', 'revenue', 'buyingIntent', 'ytViews', 'ytPattern', 'priority', 'tier', 'competition', 'contentAngle', 'rationale']
+    output.append(','.join(headers))
+    for k in filtered:
+        row = [str(k.get(h, '')).replace(',', ';').replace('"', "'") for h in headers]
+        output.append(','.join(row))
+
+    return Response('\n'.join(output), mimetype='text/csv', headers={'Content-Disposition': 'attachment; filename=filtered_keywords.csv'})
+
+@app.route('/api/test-dataforseo', methods=['POST'])
+@login_required
+def test_dataforseo():
+    """Test endpoint to check DataForSEO API directly"""
+    try:
+        data = request.get_json()
+        keyword = data.get('keyword', 'test keyword').strip()
+
+        # Check if credentials are set
+        creds_status = {
+            'login_set': bool(DATAFORSEO_LOGIN),
+            'password_set': bool(DATAFORSEO_PASSWORD),
+            'login_length': len(DATAFORSEO_LOGIN) if DATAFORSEO_LOGIN else 0
+        }
+
+        if not DATAFORSEO_LOGIN or not DATAFORSEO_PASSWORD:
+            return jsonify({
+                'success': False,
+                'error': 'DataForSEO credentials not configured',
+                'credentials': creds_status
+            })
+
+        # Test the API
+        result = get_dataforseo_keyword_data([keyword])
+
+        return jsonify({
+            'success': result.get('success'),
+            'data': result.get('data', []),
+            'error': result.get('error'),
+            'source': result.get('source'),
+            'credentials': creds_status,
+            'keyword_tested': keyword
+        })
+
+    except Exception as e:
+        import traceback
+        return jsonify({
+            'success': False,
+            'error': str(e),
+            'traceback': traceback.format_exc()
+        }), 500
+
+@app.route('/api/serpapi-keywords', methods=['POST'])
+@login_required
+def serpapi_keyword_research():
+    """
+    Test endpoint for SerpAPI keyword data.
+    Returns autocomplete suggestions, trends, and related queries.
+    """
+    data = request.get_json()
+    keyword = data.get('keyword', '').strip()
+
+    if not keyword:
+        return jsonify({'success': False, 'error': 'Keyword is required'}), 400
+
+    # Get comprehensive SerpAPI keyword data
+    result = get_serpapi_keyword_data(keyword)
+
+    # Also get YouTube data
+    yt_data = get_serpapi_youtube_data(keyword)
+    if yt_data.get('success'):
+        result['youtube'] = {
+            'total_views': yt_data.get('total_views', 0),
+            'avg_views': yt_data.get('avg_views', 0),
+            'video_count': yt_data.get('video_count', 0),
+            'view_pattern': yt_data.get('view_pattern', 'no_data'),
+            'top_channel': yt_data.get('top_channel', 'Unknown')
+        }
+
+    return jsonify(result)
+
+@app.route('/api/research', methods=['POST'])
+@login_required
+def research_keyword():
+    try:
+        data = request.get_json()
+        seed_keyword = data.get('keyword', '').strip()
+        niche = data.get('niche', 'general')
+
+        if not seed_keyword:
+            return jsonify({'success': False, 'error': 'Keyword is required'}), 400
+
+        results = {'seed_keyword': seed_keyword, 'niche': niche, 'timestamp': datetime.now().isoformat(), 'keywords': [], 'errors': []}
+
+        ke_data = get_keyword_data_with_fallback([seed_keyword])
+        seed_volume_data = ke_data['data'][0] if ke_data['success'] and ke_data.get('data') else {}
+        if not ke_data['success']: results['errors'].append(ke_data.get('error', 'Keyword data API failed'))
+
+        ke_related = get_related_keywords_with_fallback(seed_keyword)
+        related_keywords = ke_related.get('related', []) if ke_related['success'] else []
+        if not ke_related['success']: results['errors'].append(ke_related.get('error', 'Related keywords failed'))
+
+        yt_data = get_serpapi_youtube_data(seed_keyword)
+        if not yt_data['success']:
+            results['errors'].append(yt_data.get('error', 'SerpAPI failed'))
+            yt_data = {'total_views': 0, 'avg_views': 0, 'video_count': 0, 'view_pattern': 'no_data'}
+
+        # Get trend data from SerpAPI
+        trend_data = get_serpapi_google_trends(seed_keyword)
+
+        seed_result = {
+            'keyword': seed_keyword,
+            'volume': seed_volume_data.get('vol', 0),
+            'cpc': seed_volume_data.get('cpc', {}).get('value', 0) if isinstance(seed_volume_data.get('cpc'), dict) else seed_volume_data.get('cpc', 0),
+            'competition': seed_volume_data.get('competition', 0),
+            'trend': trend_data.get('trend', 'unknown') if trend_data.get('success') else 'unknown',
+            'trend_change_pct': trend_data.get('trend_change_pct', 0) if trend_data.get('success') else 0,
+            'trend_interest': trend_data.get('current_interest', 0) if trend_data.get('success') else 0,
+            'yt_total_views': yt_data.get('total_views', 0),
+            'yt_avg_views': yt_data.get('avg_views', 0),
+            'yt_video_count': yt_data.get('video_count', 0),
+            'yt_view_pattern': yt_data.get('view_pattern', 'no_data'),
+            'yt_top_channel': yt_data.get('top_channel', 'Unknown'),
+            'source': ke_data.get('source', 'seed'),
+            'niche': niche
+        }
+
+        seed_result['priority_score'] = calculate_opportunity_score({'volume': seed_result['volume'], 'keyword_difficulty': seed_result['competition'] * 100}, yt_data)
+        seed_result['opportunity_tier'] = determine_tier(seed_result['priority_score'])
+
+        # Get calibrated revenue estimates
+        revenue_data = estimate_revenue_potential(
+            {'volume': seed_result['volume'], 'cpc': seed_result['cpc']},
+            yt_data,
+            niche,
+            keyword=seed_keyword
+        )
+        seed_result['revenue_potential'] = revenue_data['moderate']
+        seed_result['revenue_conservative'] = revenue_data['conservative']
+        seed_result['revenue_optimistic'] = revenue_data['optimistic']
+        seed_result['keyword_type'] = revenue_data['keyword_type']
+        seed_result['epv'] = revenue_data['epv']
+        seed_result['capture_rate'] = revenue_data['capture_rate']
+        seed_result['estimated_traffic'] = revenue_data['estimated_traffic']
+
+        results['keywords'].append(seed_result)
+
+        if related_keywords:
+            related_kw_list = [rk.get('keyword', rk) if isinstance(rk, dict) else rk for rk in related_keywords[:15]]
+            related_volume = get_keyword_data_with_fallback(related_kw_list)
+            volume_map = {item.get('keyword', ''): item for item in related_volume.get('data', [])} if related_volume['success'] else {}
+
+            for rk in related_keywords[:15]:
+                kw = rk.get('keyword', rk) if isinstance(rk, dict) else rk
+                if kw == seed_keyword: continue
+
+                vol_data = volume_map.get(kw, {})
+                rk_result = {
+                    'keyword': kw,
+                    'volume': vol_data.get('vol', 0),
+                    'cpc': vol_data.get('cpc', {}).get('value', 0) if isinstance(vol_data.get('cpc'), dict) else vol_data.get('cpc', 0),
+                    'competition': vol_data.get('competition', 0),
+                    'yt_total_views': 0, 'yt_avg_views': 0, 'yt_video_count': 0, 'yt_view_pattern': 'no_data',
+                    'source': 'related', 'niche': niche
+                }
+                rk_result['priority_score'] = calculate_opportunity_score({'volume': rk_result['volume'], 'keyword_difficulty': rk_result['competition'] * 100}, {})
+                rk_result['opportunity_tier'] = determine_tier(rk_result['priority_score'])
+
+                # Get calibrated revenue estimates for related keyword
+                rk_revenue = estimate_revenue_potential(
+                    {'volume': rk_result['volume'], 'cpc': rk_result['cpc']},
+                    {},
+                    niche,
+                    keyword=kw
+                )
+                rk_result['revenue_potential'] = rk_revenue['moderate']
+                rk_result['revenue_conservative'] = rk_revenue['conservative']
+                rk_result['revenue_optimistic'] = rk_revenue['optimistic']
+                rk_result['keyword_type'] = rk_revenue['keyword_type']
+                rk_result['epv'] = rk_revenue['epv']
+                rk_result['capture_rate'] = rk_revenue['capture_rate']
+                rk_result['estimated_traffic'] = rk_revenue['estimated_traffic']
+
+                results['keywords'].append(rk_result)
+
+        results['keywords'].sort(key=lambda x: x['priority_score'], reverse=True)
+        return jsonify(results)
+
+    except Exception as e:
+        import traceback
+        print(f"Research endpoint error: {e}")
+        print(traceback.format_exc())
+        return jsonify({'success': False, 'error': str(e), 'traceback': traceback.format_exc()}), 500
+
+@app.route('/api/label', methods=['POST'])
+@login_required
+def set_label():
+    data = request.get_json()
+    keyword = data.get('keyword', '').strip()
+    label = data.get('label', 'none')
+    user = get_current_user()
+    user_email = user.get('email', 'anonymous') if user else 'anonymous'
+
+    valid_labels = ['none', 'interested', 'not_interested', 'maybe', 'researching', 'content_created']
+    if label not in valid_labels:
+        return jsonify({'success': False, 'error': f'Invalid label'}), 400
+
+    try:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute('''INSERT INTO keyword_labels (keyword, label, label_updated_by, updated_at)
+                     VALUES (%s, %s, %s, CURRENT_TIMESTAMP)
+                     ON CONFLICT(keyword) DO UPDATE SET label=%s, label_updated_by=%s, updated_at=CURRENT_TIMESTAMP''',
+                  (keyword, label, user_email, label, user_email))
+        conn.commit()
+        conn.close()
+        return jsonify({'success': True, 'keyword': keyword, 'label': label, 'updatedBy': user_email})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/favorite', methods=['POST'])
+@login_required
+def toggle_favorite():
+    data = request.get_json()
+    keyword = data.get('keyword', '').strip()
+    user = get_current_user()
+    user_email = user.get('email', 'anonymous') if user else 'anonymous'
+
+    try:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute('SELECT is_favorite FROM keyword_labels WHERE keyword = %s', (keyword,))
+        row = c.fetchone()
+
+        if row:
+            new_status = not bool(row[0])
+            c.execute('UPDATE keyword_labels SET is_favorite = %s, favorite_updated_by = %s, updated_at = CURRENT_TIMESTAMP WHERE keyword = %s',
+                      (new_status, user_email, keyword))
+        else:
+            new_status = True
+            c.execute('INSERT INTO keyword_labels (keyword, is_favorite, favorite_updated_by) VALUES (%s, %s, %s)',
+                      (keyword, True, user_email))
+
+        conn.commit()
+        conn.close()
+        return jsonify({'success': True, 'keyword': keyword, 'favorite': new_status, 'updatedBy': user_email})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+# ============================================
+# NOTES ENDPOINT
+# ============================================
+@app.route('/api/notes', methods=['POST'])
+@login_required
+def save_notes():
+    """Save notes for a keyword, tracked per user"""
+    data = request.get_json()
+    keyword = data.get('keyword', '').strip()
+    notes = data.get('notes', '')
+    user = get_current_user()
+    user_email = user.get('email', 'anonymous') if user else 'anonymous'
+
+    if not keyword:
+        return jsonify({'success': False, 'error': 'Keyword is required'}), 400
+
+    try:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute('''
+            INSERT INTO keyword_labels (keyword, notes, notes_updated_by, updated_at)
+            VALUES (%s, %s, %s, CURRENT_TIMESTAMP)
+            ON CONFLICT(keyword) DO UPDATE SET notes=%s, notes_updated_by=%s, updated_at=CURRENT_TIMESTAMP
+        ''', (keyword, notes, user_email, notes, user_email))
+        conn.commit()
+        conn.close()
+        return jsonify({'success': True, 'keyword': keyword, 'updatedBy': user_email})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+# ============================================
+# VOTING ENDPOINTS
+# ============================================
+@app.route('/api/vote', methods=['POST'])
+@login_required
+def vote_keyword():
+    """Upvote or downvote a keyword. vote=1 for upvote, vote=-1 for downvote, vote=0 to remove vote"""
+    data = request.get_json()
+    keyword = data.get('keyword', '').strip()
+    vote = data.get('vote', 0)
+    user = get_current_user()
+    user_email = user.get('email', 'anonymous') if user else 'anonymous'
+    user_name = user.get('name', '') if user else ''
+
+    if not keyword:
+        return jsonify({'success': False, 'error': 'Keyword is required'}), 400
+    if vote not in [-1, 0, 1]:
+        return jsonify({'success': False, 'error': 'Vote must be -1, 0, or 1'}), 400
+
+    try:
+        conn = get_db()
+        c = conn.cursor()
+
+        if vote == 0:
+            # Remove vote
+            c.execute('DELETE FROM keyword_votes WHERE keyword = %s AND user_email = %s', (keyword, user_email))
+        else:
+            c.execute('''
+                INSERT INTO keyword_votes (keyword, user_email, user_name, vote, updated_at)
+                VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP)
+                ON CONFLICT(keyword, user_email) DO UPDATE SET
+                    vote = %s, user_name = %s, updated_at = CURRENT_TIMESTAMP
+            ''', (keyword, user_email, user_name, vote, vote, user_name))
+
+        # Return updated vote counts
+        c.execute('SELECT COALESCE(SUM(CASE WHEN vote = 1 THEN 1 ELSE 0 END), 0), COALESCE(SUM(CASE WHEN vote = -1 THEN 1 ELSE 0 END), 0) FROM keyword_votes WHERE keyword = %s', (keyword,))
+        row = c.fetchone()
+        upvotes = row[0]
+        downvotes = row[1]
+
+        # Get current user's vote
+        c.execute('SELECT vote FROM keyword_votes WHERE keyword = %s AND user_email = %s', (keyword, user_email))
+        user_vote_row = c.fetchone()
+        user_vote = user_vote_row[0] if user_vote_row else 0
+
+        conn.commit()
+        conn.close()
+        return jsonify({
+            'success': True,
+            'keyword': keyword,
+            'upvotes': upvotes,
+            'downvotes': downvotes,
+            'score': upvotes - downvotes,
+            'user_vote': user_vote
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/votes', methods=['GET'])
+@login_required
+def get_all_votes():
+    """Get vote counts for all keywords and current user's votes"""
+    user = get_current_user()
+    user_email = user.get('email', 'anonymous') if user else 'anonymous'
+
+    try:
+        conn = get_db()
+        c = conn.cursor()
+
+        # Get aggregate votes per keyword
+        c.execute('''
+            SELECT keyword,
+                   COALESCE(SUM(CASE WHEN vote = 1 THEN 1 ELSE 0 END), 0) as upvotes,
+                   COALESCE(SUM(CASE WHEN vote = -1 THEN 1 ELSE 0 END), 0) as downvotes
+            FROM keyword_votes GROUP BY keyword
+        ''')
+        vote_counts = {}
+        for row in c.fetchall():
+            vote_counts[row[0]] = {'upvotes': row[1], 'downvotes': row[2], 'score': row[1] - row[2]}
+
+        # Get current user's votes
+        c.execute('SELECT keyword, vote FROM keyword_votes WHERE user_email = %s', (user_email,))
+        user_votes = {row[0]: row[1] for row in c.fetchall()}
+
+        # Get voter names per keyword for tooltip
+        c.execute('SELECT keyword, user_name, vote FROM keyword_votes ORDER BY keyword')
+        voters = {}
+        for row in c.fetchall():
+            if row[0] not in voters:
+                voters[row[0]] = []
+            voters[row[0]].append({'name': row[1] or row[0], 'vote': row[2]})
+
+        conn.close()
+        return jsonify({
+            'success': True,
+            'vote_counts': vote_counts,
+            'user_votes': user_votes,
+            'voters': voters
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+# ============================================
+# COMMENTS ENDPOINTS
+# ============================================
+@app.route('/api/comments', methods=['GET'])
+@login_required
+def get_comments():
+    """Get all comments, optionally filtered by keyword"""
+    keyword = request.args.get('keyword', '').strip()
+
+    try:
+        conn = get_db()
+        c = conn.cursor()
+
+        if keyword:
+            c.execute('''
+                SELECT id, keyword, user_email, user_name, comment, created_at, updated_at
+                FROM keyword_comments WHERE keyword = %s ORDER BY created_at DESC
+            ''', (keyword,))
+        else:
+            c.execute('''
+                SELECT id, keyword, user_email, user_name, comment, created_at, updated_at
+                FROM keyword_comments ORDER BY created_at DESC
+            ''')
+
+        comments = []
+        for row in c.fetchall():
+            comments.append({
+                'id': row[0],
+                'keyword': row[1],
+                'user_email': row[2],
+                'user_name': row[3],
+                'comment': row[4],
+                'created_at': row[5],
+                'updated_at': row[6]
+            })
+
+        conn.close()
+        return jsonify({'success': True, 'comments': comments})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/comments', methods=['POST'])
+@login_required
+def add_comment():
+    """Add a comment to a keyword"""
+    data = request.get_json()
+    keyword = data.get('keyword', '').strip()
+    comment = data.get('comment', '').strip()
+    user = get_current_user()
+    user_email = user.get('email', 'anonymous') if user else 'anonymous'
+    user_name = user.get('name', '') if user else ''
+
+    if not keyword:
+        return jsonify({'success': False, 'error': 'Keyword is required'}), 400
+    if not comment:
+        return jsonify({'success': False, 'error': 'Comment is required'}), 400
+
+    try:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute('''
+            INSERT INTO keyword_comments (keyword, user_email, user_name, comment)
+            VALUES (%s, %s, %s, %s)
+        ''', (keyword, user_email, user_name, comment))
+        comment_id = c.lastrowid
+
+        conn.commit()
+        conn.close()
+        return jsonify({
+            'success': True,
+            'comment': {
+                'id': comment_id,
+                'keyword': keyword,
+                'user_email': user_email,
+                'user_name': user_name,
+                'comment': comment,
+                'created_at': datetime.now().isoformat()
+            }
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/comments/<int:comment_id>', methods=['DELETE'])
+@login_required
+def delete_comment(comment_id):
+    """Delete a comment (only by the user who created it)"""
+    user = get_current_user()
+    user_email = user.get('email', 'anonymous') if user else 'anonymous'
+
+    try:
+        conn = get_db()
+        c = conn.cursor()
+
+        # Verify ownership
+        c.execute('SELECT user_email FROM keyword_comments WHERE id = %s', (comment_id,))
+        row = c.fetchone()
+        if not row:
+            conn.close()
+            return jsonify({'success': False, 'error': 'Comment not found'}), 404
+        if row[0] != user_email:
+            conn.close()
+            return jsonify({'success': False, 'error': 'Not authorized to delete this comment'}), 403
+
+        c.execute('DELETE FROM keyword_comments WHERE id = %s', (comment_id,))
+        conn.commit()
+        conn.close()
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+# ============================================
+# ADD TO LIBRARY (from Research) WITH USER TRACKING
+# ============================================
+@app.route('/api/library/add', methods=['POST'])
+@login_required
+def add_to_library():
+    """Add a keyword to the library from Research or Channel Analysis, with user tracking"""
+    data = request.get_json()
+    keyword = data.get('keyword', '').strip()
+    source = data.get('source', 'manual')
+    source_detail = data.get('source_detail', '')
+    keyword_data = data.get('keyword_data', {})
+    user = get_current_user()
+    user_email = user.get('email', 'anonymous') if user else 'anonymous'
+    user_name = user.get('name', '') if user else ''
+
+    if not keyword:
+        return jsonify({'success': False, 'error': 'Keyword is required'}), 400
+
+    try:
+        conn = get_db()
+        c = conn.cursor()
+
+        # Track who added it
+        c.execute('''
+            INSERT INTO keyword_additions (keyword, user_email, user_name, source, source_detail)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT(keyword, user_email) DO UPDATE SET
+                source = EXCLUDED.source,
+                source_detail = EXCLUDED.source_detail
+        ''', (keyword, user_email, user_name, source, source_detail))
+
+        # Add to researched_keywords if it has data
+        if keyword_data:
+            c.execute('''
+                INSERT INTO researched_keywords
+                (keyword, seed_keyword, source, search_volume, keyword_difficulty, cpc,
+                 yt_avg_views, yt_total_views, yt_video_count, yt_view_pattern,
+                 revenue_potential, priority_score, opportunity_tier, niche, funnel_stage)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT(keyword, source) DO UPDATE SET
+                    search_volume = EXCLUDED.search_volume,
+                    revenue_potential = EXCLUDED.revenue_potential,
+                    priority_score = EXCLUDED.priority_score,
+                    opportunity_tier = EXCLUDED.opportunity_tier,
+                    researched_at = CURRENT_TIMESTAMP
+            ''', (
+                keyword,
+                keyword_data.get('seed_keyword', ''),
+                source,
+                keyword_data.get('volume', 0),
+                keyword_data.get('competition', 0),
+                keyword_data.get('cpc', 0),
+                keyword_data.get('yt_avg_views', 0),
+                keyword_data.get('yt_total_views', 0),
+                keyword_data.get('yt_video_count', 0),
+                keyword_data.get('yt_view_pattern', 'no_data'),
+                keyword_data.get('revenue_potential', 0),
+                keyword_data.get('priority_score', 0),
+                keyword_data.get('opportunity_tier', 'B - High Value'),
+                keyword_data.get('niche', 'general'),
+                keyword_data.get('funnel_stage', '')
+            ))
+
+        # Insert into keywords_master (single source of truth)
+        niche = keyword_data.get('niche', 'general') if keyword_data else 'general'
+        volume = keyword_data.get('volume', 0) if keyword_data else 0
+        c.execute('''
+            INSERT INTO keywords_master
+            (keyword, niche, volume, yt_avg_monthly_views, yt_view_pattern,
+             revenue_potential, priority_score, opportunity_tier,
+             added_by_email, added_by_name, source)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT(keyword) DO UPDATE SET
+                volume = CASE WHEN EXCLUDED.volume > 0 THEN EXCLUDED.volume ELSE keywords_master.volume END,
+                updated_at = CURRENT_TIMESTAMP
+        ''', (
+            keyword, niche, volume,
+            keyword_data.get('yt_avg_views', 0) if keyword_data else 0,
+            keyword_data.get('yt_view_pattern', '') if keyword_data else '',
+            keyword_data.get('revenue_potential', 0) if keyword_data else 0,
+            keyword_data.get('priority_score', 0) if keyword_data else 0,
+            keyword_data.get('opportunity_tier', 'B - High Value') if keyword_data else 'B - High Value',
+            user_email, user_name or user_email, source
+        ))
+
+        # Add to in-memory KEYWORDS if not already there
+        if not any(k['keyword'].lower() == keyword.lower() for k in KEYWORDS):
+            KEYWORDS.append({
+                'keyword': keyword, 'niche': niche, 'funnel': '', 'intent': '',
+                'volume': volume, 'commission': 0, 'revenue': 0, 'buyingIntent': 0,
+                'ytViews': 0, 'ytPattern': '', 'priority': 0, 'tier': 'B - High Value',
+                'competition': '', 'contentAngle': '', 'rationale': '',
+                'conversionLikelihood': '', 'timeToConvert': '', 'problemType': '',
+                'urgencyScore': 0, 'ytTopVideo': '', 'ytTopViews': 0, 'ytTopChannel': '',
+                'addedByEmail': user_email, 'addedByName': user_name or user_email, 'source': source,
+            })
+
+        # Set label to 'interested' if not already set
+        c.execute('''
+            INSERT INTO keyword_labels (keyword, label, label_updated_by, notes, updated_at)
+            VALUES (%s, 'interested', %s, %s, CURRENT_TIMESTAMP)
+            ON CONFLICT(keyword) DO UPDATE SET
+                label = CASE WHEN keyword_labels.label = 'none' THEN 'interested' ELSE keyword_labels.label END,
+                label_updated_by = CASE WHEN keyword_labels.label = 'none' THEN %s ELSE keyword_labels.label_updated_by END,
+                updated_at = CURRENT_TIMESTAMP
+        ''', (keyword, user_email, f'[Added by {user_name or user_email} from {source}]', user_email))
+
+        conn.commit()
+        conn.close()
+        return jsonify({
+            'success': True,
+            'keyword': keyword,
+            'added_by': user_name or user_email,
+            'source': source
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/keywords/add-manual', methods=['POST'])
+@login_required
+def add_keyword_manual():
+    """Add one or more keywords manually from the Library tab"""
+    data = request.get_json()
+    keywords_input = data.get('keywords', '').strip()
+    niche = data.get('niche', 'general')
+    user = get_current_user()
+    user_email = user.get('email', 'anonymous') if user else 'anonymous'
+    user_name = user.get('name', '') if user else ''
+
+    if not keywords_input:
+        return jsonify({'success': False, 'error': 'Keywords are required'}), 400
+
+    # Support comma-separated or newline-separated keywords
+    raw_keywords = [kw.strip() for kw in keywords_input.replace('\n', ',').split(',') if kw.strip()]
+
+    if not raw_keywords:
+        return jsonify({'success': False, 'error': 'No valid keywords provided'}), 400
+
+    try:
+        conn = get_db()
+        c = conn.cursor()
+
+        added = []
+        skipped = []
+
+        for keyword in raw_keywords:
+            # Check if already exists
+            c.execute('SELECT id FROM keywords_master WHERE keyword = %s', (keyword,))
+            if c.fetchone():
+                skipped.append(keyword)
+                continue
+
+            # Insert into keywords_master
+            c.execute('''
+                INSERT INTO keywords_master
+                (keyword, niche, added_by_email, added_by_name, source)
+                VALUES (%s, %s, %s, %s, 'manual')
+            ''', (keyword, niche, user_email, user_name or user_email))
+
+            # Track who added it
+            c.execute('''
+                INSERT INTO keyword_additions (keyword, user_email, user_name, source, source_detail)
+                VALUES (%s, %s, %s, 'manual', 'Library tab')
+                ON CONFLICT(keyword, user_email) DO UPDATE SET
+                    source = 'manual', source_detail = 'Library tab'
+            ''', (keyword, user_email, user_name))
+
+            # Set label to 'interested'
+            c.execute('''
+                INSERT INTO keyword_labels (keyword, label, label_updated_by, updated_at)
+                VALUES (%s, 'interested', %s, CURRENT_TIMESTAMP)
+                ON CONFLICT(keyword) DO NOTHING
+            ''', (keyword, user_email))
+
+            # Add to in-memory KEYWORDS
+            KEYWORDS.append({
+                'keyword': keyword, 'niche': niche, 'funnel': '', 'intent': '',
+                'volume': 0, 'commission': 0, 'revenue': 0, 'buyingIntent': 0,
+                'ytViews': 0, 'ytPattern': '', 'priority': 0, 'tier': '',
+                'competition': '', 'contentAngle': '', 'rationale': '',
+                'conversionLikelihood': '', 'timeToConvert': '', 'problemType': '',
+                'urgencyScore': 0, 'ytTopVideo': '', 'ytTopViews': 0, 'ytTopChannel': '',
+                'addedByEmail': user_email, 'addedByName': user_name or user_email, 'source': 'manual',
+            })
+
+            added.append(keyword)
+
+        conn.commit()
+        conn.close()
+
+        return jsonify({
+            'success': True,
+            'added': len(added),
+            'skipped': len(skipped),
+            'added_keywords': added,
+            'skipped_keywords': skipped,
+            'message': f'Added {len(added)} keyword(s). {len(skipped)} already existed.',
+            'added_by': user_name or user_email
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/keyword/additions', methods=['GET'])
+@login_required
+def get_keyword_additions():
+    """Get who added which keywords"""
+    try:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute('SELECT keyword, user_email, user_name, source, source_detail, created_at FROM keyword_additions ORDER BY created_at DESC')
+        additions = {}
+        for row in c.fetchall():
+            kw = row[0]
+            if kw not in additions:
+                additions[kw] = []
+            additions[kw].append({
+                'user_email': row[1],
+                'user_name': row[2],
+                'source': row[3],
+                'source_detail': row[4],
+                'created_at': row[5]
+            })
+        conn.close()
+        return jsonify({'success': True, 'additions': additions})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/channel/add-to-library', methods=['POST'])
+@login_required
+def add_channel_keywords_to_library():
+    """Add keywords from channel analysis to the keyword library for further research"""
+    data = request.get_json()
+    keywords = data.get('keywords', [])
+    source_channel = data.get('channel', 'unknown')
+    user = get_current_user()
+    user_email = user.get('email', 'anonymous') if user else 'anonymous'
+    user_name = user.get('name', '') if user else ''
+
+    if not keywords:
+        return jsonify({'success': False, 'error': 'No keywords provided'}), 400
+
+    try:
+        conn = get_db()
+        c = conn.cursor()
+
+        added = []
+        skipped = []
+
+        for kw in keywords:
+            keyword = kw.get('keyword', '').strip()
+            if not keyword:
+                continue
+
+            # Check if keyword already exists
+            c.execute('SELECT id FROM researched_keywords WHERE keyword = %s', (keyword,))
+            if c.fetchone():
+                skipped.append(keyword)
+                continue
+
+            # Insert into researched_keywords
+            c.execute('''
+                INSERT INTO researched_keywords
+                (keyword, seed_keyword, source, yt_avg_views, yt_total_views, yt_video_count,
+                 yt_view_pattern, revenue_potential, niche, funnel_stage, opportunity_tier)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ''', (
+                keyword,
+                source_channel,
+                'channel_analysis',
+                kw.get('avg_views', 0),
+                kw.get('total_views', 0),
+                kw.get('count', 0),
+                kw.get('view_pattern', 'no_data'),
+                kw.get('revenue_potential', 0),
+                kw.get('niche', 'general'),
+                kw.get('conversion_immediacy', 'medium'),
+                'B - High Value'  # Default tier, will be researched
+            ))
+
+            # Insert into keywords_master (single source of truth)
+            kw_niche = kw.get('niche', 'general')
+            c.execute('''
+                INSERT INTO keywords_master
+                (keyword, niche, yt_avg_monthly_views, yt_view_pattern,
+                 revenue_potential, opportunity_tier,
+                 added_by_email, added_by_name, source)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT(keyword) DO UPDATE SET
+                    yt_avg_monthly_views = CASE WHEN EXCLUDED.yt_avg_monthly_views > 0 THEN EXCLUDED.yt_avg_monthly_views ELSE keywords_master.yt_avg_monthly_views END,
+                    updated_at = CURRENT_TIMESTAMP
+            ''', (
+                keyword, kw_niche,
+                kw.get('avg_views', 0), kw.get('view_pattern', 'no_data'),
+                kw.get('revenue_potential', 0), 'B - High Value',
+                user_email, user_name or user_email, 'channel_analysis'
+            ))
+
+            # Add to in-memory KEYWORDS if not already there
+            if not any(k['keyword'].lower() == keyword.lower() for k in KEYWORDS):
+                KEYWORDS.append({
+                    'keyword': keyword, 'niche': kw_niche, 'funnel': '', 'intent': '',
+                    'volume': 0, 'commission': 0, 'revenue': 0, 'buyingIntent': 0,
+                    'ytViews': kw.get('avg_views', 0), 'ytPattern': kw.get('view_pattern', ''),
+                    'priority': 0, 'tier': 'B - High Value',
+                    'competition': '', 'contentAngle': '', 'rationale': '',
+                    'conversionLikelihood': '', 'timeToConvert': '', 'problemType': '',
+                    'urgencyScore': 0, 'ytTopVideo': '', 'ytTopViews': 0, 'ytTopChannel': '',
+                    'addedByEmail': user_email, 'addedByName': user_name or user_email,
+                    'source': 'channel_analysis',
+                })
+
+            # Insert/update YouTube data
+            c.execute('''
+                INSERT INTO keyword_yt_data
+                (keyword, yt_avg_views, yt_view_pattern, yt_total_views, yt_video_count)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT(keyword) DO UPDATE SET
+                    yt_avg_views = EXCLUDED.yt_avg_views,
+                    yt_view_pattern = EXCLUDED.yt_view_pattern,
+                    yt_total_views = EXCLUDED.yt_total_views,
+                    yt_video_count = EXCLUDED.yt_video_count,
+                    updated_at = CURRENT_TIMESTAMP
+            ''', (
+                keyword,
+                kw.get('avg_views', 0),
+                kw.get('view_pattern', 'no_data'),
+                kw.get('total_views', 0),
+                kw.get('count', 0)
+            ))
+
+            # Set label to 'researching'
+            c.execute('''
+                INSERT INTO keyword_labels (keyword, label, label_updated_by, notes, updated_at)
+                VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP)
+                ON CONFLICT(keyword) DO UPDATE SET
+                    label = CASE WHEN keyword_labels.label = 'none' THEN 'researching' ELSE keyword_labels.label END,
+                    label_updated_by = CASE WHEN keyword_labels.label = 'none' THEN %s ELSE keyword_labels.label_updated_by END,
+                    notes = COALESCE(keyword_labels.notes, '') || EXCLUDED.notes,
+                    updated_at = CURRENT_TIMESTAMP
+            ''', (keyword, 'researching', user_email, f' [From channel: {source_channel}]', user_email))
+
+            # Track who added this keyword
+            c.execute('''
+                INSERT INTO keyword_additions (keyword, user_email, user_name, source, source_detail)
+                VALUES (%s, %s, %s, 'channel_analysis', %s)
+                ON CONFLICT(keyword, user_email) DO UPDATE SET
+                    source = 'channel_analysis',
+                    source_detail = EXCLUDED.source_detail
+            ''', (keyword, user_email, user_name, source_channel))
+
+            added.append(keyword)
+
+        conn.commit()
+        conn.close()
+
+        return jsonify({
+            'success': True,
+            'added': len(added),
+            'skipped': len(skipped),
+            'added_keywords': added,
+            'skipped_keywords': skipped,
+            'message': f'Added {len(added)} keywords to library. {len(skipped)} already existed.'
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/revenue/analysis')
+def analyze_revenue():
+    try:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute('SELECT r.keyword, r.video_views, r.affiliate_clicks, r.conversions, r.revenue, k.search_volume, k.yt_avg_views, k.yt_view_pattern FROM revenue_data r LEFT JOIN researched_keywords k ON r.keyword = k.keyword')
+        rows = c.fetchall()
+        conn.close()
+
+        if not rows:
+            return jsonify({'success': True, 'message': 'No revenue data yet. Add revenue data to enable pattern analysis.', 'patterns': []})
+
+        analysis = {'total_records': len(rows), 'total_revenue': sum(r[4] for r in rows if r[4]), 'avg_revenue_per_keyword': sum(r[4] for r in rows if r[4]) / len(rows), 'patterns': []}
+
+        pattern_revenue = {}
+        for row in rows:
+            pattern = row[7] or 'unknown'
+            if pattern not in pattern_revenue: pattern_revenue[pattern] = []
+            if row[4]: pattern_revenue[pattern].append(row[4])
+
+        for pattern, revenues in pattern_revenue.items():
+            if revenues:
+                analysis['patterns'].append({'pattern': pattern, 'count': len(revenues), 'avg_revenue': sum(revenues) / len(revenues), 'max_revenue': max(revenues), 'min_revenue': min(revenues)})
+
+        return jsonify({'success': True, 'analysis': analysis})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/competitor/analyze', methods=['POST'])
+@login_required
+def analyze_competitor():
+    """
+    Analyze a competitor's YouTube channel or website to extract keyword opportunities.
+    Returns ALL videos with their target keywords + aggregated keyword opportunities.
+    """
+    data = request.get_json()
+    competitor = data.get('competitor', '').strip()
+    comp_type = data.get('type', 'youtube')
+    niche = data.get('niche', 'general')
+    max_pages = data.get('max_pages', 3)  # How many pages of videos to fetch
+
+    if not competitor:
+        return jsonify({'success': False, 'error': 'Competitor name is required'}), 400
+
+    results = {
+        'success': True,
+        'competitor': competitor,
+        'type': comp_type,
+        'niche': niche,
+        'keywords': [],       # Aggregated unique keywords with metrics
+        'all_videos': [],     # Full list of videos with target keywords
+        'errors': []
+    }
+
+    try:
+        if comp_type == 'youtube':
+            # Get ALL videos from the competitor's YouTube channel
+            yt_results = search_competitor_youtube(competitor)
+            if yt_results.get('success'):
+                videos = yt_results.get('videos', [])
+
+                # Extract keywords - returns (aggregated_keywords, per_video_keywords)
+                extracted_keywords, video_keywords = extract_keywords_from_videos(videos)
+
+                # Store all videos with their target keywords
+                results['all_videos'] = video_keywords
+                results['video_count'] = len(videos)
+
+                # Get volume data for aggregated keywords
+                results['keywords'] = enrich_competitor_keywords(extracted_keywords, niche)
+
+                # Also enrich the video keywords with volume data
+                if video_keywords:
+                    unique_targets = list(set(v['target_keyword'] for v in video_keywords if v['target_keyword']))
+                    target_volumes = get_keyword_data_with_fallback(unique_targets[:50])  # API limit
+
+                    volume_map = {}
+                    if target_volumes.get('success') and target_volumes.get('data'):
+                        for item in target_volumes['data']:
+                            volume_map[item.get('keyword', '').lower()] = item.get('vol', 0)
+
+                    # Add volume to each video's target keyword
+                    for video in results['all_videos']:
+                        kw = video.get('target_keyword', '').lower()
+                        video['keyword_volume'] = volume_map.get(kw, 0)
+
+            else:
+                results['errors'].append(yt_results.get('error', 'YouTube search failed'))
+
+        else:
+            # Website analysis - search for site content
+            web_results = search_competitor_website(competitor)
+            if web_results.get('success'):
+                results['keywords'] = enrich_competitor_keywords(web_results.get('keywords', []), niche)
+            else:
+                results['errors'].append(web_results.get('error', 'Website analysis failed'))
+
+        # Sort aggregated keywords by priority score
+        results['keywords'].sort(key=lambda x: x.get('priority_score', 0), reverse=True)
+
+        # Sort videos by volume (highest first)
+        results['all_videos'].sort(key=lambda x: x.get('keyword_volume', 0), reverse=True)
+
+        return jsonify(results)
+
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+# ============================================
+# CHANNEL KEYWORD ANALYSIS (NEW)
+# ============================================
+
+@app.route('/api/keyword/extract', methods=['POST'])
+@login_required
+def test_keyword_extraction():
+    """Test endpoint to verify keyword extraction logic"""
+    try:
+        data = request.get_json()
+        titles = data.get('titles', [])
+
+        if isinstance(titles, str):
+            titles = [titles]
+
+        results = []
+        for title in titles:
+            extracted = extract_target_keyword(title)
+            results.append({
+                'input': title,
+                'extracted': extracted
+            })
+
+        return jsonify({'success': True, 'results': results})
+
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+
+@app.route('/api/channel/debug', methods=['POST'])
+@login_required
+def debug_channel_fetch():
+    """Debug endpoint to see what's happening with channel video fetching"""
+    try:
+        data = request.get_json()
+        channel = data.get('channel', '').strip()
+
+        debug_info = {
+            'input': channel,
+            'youtube_api_key_configured': bool(YOUTUBE_API_KEY),
+            'serpapi_key_configured': bool(SERPAPI_API_KEY),
+            'steps': []
+        }
+
+        # Step 1: Find the channel
+        debug_info['steps'].append({'step': 'Finding channel...'})
+        channel_info = find_youtube_channel(channel)
+        debug_info['channel_info'] = channel_info
+
+        if channel_info.get('success'):
+            channel_id = channel_info.get('channel_id')
+            channel_name = channel_info.get('channel_name')
+            debug_info['channel_id'] = channel_id
+            debug_info['channel_name'] = channel_name
+
+            # Step 2: Try YouTube Data API
+            if YOUTUBE_API_KEY:
+                debug_info['steps'].append({'step': 'Trying YouTube Data API...'})
+                api_videos = fetch_videos_via_youtube_api(channel_id)
+                debug_info['youtube_api_video_count'] = len(api_videos)
+                debug_info['youtube_api_sample'] = [v.get('title', '')[:50] for v in api_videos[:5]]
+            else:
+                debug_info['steps'].append({'step': 'YouTube API key not configured, skipping'})
+
+            # Step 3: Try SerpAPI strategies
+            debug_info['steps'].append({'step': 'Trying SerpAPI strategies...'})
+            all_videos = fetch_channel_videos_by_id(channel_id, channel_name=channel_name)
+            debug_info['total_videos_found'] = len(all_videos)
+            debug_info['video_sources'] = {}
+            for v in all_videos:
+                src = v.get('source', 'unknown')
+                debug_info['video_sources'][src] = debug_info['video_sources'].get(src, 0) + 1
+
+        return jsonify({'success': True, 'debug': debug_info})
+
+    except Exception as e:
+        import traceback
+        return jsonify({'success': False, 'error': str(e), 'traceback': traceback.format_exc()})
+
+@app.route('/api/channel/analyze', methods=['POST'])
+@login_required
+def analyze_channel_keywords():
+    """
+    Analyze a YouTube channel's keyword publishing patterns.
+    Scrapes all videos and analyzes:
+    - How many times they publish on each keyword
+    - Republishing frequency (time between videos on same keyword)
+    - Most frequent keywords
+    """
+    try:
+        data = request.get_json()
+        channel = data.get('channel', '').strip()
+
+        if not channel:
+            return jsonify({'success': False, 'error': 'Channel is required'}), 400
+
+        print(f"[CHANNEL ANALYSIS] Starting analysis for: {channel}")
+
+        # Fetch all videos from the channel
+        yt_results = search_competitor_youtube(channel)
+
+        if not yt_results.get('success'):
+            return jsonify({
+                'success': False,
+                'error': yt_results.get('error', 'Failed to fetch channel videos')
+            }), 400
+
+        videos = yt_results.get('videos', [])
+        channel_name = yt_results.get('channel_name', channel)
+
+        print(f"[CHANNEL ANALYSIS] Found {len(videos)} videos from {channel_name}")
+
+        if not videos:
+            return jsonify({
+                'success': False,
+                'error': 'No videos found for this channel'
+            }), 404
+
+        # Analyze keyword patterns from video titles
+        keyword_analysis = analyze_keyword_patterns(videos, channel_name)
+
+        return jsonify({
+            'success': True,
+            'channel': channel_name,
+            'channel_id': yt_results.get('channel_id', ''),
+            'total_videos': len(videos),
+            'videos': videos,  # Return all videos
+            'keyword_patterns': keyword_analysis['patterns'],
+            'keyword_groups': keyword_analysis['groups'],
+            'top_keywords': keyword_analysis['top_keywords'],
+            'hot_keywords': keyword_analysis['hot_keywords'],  # Republished in last 12 months
+            'publishing_stats': keyword_analysis['stats'],
+            'republish_analysis': keyword_analysis['republish']
+        })
+
+    except Exception as e:
+        print(f"[CHANNEL ANALYSIS] Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+def detect_niche(text):
+    """
+    Detect the niche/category from a keyword or title.
+    Returns the niche name or 'other' if not detected.
+    """
+    if not text:
+        return 'other'
+
+    text_lower = text.lower()
+
+    # Niche definitions: {niche_name: [brand_names, category_terms]}
+    NICHE_PATTERNS = {
+        'vpn': {
+            'brands': ['nordvpn', 'nord vpn', 'expressvpn', 'express vpn', 'surfshark', 'cyberghost',
+                      'private internet access', 'pia', 'protonvpn', 'proton vpn', 'ipvanish',
+                      'mullvad', 'windscribe', 'tunnelbear', 'hotspot shield', 'purevpn'],
+            'terms': ['vpn', 'virtual private network']
+        },
+        'mattress': {
+            'brands': ['purple', 'casper', 'nectar', 'saatva', 'helix', 'leesa', 'tuft and needle',
+                      'tuft & needle', 'brooklyn bedding', 'dreamcloud', 'winkbed', 'avocado',
+                      'tempur-pedic', 'tempurpedic', 'sleep number', 'beautyrest', 'serta'],
+            'terms': ['mattress', 'bed', 'sleep', 'pillow', 'bedding', 'topper']
+        },
+        'parental_control': {
+            'brands': ['bark', 'qustodio', 'net nanny', 'norton family', 'kaspersky safe kids',
+                      'famisafe', 'ourpact', 'screen time', 'mobicip', 'circle', 'boomerang'],
+            'terms': ['parental control', 'parental monitoring', 'kids safety', 'child safety',
+                     'screen time', 'family safety']
+        },
+        'llc_formation': {
+            'brands': ['zenbusiness', 'legalzoom', 'incfile', 'northwest registered agent',
+                      'rocket lawyer', 'bizfilings', 'swyft filings', 'tailor brands',
+                      'harbor compliance', 'mycorporation'],
+            'terms': ['llc', 'incorporate', 'business formation', 'registered agent', 'ein']
+        },
+        'antivirus': {
+            'brands': ['norton', 'mcafee', 'bitdefender', 'kaspersky', 'avast', 'avg', 'malwarebytes',
+                      'eset', 'trend micro', 'webroot', 'totalav', 'intego', 'f-secure'],
+            'terms': ['antivirus', 'anti-virus', 'malware', 'virus protection', 'internet security']
+        },
+        'identity_theft': {
+            'brands': ['lifelock', 'aura', 'identity guard', 'identityforce', 'id watchdog',
+                      'idshield', 'experian identityworks', 'credit sesame', 'privacy guard'],
+            'terms': ['identity theft', 'identity protection', 'credit monitoring', 'dark web monitoring']
+        },
+        'password_manager': {
+            'brands': ['lastpass', '1password', 'dashlane', 'bitwarden', 'keeper', 'roboform',
+                      'nordpass', 'zoho vault', 'sticky password', 'enpass'],
+            'terms': ['password manager', 'password vault', 'password keeper']
+        },
+        'web_hosting': {
+            'brands': ['bluehost', 'siteground', 'hostinger', 'hostgator', 'dreamhost', 'a2 hosting',
+                      'inmotion', 'greengeeks', 'wpengine', 'wp engine', 'cloudways', 'kinsta',
+                      'godaddy', 'namecheap', 'ionos', 'scala hosting'],
+            'terms': ['web hosting', 'hosting', 'wordpress hosting', 'vps', 'dedicated server',
+                     'shared hosting', 'cloud hosting']
+        },
+        'email_marketing': {
+            'brands': ['mailchimp', 'convertkit', 'constant contact', 'activecampaign', 'getresponse',
+                      'aweber', 'drip', 'klaviyo', 'sendinblue', 'brevo', 'mailerlite', 'hubspot'],
+            'terms': ['email marketing', 'newsletter', 'email automation', 'email list']
+        },
+        'home_security': {
+            'brands': ['ring', 'simplisafe', 'adt', 'vivint', 'frontpoint', 'abode', 'cove',
+                      'brinks', 'link interactive', 'scout', 'wyze', 'eufy', 'arlo', 'nest'],
+            'terms': ['home security', 'security camera', 'security system', 'alarm system',
+                     'doorbell camera', 'smart lock']
+        },
+        'pet': {
+            'brands': ['fi', 'whistle', 'tractive', 'petcube', 'furbo', 'litter robot',
+                      'chewy', 'petco', 'rover', 'wag', 'barkbox', 'ollie', 'nom nom', 'farmers dog'],
+            'terms': ['pet', 'dog', 'cat', 'puppy', 'kitten', 'pet insurance', 'dog food', 'cat food',
+                     'gps tracker', 'pet camera']
+        },
+        'website_builder': {
+            'brands': ['wix', 'squarespace', 'weebly', 'shopify', 'wordpress', 'webflow',
+                      'godaddy website builder', 'zyro', 'strikingly', 'carrd', 'duda'],
+            'terms': ['website builder', 'site builder', 'web design', 'landing page', 'ecommerce']
+        },
+        'crm': {
+            'brands': ['salesforce', 'hubspot', 'zoho crm', 'pipedrive', 'monday', 'freshsales',
+                      'copper', 'insightly', 'agile crm', 'close'],
+            'terms': ['crm', 'customer relationship', 'sales software', 'lead management']
+        },
+        'vpn_streaming': {
+            'brands': [],  # Use VPN brands
+            'terms': ['streaming', 'netflix', 'hulu', 'disney plus', 'amazon prime', 'bbc iplayer',
+                     'unblock', 'geo-restriction']
+        },
+        'tax_software': {
+            'brands': ['turbotax', 'h&r block', 'taxact', 'freetaxusa', 'taxslayer', 'jackson hewitt',
+                      'credit karma tax', 'cash app taxes'],
+            'terms': ['tax software', 'tax filing', 'tax return', 'tax prep']
+        },
+        'online_learning': {
+            'brands': ['coursera', 'udemy', 'skillshare', 'masterclass', 'linkedin learning',
+                      'pluralsight', 'datacamp', 'codecademy', 'brilliant', 'duolingo'],
+            'terms': ['online course', 'online learning', 'e-learning', 'tutorial', 'certification']
+        },
+        'meal_delivery': {
+            'brands': ['hellofresh', 'blue apron', 'home chef', 'green chef', 'factor', 'freshly',
+                      'sunbasket', 'dinnerly', 'everyplate', 'gobble', 'marley spoon'],
+            'terms': ['meal kit', 'meal delivery', 'food delivery', 'prepared meals']
+        },
+        'fitness': {
+            'brands': ['peloton', 'mirror', 'tonal', 'bowflex', 'nordictrack', 'hydrow',
+                      'beachbody', 'apple fitness', 'fitbit', 'whoop', 'oura'],
+            'terms': ['fitness', 'workout', 'exercise', 'gym', 'treadmill', 'bike', 'rowing']
+        },
+        'data_removal': {
+            'brands': ['deleteme', 'incogni', 'kanary', 'privacy duck', 'removaly', 'optery'],
+            'terms': ['data broker', 'data removal', 'privacy', 'remove personal information',
+                     'opt out', 'people search']
+        }
+    }
+
+    # Check each niche
+    for niche, patterns in NICHE_PATTERNS.items():
+        # Check brands first (more specific)
+        for brand in patterns.get('brands', []):
+            if brand in text_lower:
+                return niche
+
+        # Check category terms
+        for term in patterns.get('terms', []):
+            if term in text_lower:
+                return niche
+
+    return 'other'
+
+def extract_target_keyword(title):
+    """
+    Extract the target keyword from a YouTube video title.
+
+    Rules:
+    - Split on separators (|, -, :) and take first segment
+    - Normalize "Top N" to "Best"
+    - Remove years (2020-2029) from the end
+    - Remove filler/clickbait words
+    - Preserve original brand spelling (NordVPN vs Nord VPN)
+    - Identify keyword type (review, comparison, best-of, etc.)
+
+    Returns: {
+        'keyword': 'nordvpn review',
+        'keyword_normalized': 'nordvpn review',  # for grouping
+        'keyword_type': 'review',
+        'original_segment': 'NordVPN Review 2024'
+    }
+    """
+    import re
+
+    if not title:
+        return None
+
+    original_title = title
+
+    # Step 1: Remove emojis and clean unicode
+    title = re.sub(r'[^\x00-\x7F]+', ' ', title)  # Remove non-ASCII (emojis)
+    title = title.strip()
+
+    # Step 2: Split on major separators and take first segment
+    # Priority: | then - then : then [ then (
+    separators = [r'\s*\|\s*', r'\s+-\s+', r'\s*:\s*', r'\s*\[\s*', r'\s*\(\s*']
+
+    segment = title
+    for sep in separators:
+        parts = re.split(sep, segment, maxsplit=1)
+        if len(parts) > 1 and len(parts[0].strip()) >= 5:
+            segment = parts[0].strip()
+            break
+
+    original_segment = segment
+
+    # Step 3: Identify keyword type based on patterns
+    keyword_type = 'other'
+    segment_lower = segment.lower()
+
+    # Comparison: "X vs Y" or "X versus Y"
+    if re.search(r'\bvs\.?\b|\bversus\b', segment_lower):
+        keyword_type = 'comparison'
+    # Review patterns
+    elif re.search(r'\breview\b', segment_lower):
+        keyword_type = 'review'
+    # Best-of patterns (including "Top N")
+    elif re.search(r'\b(best|top\s*\d+)\b', segment_lower):
+        keyword_type = 'best_of'
+    # How-to patterns
+    elif re.search(r'^how\s+to\b', segment_lower):
+        keyword_type = 'how_to'
+    # Deal/Coupon patterns
+    elif re.search(r'\b(coupon|discount|deal|promo|code|offer|sale)\b', segment_lower):
+        keyword_type = 'deal'
+    # Tutorial/Guide
+    elif re.search(r'\b(tutorial|guide|setup|install)\b', segment_lower):
+        keyword_type = 'tutorial'
+
+    # Step 4: Normalize "Top N" to "Best"
+    segment = re.sub(r'\btop\s*\d+\b', 'Best', segment, flags=re.IGNORECASE)
+
+    # Step 5: Remove years from the END only (preserve years in product names like "iPhone 15")
+    # Match year at end, possibly with parentheses
+    segment = re.sub(r'\s*\(?\s*20[2-3]\d\s*\)?\s*$', '', segment)
+
+    # Step 6: Remove filler/clickbait words (usually at the end)
+    filler_words = [
+        r'\s*\b(honest|real|full|complete|ultimate|updated|unbiased|detailed)\b\s*$',
+        r'\s*\b(must watch|watch this|you need|before you buy)\b.*$',
+        r'\s*\b(my experience|my opinion|my thoughts)\b.*$',
+        r'\s*[!?]+\s*$',  # Trailing punctuation
+    ]
+    for filler in filler_words:
+        segment = re.sub(filler, '', segment, flags=re.IGNORECASE)
+
+    # Step 7: Clean up extra whitespace
+    segment = ' '.join(segment.split())
+    segment = segment.strip()
+
+    # Step 8: Create normalized version for grouping (lowercase, minimal)
+    normalized = segment.lower()
+    # Remove extra spaces and standardize
+    normalized = ' '.join(normalized.split())
+
+    # If segment is too short or empty, try to salvage from original
+    if len(segment) < 3:
+        segment = original_segment
+        normalized = segment.lower()
+
+    # Step 9: Detect niche from the keyword
+    niche = detect_niche(segment)
+
+    return {
+        'keyword': segment,
+        'keyword_normalized': normalized,
+        'keyword_type': keyword_type,
+        'niche': niche,
+        'original_segment': original_segment,
+        'original_title': original_title
+    }
+
+def analyze_keyword_patterns(videos, channel_name):
+    """Analyze keyword publishing patterns from a list of videos using smart keyword extraction"""
+    import re
+    from datetime import datetime, timedelta
+    from collections import defaultdict
+
+    # Extract keywords from video titles
+    keyword_counts = defaultdict(list)  # normalized_keyword -> list of video info
+    keyword_first_published = {}
+    keyword_last_published = {}
+
+    # Helper to parse publish date
+    def parse_date(date_str):
+        if not date_str:
+            return None
+        try:
+            original_date_str = date_str
+            date_str_lower = date_str.lower().strip()
+
+            # Handle ISO 8601 format from YouTube API (2024-01-15T10:30:00Z)
+            if 'T' in original_date_str:
+                try:
+                    # Remove timezone suffix and parse
+                    clean_date = original_date_str.replace('Z', '').split('.')[0]
+                    return datetime.strptime(clean_date, '%Y-%m-%dT%H:%M:%S')
+                except:
+                    pass
+
+            # Handle relative dates like "2 weeks ago", "3 months ago"
+            if 'ago' in date_str_lower:
+                now = datetime.now()
+
+                if 'hour' in date_str_lower:
+                    hours = int(re.search(r'(\d+)', date_str_lower).group(1))
+                    return now - timedelta(hours=hours)
+                elif 'day' in date_str_lower:
+                    days = int(re.search(r'(\d+)', date_str_lower).group(1))
+                    return now - timedelta(days=days)
+                elif 'week' in date_str_lower:
+                    weeks = int(re.search(r'(\d+)', date_str_lower).group(1))
+                    return now - timedelta(weeks=weeks)
+                elif 'month' in date_str_lower:
+                    months = int(re.search(r'(\d+)', date_str_lower).group(1))
+                    return now - timedelta(days=months * 30)
+                elif 'year' in date_str_lower:
+                    years = int(re.search(r'(\d+)', date_str_lower).group(1))
+                    return now - timedelta(days=years * 365)
+
+            # Try parsing various date formats
+            for fmt in ['%b %d, %Y', '%Y-%m-%d', '%d %b %Y', '%B %d, %Y', '%Y-%m-%dT%H:%M:%S']:
+                try:
+                    return datetime.strptime(date_str_lower, fmt)
+                except:
+                    try:
+                        return datetime.strptime(original_date_str, fmt)
+                    except:
+                        continue
+
+            return None
+        except:
+            return None
+
+    # Extract target keyword from each video using smart extraction
+    for video in videos:
+        title = video.get('title', '')
+        published_date_str = video.get('published_date', '') or video.get('published_time', '')
+        published_date = parse_date(published_date_str)
+        views = video.get('views', 0)
+
+        # Parse views
+        if isinstance(views, str):
+            views = views.lower().replace(' views', '').replace(',', '').replace('k', '000').replace('m', '000000')
+            try:
+                views = int(float(views))
+            except:
+                views = 0
+
+        # Extract the target keyword using our smart extraction
+        extracted = extract_target_keyword(title)
+
+        if not extracted:
+            continue
+
+        keyword = extracted['keyword']
+        keyword_normalized = extracted['keyword_normalized']
+        keyword_type = extracted['keyword_type']
+        niche = extracted['niche']
+
+        # Track video info
+        video_info = {
+            'title': title,
+            'link': video.get('link', ''),
+            'published_date': published_date_str,
+            'parsed_date': published_date.isoformat() if published_date else None,
+            'views': views,
+            'keyword_type': keyword_type,
+            'niche': niche,
+            'extracted_keyword': keyword
+        }
+
+        # Group by normalized keyword (for finding duplicates)
+        keyword_counts[keyword_normalized].append(video_info)
+
+        if published_date:
+            if keyword_normalized not in keyword_first_published or published_date < parse_date(keyword_first_published[keyword_normalized]):
+                keyword_first_published[keyword_normalized] = published_date_str
+            if keyword_normalized not in keyword_last_published or published_date > parse_date(keyword_last_published[keyword_normalized]):
+                keyword_last_published[keyword_normalized] = published_date_str
+
+    # Calculate keyword statistics
+    keyword_stats = []
+    twelve_months_ago = datetime.now() - timedelta(days=365)
+
+    for keyword_normalized, video_list in keyword_counts.items():
+        if len(video_list) >= 1:  # Include all keywords (even single occurrence for debugging)
+            total_views = sum(v.get('views', 0) for v in video_list)
+            avg_views = total_views / len(video_list) if video_list else 0
+
+            # Get the display keyword from the first video (preserves original casing)
+            display_keyword = video_list[0].get('extracted_keyword', keyword_normalized)
+
+            # Get the most common keyword type
+            keyword_types = [v.get('keyword_type', 'other') for v in video_list]
+            keyword_type = max(set(keyword_types), key=keyword_types.count)
+
+            # Get the most common niche
+            niches = [v.get('niche', 'other') for v in video_list]
+            niche = max(set(niches), key=niches.count)
+
+            # Calculate time between videos
+            dates = [parse_date(v.get('published_date', '')) for v in video_list]
+            dates = [d for d in dates if d]
+            dates.sort()
+
+            republish_interval_days = None
+            if len(dates) >= 2:
+                intervals = [(dates[i+1] - dates[i]).days for i in range(len(dates)-1)]
+                republish_interval_days = sum(intervals) / len(intervals)
+
+            # Calculate recent (last 12 months) stats
+            recent_videos = [v for v in video_list if parse_date(v.get('published_date', '')) and parse_date(v.get('published_date', '')) >= twelve_months_ago]
+            recent_count = len(recent_videos)
+            recent_views = sum(v.get('views', 0) for v in recent_videos)
+
+            # Calculate view distribution pattern for this keyword's videos
+            view_counts = sorted([v.get('views', 0) for v in video_list], reverse=True)
+            view_pattern = 'no_data'
+            if len(view_counts) >= 3 and sum(view_counts) > 0:
+                total = sum(view_counts)
+                top_share = view_counts[0] / total
+                top3_share = sum(view_counts[:3]) / total
+                if top_share > 0.5:
+                    view_pattern = 'winner_take_all'
+                elif top3_share > 0.7:
+                    view_pattern = 'top_heavy'
+                else:
+                    view_pattern = 'distributed'
+
+            # Conversion immediacy based on keyword type
+            conversion_immediacy_map = {
+                'deal': 'high',      # People ready to buy with coupon/deal
+                'comparison': 'high', # Comparing options = close to decision
+                'review': 'medium',   # Researching specific product
+                'best_of': 'medium',  # Looking for recommendations
+                'informational': 'low',  # Just learning
+                'other': 'medium'
+            }
+            conversion_immediacy = conversion_immediacy_map.get(keyword_type, 'medium')
+
+            # Estimate revenue potential using avg_views as proxy for traffic
+            # EPV by keyword type from calibrated model
+            epv_by_type = {
+                'deal': 1.18, 'comparison': 0.53, 'review': 0.31,
+                'best_of': 0.16, 'informational': 0.10, 'other': 0.17
+            }
+            base_epv = epv_by_type.get(keyword_type, 0.17)
+
+            # Niche multiplier
+            niche_multipliers = {
+                'vpn': 1.5, 'identity_theft': 1.4, 'data_broker_removal': 1.3,
+                'antivirus': 1.2, 'web_hosting': 1.3, 'email_marketing': 1.2,
+                'parental_control': 1.1, 'home_security': 1.0, 'pet_tech': 1.0,
+                'mattress': 1.1, 'llc_formation': 1.2
+            }
+            niche_mult = niche_multipliers.get(niche, 1.0)
+
+            # Traffic capture rate based on view distribution
+            capture_rates = {
+                'distributed': 0.15, 'top_heavy': 0.08,
+                'winner_take_all': 0.03, 'no_data': 0.10
+            }
+            capture_rate = capture_rates.get(view_pattern, 0.10)
+
+            # Calculate willingness to spend (% of searchers willing to pay)
+            willingness = estimate_willingness_to_spend(display_keyword, keyword_type, niche)
+
+            # Estimate monthly traffic from avg_views (rough proxy)
+            # Assume avg_views represents ~30% of monthly search traffic for top results
+            estimated_monthly_traffic = avg_views * 3 * capture_rate
+            adjusted_epv = base_epv * niche_mult
+
+            # Revenue potential = traffic × EPV × willingness to spend
+            revenue_potential = round(estimated_monthly_traffic * adjusted_epv * willingness, 2)
+
+            keyword_stats.append({
+                'keyword': display_keyword,
+                'keyword_normalized': keyword_normalized,
+                'keyword_type': keyword_type,
+                'niche': niche,
+                'count': len(video_list),
+                'total_views': total_views,
+                'avg_views': int(avg_views),
+                'first_published': keyword_first_published.get(keyword_normalized, ''),
+                'last_published': keyword_last_published.get(keyword_normalized, ''),
+                'republish_interval_days': round(republish_interval_days, 1) if republish_interval_days else None,
+                'recent_count': recent_count,  # Videos in last 12 months
+                'recent_views': recent_views,
+                'is_hot': recent_count >= 2,  # Republished recently
+                'view_pattern': view_pattern,  # View distribution pattern
+                'conversion_immediacy': conversion_immediacy,  # How close to purchase
+                'willingness_to_spend': willingness,  # % of searchers willing to pay
+                'revenue_potential': revenue_potential,  # Estimated $/month (adjusted by willingness)
+                'epv': round(adjusted_epv, 2),  # Earnings per visitor
+                'capture_rate': round(capture_rate * 100, 1),  # Traffic capture %
+                'videos': video_list[:5]  # Include first 5 videos as examples
+            })
+
+    # Sort by count (most frequent first)
+    keyword_stats.sort(key=lambda x: x['count'], reverse=True)
+
+    # Filter to only keywords with 2+ videos for most stats
+    repeated_keywords = [k for k in keyword_stats if k['count'] >= 2]
+
+    # Hot keywords - republished 2+ times in last 12 months
+    hot_keywords = sorted(
+        [k for k in keyword_stats if k['recent_count'] >= 2],
+        key=lambda x: x['recent_count'],
+        reverse=True
+    )
+
+    # Group keywords by niche
+    niche_groups = {}
+    for k in repeated_keywords:
+        niche = k['niche']
+        if niche not in niche_groups:
+            niche_groups[niche] = []
+        niche_groups[niche].append(k)
+
+    # Sort each niche group by count
+    for niche in niche_groups:
+        niche_groups[niche].sort(key=lambda x: x['count'], reverse=True)
+        niche_groups[niche] = niche_groups[niche][:20]  # Top 20 per niche
+
+    # Group keywords by category
+    keyword_groups = {
+        'frequent_topics': [k for k in repeated_keywords if k['count'] >= 5][:20],
+        'repeated_keywords': [k for k in repeated_keywords if 2 <= k['count'] < 5][:30],
+        'high_view_keywords': sorted(repeated_keywords, key=lambda x: x['avg_views'], reverse=True)[:20],
+        # Hot keywords - actively republishing in last 12 months
+        'hot_recent': hot_keywords[:20],
+        # Group by keyword type
+        'reviews': [k for k in repeated_keywords if k['keyword_type'] == 'review'][:15],
+        'comparisons': [k for k in repeated_keywords if k['keyword_type'] == 'comparison'][:15],
+        'best_of': [k for k in repeated_keywords if k['keyword_type'] == 'best_of'][:15],
+        'deals': [k for k in repeated_keywords if k['keyword_type'] == 'deal'][:15],
+        # Group by niche
+        'by_niche': niche_groups,
+    }
+
+    # Calculate overall publishing stats
+    all_dates = []
+    for video in videos:
+        d = parse_date(video.get('published_date', '') or video.get('published_time', ''))
+        if d:
+            all_dates.append(d)
+
+    all_dates.sort()
+
+    # Find the most repeated keyword (count >= 2)
+    most_used = repeated_keywords[0] if repeated_keywords else None
+    hottest = hot_keywords[0] if hot_keywords else None
+
+    # Count niches
+    niche_counts = {}
+    for k in repeated_keywords:
+        niche = k['niche']
+        niche_counts[niche] = niche_counts.get(niche, 0) + 1
+
+    publishing_stats = {
+        'total_videos': len(videos),
+        'unique_keywords_found': len(repeated_keywords),
+        'total_unique_keywords': len(keyword_stats),
+        'most_used_keyword': most_used['keyword'] if most_used else None,
+        'most_used_keyword_count': most_used['count'] if most_used else 0,
+        'hot_keywords_count': len(hot_keywords),  # Keywords republished in last 12 months
+        'hottest_keyword': hottest['keyword'] if hottest else None,
+        'hottest_keyword_recent_count': hottest['recent_count'] if hottest else 0,
+        'niches_found': list(niche_counts.keys()),
+        'niche_counts': niche_counts,
+    }
+
+    if len(all_dates) >= 2:
+        days_range = (all_dates[-1] - all_dates[0]).days
+        publishing_stats['date_range_days'] = days_range
+        publishing_stats['avg_videos_per_month_alltime'] = round(len(videos) / max(1, days_range / 30), 1)
+        publishing_stats['first_video_date'] = all_dates[0].strftime('%Y-%m-%d')
+        publishing_stats['last_video_date'] = all_dates[-1].strftime('%Y-%m-%d')
+
+        # Calculate RECENT publishing rate (last 90 days) - more accurate for active channels
+        ninety_days_ago = datetime.now() - timedelta(days=90)
+        recent_videos = [d for d in all_dates if d >= ninety_days_ago]
+        if len(recent_videos) >= 3:  # Need at least a few videos to calculate rate
+            publishing_stats['avg_videos_per_month'] = round(len(recent_videos) / 3, 1)  # 90 days = 3 months
+            publishing_stats['videos_last_90_days'] = len(recent_videos)
+        else:
+            # Fall back to all-time if not enough recent data
+            publishing_stats['avg_videos_per_month'] = publishing_stats['avg_videos_per_month_alltime']
+            publishing_stats['videos_last_90_days'] = len(recent_videos)
+
+    # Republish analysis - which keywords get republished most often
+    republish_analysis = sorted(
+        [k for k in keyword_stats if k['republish_interval_days'] is not None],
+        key=lambda x: x['republish_interval_days']
+    )[:20]
+
+    return {
+        'patterns': repeated_keywords[:50],  # Top 50 repeated keywords
+        'all_keywords': keyword_stats[:100],  # All keywords including single-use
+        'hot_keywords': hot_keywords[:30],  # Keywords republished in last 12 months
+        'groups': keyword_groups,
+        'top_keywords': [{'keyword': k['keyword'], 'keyword_type': k['keyword_type'], 'niche': k['niche'], 'count': k['count'], 'avg_views': k['avg_views'], 'recent_count': k['recent_count']} for k in repeated_keywords[:20]],
+        'stats': publishing_stats,
+        'republish': republish_analysis
+    }
+
+def search_competitor_youtube(competitor):
+    """
+    Get ALL videos from a YouTube channel using SerpAPI.
+    Accepts: channel URL, channel handle (@name), or channel name.
+    """
+    try:
+        if not SERPAPI_API_KEY:
+            return {'success': False, 'error': 'SerpAPI key not configured'}
+
+        import re
+
+        # Extract channel identifier from various URL formats
+        channel_id = None
+        channel_handle = None
+        method_used = None
+
+        print(f"Analyzing competitor: {competitor}")
+
+        # Check if it's a URL
+        if 'youtube.com' in competitor or 'youtu.be' in competitor:
+            # Handle various YouTube URL formats
+            # /channel/UC... format
+            channel_match = re.search(r'/channel/(UC[a-zA-Z0-9_-]+)', competitor)
+            if channel_match:
+                channel_id = channel_match.group(1)
+                method_used = 'direct_channel_id'
+                print(f"Found channel ID from URL: {channel_id}")
+
+            # /@handle format
+            handle_match = re.search(r'/@([a-zA-Z0-9_-]+)', competitor)
+            if handle_match:
+                channel_handle = handle_match.group(1)
+                method_used = 'handle_from_url'
+                print(f"Found handle from URL: @{channel_handle}")
+
+            # /c/CustomName or /user/Username format
+            custom_match = re.search(r'/(?:c|user)/([a-zA-Z0-9_-]+)', competitor)
+            if custom_match:
+                channel_handle = custom_match.group(1)
+                method_used = 'custom_url'
+                print(f"Found custom/user name from URL: {channel_handle}")
+
+        # Check if it's a handle (starts with @)
+        elif competitor.startswith('@'):
+            channel_handle = competitor[1:]
+            method_used = 'handle_direct'
+            print(f"Direct handle input: @{channel_handle}")
+
+        # Otherwise treat as channel name to search for
+        else:
+            channel_handle = competitor
+            method_used = 'name_search'
+            print(f"Will search for channel name: {channel_handle}")
+
+        all_videos = []
+        channel_name = None
+
+        # If we have a channel ID, use it directly
+        if channel_id:
+            print(f"Fetching videos using channel ID: {channel_id}")
+            # Try to get channel name first if we don't have it
+            if not channel_name:
+                channel_info = find_youtube_channel(channel_id)
+                channel_name = channel_info.get('channel_name', competitor)
+            videos = fetch_channel_videos_by_id(channel_id, channel_name=channel_name)
+            all_videos.extend(videos)
+        else:
+            # First, search for the channel to get its ID
+            print(f"Searching for channel: {channel_handle or competitor}")
+            channel_info = find_youtube_channel(channel_handle or competitor)
+            if channel_info.get('success') and channel_info.get('channel_id'):
+                channel_id = channel_info['channel_id']
+                channel_name = channel_info.get('channel_name', '')
+                print(f"Found channel: {channel_name} (ID: {channel_id})")
+                videos = fetch_channel_videos_by_id(channel_id, channel_name=channel_name)
+                all_videos.extend(videos)
+            else:
+                # Fallback: search YouTube for videos mentioning the competitor
+                print(f"Channel not found, using fallback search for: {competitor}")
+                method_used = 'fallback_search'
+                fallback_videos = search_youtube_videos(competitor)
+                all_videos.extend(fallback_videos)
+
+        print(f"Total videos found: {len(all_videos)}")
+
+        return {
+            'success': True,
+            'videos': all_videos,
+            'total_found': len(all_videos),
+            'channel_id': channel_id,
+            'channel_name': channel_name,
+            'method_used': method_used
+        }
+
+    except Exception as e:
+        print(f"Error in search_competitor_youtube: {e}")
+        return {'success': False, 'error': str(e)}
+
+def find_youtube_channel(query):
+    """Search for a YouTube channel and return its ID using multiple strategies"""
+    import re
+
+    print(f"[FIND_CHANNEL] Searching for: {query}")
+
+    # Strategy 1: If we have a YouTube API key, use it to resolve handles directly
+    if YOUTUBE_API_KEY:
+        print("[FIND_CHANNEL] Trying YouTube Data API...")
+        result = find_channel_via_youtube_api(query)
+        if result.get('success'):
+            print(f"[FIND_CHANNEL] Found via YouTube API: {result.get('channel_name')} ({result.get('channel_id')})")
+            return result
+
+    # Strategy 2: Try SerpAPI with channel filter
+    print("[FIND_CHANNEL] Trying SerpAPI with channel filter...")
+    try:
+        url = "https://serpapi.com/search.json"
+        params = {
+            "engine": "youtube",
+            "search_query": query,
+            "api_key": SERPAPI_API_KEY,
+            "sp": "EgIQAg=="  # Filter for channels only
+        }
+
+        response = requests.get(url, params=params, timeout=30)
+
+        if response.status_code == 200:
+            data = response.json()
+            channels = data.get('channel_results', [])
+
+            if channels:
+                channel = channels[0]
+                channel_link = channel.get('link', '')
+                match = re.search(r'/channel/(UC[a-zA-Z0-9_-]+)', channel_link)
+                if match:
+                    print(f"[FIND_CHANNEL] Found via SerpAPI channel search: {channel.get('title')}")
+                    return {
+                        'success': True,
+                        'channel_id': match.group(1),
+                        'channel_name': channel.get('title', ''),
+                        'subscribers': channel.get('subscribers', '')
+                    }
+    except Exception as e:
+        print(f"[FIND_CHANNEL] SerpAPI channel search error: {e}")
+
+    # Strategy 3: Try SerpAPI without channel filter (search videos, extract channel)
+    print("[FIND_CHANNEL] Trying SerpAPI video search...")
+    try:
+        # Try different query variations
+        search_queries = [query]
+        if query.startswith('@'):
+            # Convert handle to readable name
+            clean_name = query[1:].replace('_', ' ').replace('-', ' ')
+            search_queries.append(clean_name)
+            search_queries.append(f'"{clean_name}"')
+
+        for search_query in search_queries:
+            params = {
+                "engine": "youtube",
+                "search_query": search_query,
+                "api_key": SERPAPI_API_KEY
+            }
+
+            response = requests.get(url, params=params, timeout=30)
+
+            if response.status_code == 200:
+                data = response.json()
+
+                # Check channel results first
+                channels = data.get('channel_results', [])
+                if channels:
+                    channel = channels[0]
+                    channel_link = channel.get('link', '')
+                    match = re.search(r'/channel/(UC[a-zA-Z0-9_-]+)', channel_link)
+                    if match:
+                        print(f"[FIND_CHANNEL] Found channel in results: {channel.get('title')}")
+                        return {
+                            'success': True,
+                            'channel_id': match.group(1),
+                            'channel_name': channel.get('title', ''),
+                            'subscribers': channel.get('subscribers', '')
+                        }
+
+                # Check video results for channel info
+                videos = data.get('video_results', [])
+                for video in videos:
+                    channel_info = video.get('channel', {})
+                    if isinstance(channel_info, dict):
+                        channel_link = channel_info.get('link', '')
+                        channel_name = channel_info.get('name', '')
+                    else:
+                        continue
+
+                    match = re.search(r'/channel/(UC[a-zA-Z0-9_-]+)', channel_link)
+                    if match:
+                        # Check if this channel matches our query
+                        query_lower = query.lower().replace('@', '').replace('_', '').replace('-', '')
+                        name_lower = channel_name.lower().replace(' ', '').replace('_', '').replace('-', '')
+
+                        if query_lower in name_lower or name_lower in query_lower:
+                            print(f"[FIND_CHANNEL] Found matching channel from video: {channel_name}")
+                            return {
+                                'success': True,
+                                'channel_id': match.group(1),
+                                'channel_name': channel_name
+                            }
+
+    except Exception as e:
+        print(f"[FIND_CHANNEL] SerpAPI video search error: {e}")
+
+    print("[FIND_CHANNEL] Channel not found with any strategy")
+    return {'success': False, 'error': 'Channel not found'}
+
+def find_channel_via_youtube_api(query):
+    """Use YouTube Data API to find a channel by handle or name"""
+    try:
+        if not YOUTUBE_API_KEY:
+            return {'success': False, 'error': 'No YouTube API key'}
+
+        import re
+
+        # Clean up the query
+        search_term = query.strip()
+        if search_term.startswith('@'):
+            search_term = search_term[1:]
+
+        # Method 1: Try to search for the channel directly
+        url = "https://www.googleapis.com/youtube/v3/search"
+        params = {
+            'part': 'snippet',
+            'q': search_term,
+            'type': 'channel',
+            'maxResults': 5,
+            'key': YOUTUBE_API_KEY
+        }
+
+        response = requests.get(url, params=params, timeout=30)
+
+        if response.status_code == 200:
+            data = response.json()
+            items = data.get('items', [])
+
+            for item in items:
+                channel_id = item.get('id', {}).get('channelId')
+                snippet = item.get('snippet', {})
+                channel_title = snippet.get('title', '')
+
+                if channel_id:
+                    # Check if this matches our query
+                    query_lower = search_term.lower().replace('_', '').replace('-', '').replace(' ', '')
+                    title_lower = channel_title.lower().replace('_', '').replace('-', '').replace(' ', '')
+
+                    if query_lower in title_lower or title_lower in query_lower or len(items) == 1:
+                        return {
+                            'success': True,
+                            'channel_id': channel_id,
+                            'channel_name': channel_title,
+                            'description': snippet.get('description', '')[:100]
+                        }
+
+        # Method 2: Try forHandle parameter (for @handles)
+        if query.startswith('@'):
+            url = "https://www.googleapis.com/youtube/v3/channels"
+            params = {
+                'part': 'snippet,contentDetails',
+                'forHandle': query,  # Include the @ symbol
+                'key': YOUTUBE_API_KEY
+            }
+
+            response = requests.get(url, params=params, timeout=30)
+
+            if response.status_code == 200:
+                data = response.json()
+                items = data.get('items', [])
+
+                if items:
+                    item = items[0]
+                    return {
+                        'success': True,
+                        'channel_id': item.get('id'),
+                        'channel_name': item.get('snippet', {}).get('title', ''),
+                        'description': item.get('snippet', {}).get('description', '')[:100]
+                    }
+
+        return {'success': False, 'error': 'Channel not found via YouTube API'}
+
+    except Exception as e:
+        print(f"[YT_API_FIND] Error: {e}")
+        return {'success': False, 'error': str(e)}
+
+def fetch_videos_via_youtube_api(channel_id, max_results=10000):
+    """
+    Fetch ALL videos from a YouTube channel using the official YouTube Data API.
+    This is the ONLY reliable way to get all videos from a channel.
+
+    Default limit is 10,000 videos which should cover virtually any channel.
+    Each API call fetches 50 videos and costs ~1 quota unit.
+
+    Requires YOUTUBE_API_KEY environment variable to be set.
+    Get a free API key from: https://console.cloud.google.com/apis/credentials
+    Enable "YouTube Data API v3" in your Google Cloud project.
+    """
+    all_videos = []
+
+    try:
+        if not YOUTUBE_API_KEY:
+            print("[YT_API] No YouTube API key configured")
+            return all_videos
+
+        import time
+
+        # Step 1: Get the channel's uploads playlist ID
+        # The uploads playlist ID is "UU" + channel_id[2:] (replace UC with UU)
+        if channel_id.startswith('UC'):
+            uploads_playlist_id = 'UU' + channel_id[2:]
+        else:
+            # Need to fetch channel info first to get the uploads playlist
+            print(f"[YT_API] Fetching channel info for: {channel_id}")
+            channel_url = f"https://www.googleapis.com/youtube/v3/channels"
+            params = {
+                'part': 'contentDetails',
+                'id': channel_id,
+                'key': YOUTUBE_API_KEY
+            }
+            response = requests.get(channel_url, params=params, timeout=30)
+            if response.status_code != 200:
+                print(f"[YT_API] Channel fetch error: {response.status_code}")
+                return all_videos
+
+            data = response.json()
+            items = data.get('items', [])
+            if not items:
+                print("[YT_API] Channel not found")
+                return all_videos
+
+            uploads_playlist_id = items[0].get('contentDetails', {}).get('relatedPlaylists', {}).get('uploads')
+            if not uploads_playlist_id:
+                print("[YT_API] No uploads playlist found")
+                return all_videos
+
+        print(f"[YT_API] Fetching videos from playlist: {uploads_playlist_id}")
+
+        # Step 2: Fetch all videos from the uploads playlist
+        playlist_url = "https://www.googleapis.com/youtube/v3/playlistItems"
+        page_token = None
+        total_fetched = 0
+
+        while total_fetched < max_results:
+            params = {
+                'part': 'snippet',
+                'playlistId': uploads_playlist_id,
+                'maxResults': 50,  # Max allowed per request
+                'key': YOUTUBE_API_KEY
+            }
+            if page_token:
+                params['pageToken'] = page_token
+
+            response = requests.get(playlist_url, params=params, timeout=30)
+
+            if response.status_code != 200:
+                print(f"[YT_API] Playlist fetch error: {response.status_code}")
+                error_data = response.json()
+                print(f"[YT_API] Error details: {error_data.get('error', {}).get('message', 'Unknown')}")
+                break
+
+            data = response.json()
+            items = data.get('items', [])
+
+            if not items:
+                print("[YT_API] No more videos in playlist")
+                break
+
+            for item in items:
+                snippet = item.get('snippet', {})
+                video_id = snippet.get('resourceId', {}).get('videoId')
+
+                if video_id:
+                    video = {
+                        'video_id': video_id,
+                        'title': snippet.get('title', ''),
+                        'link': f'https://www.youtube.com/watch?v={video_id}',
+                        'published_date': snippet.get('publishedAt', ''),
+                        'description': snippet.get('description', '')[:200],
+                        'thumbnail': snippet.get('thumbnails', {}).get('medium', {}).get('url', ''),
+                        'channel': {
+                            'name': snippet.get('channelTitle', ''),
+                            'id': snippet.get('channelId', '')
+                        }
+                    }
+                    all_videos.append(video)
+                    total_fetched += 1
+
+            print(f"[YT_API] Fetched {len(items)} videos (total: {total_fetched})")
+
+            # Check for next page
+            page_token = data.get('nextPageToken')
+            if not page_token:
+                print("[YT_API] No more pages")
+                break
+
+            time.sleep(0.1)  # Small delay to avoid rate limiting
+
+        print(f"[YT_API] Total videos fetched: {len(all_videos)}")
+
+        # Step 3: Fetch view counts for all videos (in batches of 50)
+        if all_videos:
+            print(f"[YT_API] Fetching view counts for {len(all_videos)} videos...")
+            video_ids = [v.get('video_id') for v in all_videos if v.get('video_id')]
+            view_counts = {}
+
+            # Process in batches of 50
+            for i in range(0, len(video_ids), 50):
+                batch_ids = video_ids[i:i+50]
+                videos_url = "https://www.googleapis.com/youtube/v3/videos"
+                params = {
+                    'part': 'statistics',
+                    'id': ','.join(batch_ids),
+                    'key': YOUTUBE_API_KEY
+                }
+
+                try:
+                    response = requests.get(videos_url, params=params, timeout=30)
+                    if response.status_code == 200:
+                        data = response.json()
+                        for item in data.get('items', []):
+                            vid_id = item.get('id')
+                            stats = item.get('statistics', {})
+                            view_counts[vid_id] = int(stats.get('viewCount', 0))
+                    else:
+                        print(f"[YT_API] View count fetch error: {response.status_code}")
+                except Exception as e:
+                    print(f"[YT_API] View count batch error: {e}")
+
+                time.sleep(0.05)  # Small delay between batches
+
+            # Update videos with view counts
+            for video in all_videos:
+                vid_id = video.get('video_id')
+                if vid_id and vid_id in view_counts:
+                    video['views'] = view_counts[vid_id]
+                else:
+                    video['views'] = 0
+
+            total_views = sum(view_counts.values())
+            print(f"[YT_API] Fetched view counts. Total views: {total_views:,}")
+
+        return all_videos
+
+    except Exception as e:
+        print(f"[YT_API] Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return all_videos
+
+def fetch_channel_videos_by_id(channel_id, max_pages=100, channel_name=None):
+    """Fetch ALL videos from a YouTube channel using multiple strategies"""
+    all_videos = []
+    seen_video_ids = set()  # Track seen videos to avoid duplicates
+
+    try:
+        import time
+        import re
+
+        print(f"[FETCH] Starting comprehensive video fetch for: {channel_name or channel_id}")
+
+        # Strategy 0: Use YouTube Data API (most reliable, if key is configured)
+        if YOUTUBE_API_KEY and channel_id:
+            print(f"[FETCH] Strategy 0: YouTube Data API (most reliable)...")
+            api_videos = fetch_videos_via_youtube_api(channel_id)
+            for video in api_videos:
+                video_id = video.get('video_id') or extract_video_id(video)
+                if video_id and video_id not in seen_video_ids:
+                    seen_video_ids.add(video_id)
+                    video['source'] = 'youtube_data_api'
+                    all_videos.append(video)
+            print(f"[FETCH] Strategy 0 found {len(all_videos)} videos via YouTube Data API")
+
+            # If we got a good number of videos from the API, we're done
+            if len(all_videos) >= 50:
+                print(f"[FETCH] Got sufficient videos from YouTube API, skipping other strategies")
+                return all_videos
+
+        # Strategy 1: Use Google search with site:youtube.com to find channel videos
+        # This is more effective than YouTube search for getting all videos
+        if channel_name:
+            print(f"[FETCH] Strategy 1: Google site search for channel videos...")
+            google_videos = fetch_videos_via_google_search(channel_name, max_pages=20)
+            for video in google_videos:
+                video_id = extract_video_id(video)
+                if video_id and video_id not in seen_video_ids:
+                    seen_video_ids.add(video_id)
+                    video['source'] = 'google_site_search'
+                    all_videos.append(video)
+            print(f"[FETCH] Strategy 1 found {len(all_videos)} videos")
+
+        # Strategy 2: YouTube search with channel name (various queries)
+        if channel_name:
+            print(f"[FETCH] Strategy 2: YouTube search variations...")
+            search_queries = [
+                f'"{channel_name}"',  # Exact match
+                channel_name,  # Loose match
+                f'{channel_name} review',  # Common video types
+                f'{channel_name} best',
+                f'{channel_name} 2024',
+                f'{channel_name} 2023',
+            ]
+
+            for query in search_queries:
+                yt_videos = search_youtube_with_query(query, max_pages=10, channel_filter=channel_name)
+                for video in yt_videos:
+                    video_id = extract_video_id(video)
+                    if video_id and video_id not in seen_video_ids:
+                        seen_video_ids.add(video_id)
+                        video['source'] = 'youtube_search'
+                        all_videos.append(video)
+                time.sleep(0.2)
+
+            print(f"[FETCH] Strategy 2 total: {len(all_videos)} videos")
+
+        # Strategy 3: Search with sort by date (oldest and newest)
+        if channel_name and len(all_videos) < 100:
+            print(f"[FETCH] Strategy 3: Date-sorted searches...")
+            for sort_mode in ['CAI%3D', 'CAISAhAB']:  # newest, oldest
+                sorted_videos = search_youtube_sorted(channel_name, sp_param=sort_mode, max_pages=10)
+                for video in sorted_videos:
+                    video_id = extract_video_id(video)
+                    if video_id and video_id not in seen_video_ids:
+                        # Verify it's from the right channel
+                        video_channel = video.get('channel', {})
+                        if isinstance(video_channel, dict):
+                            video_channel_name = video_channel.get('name', '')
+                        else:
+                            video_channel_name = str(video_channel)
+
+                        if channel_name.lower() in video_channel_name.lower() or video_channel_name.lower() in channel_name.lower():
+                            seen_video_ids.add(video_id)
+                            video['source'] = 'youtube_sorted'
+                            all_videos.append(video)
+                time.sleep(0.2)
+
+            print(f"[FETCH] Strategy 3 total: {len(all_videos)} videos")
+
+        print(f"[FETCH] Total videos fetched: {len(all_videos)}")
+        return all_videos
+
+    except Exception as e:
+        print(f"Error fetching channel videos: {e}")
+        import traceback
+        traceback.print_exc()
+        return all_videos
+
+def extract_video_id(video):
+    """Extract video ID from various video object formats"""
+    import re
+    video_link = video.get('link', '') or video.get('url', '')
+    video_id = video.get('video_id') or video.get('id')
+
+    if not video_id and video_link:
+        # Extract from YouTube URL
+        match = re.search(r'(?:v=|youtu\.be/)([a-zA-Z0-9_-]{11})', video_link)
+        if match:
+            video_id = match.group(1)
+
+    return video_id
+
+def fetch_videos_via_google_search(channel_name, max_pages=20):
+    """Use Google search to find all videos from a YouTube channel"""
+    all_videos = []
+    seen_urls = set()
+
+    try:
+        import time
+        url = "https://serpapi.com/search.json"
+
+        # Search Google for YouTube videos from this channel
+        search_query = f'site:youtube.com/watch "{channel_name}"'
+
+        params = {
+            "engine": "google",
+            "q": search_query,
+            "api_key": SERPAPI_API_KEY,
+            "num": 100  # Get max results per page
+        }
+
+        page_count = 0
+        start = 0
+
+        while page_count < max_pages:
+            page_count += 1
+            params['start'] = start
+
+            print(f"[GOOGLE] Page {page_count}, start={start}...")
+
+            response = requests.get(url, params=params, timeout=60)
+
+            if response.status_code != 200:
+                print(f"[GOOGLE] API error: {response.status_code}")
+                break
+
+            data = response.json()
+            organic = data.get('organic_results', [])
+
+            if not organic:
+                print("[GOOGLE] No more results")
+                break
+
+            new_count = 0
+            for result in organic:
+                link = result.get('link', '')
+                if 'youtube.com/watch' in link and link not in seen_urls:
+                    seen_urls.add(link)
+                    # Convert to video format
+                    video = {
+                        'title': result.get('title', ''),
+                        'link': link,
+                        'snippet': result.get('snippet', ''),
+                        'published_date': result.get('date', ''),
+                    }
+                    all_videos.append(video)
+                    new_count += 1
+
+            print(f"[GOOGLE] Added {new_count} videos (total: {len(all_videos)})")
+
+            if new_count == 0:
+                break
+
+            # Check for next page
+            pagination = data.get('serpapi_pagination', {})
+            if not pagination.get('next'):
+                break
+
+            start += 100
+            time.sleep(0.3)
+
+        return all_videos
+
+    except Exception as e:
+        print(f"[GOOGLE] Error: {e}")
+        return all_videos
+
+def search_youtube_with_query(query, max_pages=5, channel_filter=None):
+    """Search YouTube with a specific query and optionally filter by channel"""
+    all_videos = []
+
+    try:
+        import time
+        url = "https://serpapi.com/search.json"
+
+        params = {
+            "engine": "youtube",
+            "search_query": query,
+            "api_key": SERPAPI_API_KEY
+        }
+
+        page_count = 0
+        while page_count < max_pages:
+            page_count += 1
+
+            response = requests.get(url, params=params, timeout=60)
+
+            if response.status_code != 200:
+                break
+
+            data = response.json()
+            videos = data.get('video_results', [])
+
+            if not videos:
+                break
+
+            for video in videos:
+                # If channel filter is set, verify the video is from that channel
+                if channel_filter:
+                    video_channel = video.get('channel', {})
+                    if isinstance(video_channel, dict):
+                        video_channel_name = video_channel.get('name', '')
+                    else:
+                        video_channel_name = str(video_channel)
+
+                    # Flexible matching
+                    if not (channel_filter.lower() in video_channel_name.lower() or
+                            video_channel_name.lower() in channel_filter.lower()):
+                        continue
+
+                all_videos.append(video)
+
+            # Get next page
+            serpapi_pagination = data.get('serpapi_pagination', {})
+            next_page_token = serpapi_pagination.get('next_page_token')
+
+            if not next_page_token:
+                break
+
+            params['sp'] = next_page_token
+            time.sleep(0.2)
+
+        return all_videos
+
+    except Exception as e:
+        print(f"[YT_SEARCH] Error: {e}")
+        return all_videos
+
+def search_youtube_sorted(channel_name, sp_param, max_pages=10):
+    """Search YouTube with specific sort parameter"""
+    all_videos = []
+
+    try:
+        import time
+        url = "https://serpapi.com/search.json"
+
+        params = {
+            "engine": "youtube",
+            "search_query": f'"{channel_name}"',
+            "api_key": SERPAPI_API_KEY,
+            "sp": sp_param
+        }
+
+        page_count = 0
+        while page_count < max_pages:
+            page_count += 1
+
+            response = requests.get(url, params=params, timeout=60)
+
+            if response.status_code != 200:
+                break
+
+            data = response.json()
+            videos = data.get('video_results', [])
+
+            if not videos:
+                break
+
+            all_videos.extend(videos)
+
+            # Get next page
+            serpapi_pagination = data.get('serpapi_pagination', {})
+            next_page_token = serpapi_pagination.get('next_page_token')
+
+            if not next_page_token:
+                break
+
+            params['sp'] = next_page_token
+            time.sleep(0.2)
+
+        return all_videos
+
+    except Exception as e:
+        print(f"[YT_SORTED] Error: {e}")
+        return all_videos
+
+def fetch_channel_videos_via_search(channel_id, max_pages=20, channel_name=None):
+    """Fetch channel videos using YouTube search as fallback"""
+    all_videos = []
+    seen_video_ids = set()
+
+    try:
+        import time
+        url = "https://serpapi.com/search.json"
+
+        # Try multiple search strategies
+        search_queries = []
+
+        # Strategy 1: Direct channel filter
+        search_queries.append(f"site:youtube.com/watch channel:{channel_id}")
+
+        # Strategy 2: If we have channel name, search by name
+        if channel_name:
+            search_queries.append(f'"{channel_name}" site:youtube.com')
+
+        for search_query in search_queries:
+            params = {
+                "engine": "youtube",
+                "search_query": search_query,
+                "api_key": SERPAPI_API_KEY
+            }
+
+            page_count = 0
+            while page_count < max_pages:
+                page_count += 1
+                print(f"Search fallback page {page_count} with query: {search_query[:50]}...")
+
+                response = requests.get(url, params=params, timeout=60)
+
+                if response.status_code != 200:
+                    print(f"Search API error: {response.status_code}")
+                    break
+
+                data = response.json()
+                videos = data.get('video_results', [])
+
+                if not videos:
+                    print("No more videos in search results")
+                    break
+
+                new_count = 0
+                for video in videos:
+                    video_id = video.get('link', '')
+                    if video_id and video_id not in seen_video_ids:
+                        seen_video_ids.add(video_id)
+                        video['source'] = 'channel_search'
+                        all_videos.append(video)
+                        new_count += 1
+
+                print(f"Added {new_count} new videos from search (total: {len(all_videos)})")
+
+                if new_count == 0:
+                    break
+
+                # Get next page token
+                serpapi_pagination = data.get('serpapi_pagination', {})
+                next_page_token = serpapi_pagination.get('next_page_token')
+
+                if not next_page_token:
+                    break
+
+                params['sp'] = next_page_token
+                time.sleep(0.3)
+
+            # If we got enough videos, stop trying other queries
+            if len(all_videos) >= 50:
+                break
+
+        print(f"Search fallback total: {len(all_videos)} videos")
+        return all_videos
+
+    except Exception as e:
+        print(f"Error in search fallback: {e}")
+        return all_videos
+
+def search_youtube_videos(query, max_results=50):
+    """Fallback: search YouTube for videos (when channel ID not found)"""
+    all_videos = []
+
+    try:
+        url = "https://serpapi.com/search.json"
+        params = {
+            "engine": "youtube",
+            "search_query": query,
+            "api_key": SERPAPI_API_KEY
+        }
+
+        response = requests.get(url, params=params, timeout=30)
+
+        if response.status_code == 200:
+            data = response.json()
+            videos = data.get('video_results', [])
+
+            for video in videos[:max_results]:
+                video['source'] = 'search'
+            all_videos.extend(videos[:max_results])
+
+        return all_videos
+
+    except Exception as e:
+        print(f"Error searching videos: {e}")
+        return all_videos
+
+def fetch_channel_videos_sorted(channel_name, sort_mode='oldest', max_pages=20):
+    """Fetch channel videos sorted by upload date (oldest or newest)"""
+    all_videos = []
+    seen_video_ids = set()
+
+    try:
+        import time
+        url = "https://serpapi.com/search.json"
+
+        # sp parameter for sorting:
+        # CAI= for newest (upload date)
+        # CAISAhAB= for oldest (upload date reversed)
+        sp_param = "CAISAhAB" if sort_mode == 'oldest' else "CAI%3D"
+
+        params = {
+            "engine": "youtube",
+            "search_query": f'"{channel_name}"',
+            "api_key": SERPAPI_API_KEY,
+            "sp": sp_param
+        }
+
+        page_count = 0
+        while page_count < max_pages:
+            page_count += 1
+            print(f"Sorted search ({sort_mode}) page {page_count} for: {channel_name[:30]}...")
+
+            response = requests.get(url, params=params, timeout=60)
+
+            if response.status_code != 200:
+                print(f"Sorted search API error: {response.status_code}")
+                break
+
+            data = response.json()
+            videos = data.get('video_results', [])
+
+            if not videos:
+                print("No more videos in sorted search")
+                break
+
+            new_count = 0
+            for video in videos:
+                video_id = video.get('link', '')
+                video_channel = video.get('channel', {})
+                video_channel_name = video_channel.get('name', '') if isinstance(video_channel, dict) else str(video_channel)
+
+                # Check if this is from the right channel
+                if channel_name.lower() in video_channel_name.lower() or video_channel_name.lower() in channel_name.lower():
+                    if video_id and video_id not in seen_video_ids:
+                        seen_video_ids.add(video_id)
+                        video['source'] = f'sorted_{sort_mode}'
+                        all_videos.append(video)
+                        new_count += 1
+
+            print(f"Added {new_count} videos from sorted search (total: {len(all_videos)})")
+
+            if new_count == 0:
+                break
+
+            # Get next page token
+            serpapi_pagination = data.get('serpapi_pagination', {})
+            next_page_token = serpapi_pagination.get('next_page_token')
+
+            if not next_page_token:
+                break
+
+            params['sp'] = next_page_token
+            time.sleep(0.3)
+
+        return all_videos
+
+    except Exception as e:
+        print(f"Error in sorted search: {e}")
+        return all_videos
+
+def search_competitor_website(competitor):
+    """Search for competitor website content keywords"""
+    try:
+        if not SERPAPI_API_KEY:
+            return {'success': False, 'error': 'SerpAPI key not configured'}
+
+        # Search Google for the competitor's site
+        url = "https://serpapi.com/search.json"
+        params = {
+            "engine": "google",
+            "q": f"site:{competitor}",
+            "api_key": SERPAPI_API_KEY,
+            "num": 20
+        }
+
+        response = requests.get(url, params=params, timeout=30)
+
+        if response.status_code == 200:
+            data = response.json()
+            organic = data.get('organic_results', [])
+
+            keywords = []
+            for result in organic:
+                title = result.get('title', '')
+                # Extract potential keywords from titles
+                keywords.extend(extract_keywords_from_title(title))
+
+            return {'success': True, 'keywords': list(set(keywords))}
+        else:
+            return {'success': False, 'error': f"SerpAPI error: {response.status_code}"}
+
+    except Exception as e:
+        return {'success': False, 'error': str(e)}
+
+def extract_keywords_from_videos(videos):
+    """Extract potential keywords from video titles - returns both per-video and aggregated"""
+    keywords = []
+    seen = set()
+    video_keywords = []  # Full list with each video's target keyword
+
+    for video in videos:
+        title = video.get('title', '')
+        # Handle both nested and flat channel structures
+        if isinstance(video.get('channel'), dict):
+            channel = video.get('channel', {}).get('name', '')
+        else:
+            channel = video.get('channel', '')
+        views = video.get('views', '')
+        link = video.get('link', '')
+        published = video.get('published_date', video.get('published', ''))
+
+        # Extract the PRIMARY target keyword from title
+        primary_keyword = extract_primary_keyword(title)
+
+        # Store video with its target keyword
+        video_keywords.append({
+            'title': title,
+            'channel': channel,
+            'views': views,
+            'link': link,
+            'published': published,
+            'target_keyword': primary_keyword
+        })
+
+        # Also extract all keyword patterns for aggregation
+        extracted = extract_keywords_from_title(title)
+
+        for kw in extracted:
+            kw_lower = kw.lower()
+            if kw_lower not in seen and len(kw) > 3:
+                seen.add(kw_lower)
+                keywords.append({
+                    'keyword': kw,
+                    'source_video': title,
+                    'source_channel': channel,
+                    'source_views': views
+                })
+
+    return keywords, video_keywords
+
+def extract_primary_keyword(title):
+    """Extract the PRIMARY target keyword from a video title"""
+    import re
+
+    # Clean title
+    title_clean = title.lower().strip()
+
+    # Remove common YouTube title patterns at the end
+    title_clean = re.sub(r'\s*[\|\-\[\(].*$', '', title_clean)
+    title_clean = re.sub(r'\s*\d{4}$', '', title_clean)  # Remove year at end
+    title_clean = re.sub(r'^\d+\.\s*', '', title_clean)  # Remove numbering
+
+    # Priority patterns to extract (ordered by intent value)
+    patterns = [
+        (r'^([\w\s]+)\s+vs\.?\s+([\w\s]+)(?:\s|$)', 'comparison'),  # "X vs Y"
+        (r'^([\w\s]+)\s+review$', 'review'),  # "X review"
+        (r'^best\s+([\w\s]+?)(?:\s+for|\s+in|\s+of|\s+\d{4}|$)', 'best_of'),  # "best X"
+        (r'^([\w\s]+)\s+(?:coupon|discount|promo|deal)', 'deal'),  # "X coupon"
+        (r'^how\s+to\s+([\w\s]+)', 'how_to'),  # "how to X"
+        (r'^([\w\s]+)\s+tutorial', 'tutorial'),  # "X tutorial"
+        (r'^([\w\s]+)\s+guide', 'guide'),  # "X guide"
+        (r'^is\s+([\w\s]+)\s+(?:worth|legit|safe|good)', 'review'),  # "is X worth it"
+    ]
+
+    for pattern, kw_type in patterns:
+        match = re.search(pattern, title_clean)
+        if match:
+            # For comparison, return full "X vs Y"
+            if kw_type == 'comparison':
+                return f"{match.group(1).strip()} vs {match.group(2).strip()}"
+            elif kw_type == 'review':
+                return f"{match.group(1).strip()} review"
+            elif kw_type == 'best_of':
+                return f"best {match.group(1).strip()}"
+            elif kw_type == 'deal':
+                return f"{match.group(1).strip()} coupon"
+            else:
+                return match.group(1).strip() if match.groups() else title_clean[:50]
+
+    # Fallback: return cleaned title (truncated)
+    return title_clean[:60].strip()
+
+def extract_keywords_from_title(title):
+    """Extract potential keywords from a title"""
+    import re
+
+    keywords = []
+
+    # Clean the title
+    title_clean = title.lower()
+
+    # Common patterns to extract
+    patterns = [
+        r'best\s+[\w\s]+(%s:for|in|of|\d{4})',  # "best X for Y" or "best X 2024"
+        r'[\w\s]+\s+vs\.?\s+[\w\s]+',  # "X vs Y"
+        r'[\w\s]+\s+review',  # "X review"
+        r'[\w\s]+\s+reviews',  # "X reviews"
+        r'how\s+to\s+[\w\s]+',  # "how to X"
+        r'[\w\s]+\s+coupon(?:\s+code)?',  # "X coupon code"
+        r'[\w\s]+\s+discount',  # "X discount"
+        r'[\w\s]+\s+tutorial',  # "X tutorial"
+        r'[\w\s]+\s+guide',  # "X guide"
+    ]
+
+    for pattern in patterns:
+        matches = re.findall(pattern, title_clean)
+        for match in matches:
+            clean_match = match.strip()
+            if len(clean_match) > 5 and len(clean_match) < 60:
+                keywords.append(clean_match)
+
+    # Also add the full title as a potential keyword if it's reasonable length
+    if 10 < len(title) < 60:
+        # Remove common YouTube title additions
+        clean_title = re.sub(r'\s*[\|\-\[\(].*$', '', title)
+        clean_title = re.sub(r'^\d+\.\s*', '', clean_title)
+        if clean_title and len(clean_title) > 10:
+            keywords.append(clean_title.strip())
+
+    return keywords
+
+def enrich_competitor_keywords(keywords, niche):
+    """Add volume data and metrics to extracted keywords"""
+    enriched = []
+
+    # Get list of keyword strings
+    if isinstance(keywords[0], dict) if keywords else False:
+        kw_list = [k.get('keyword', k) for k in keywords]
+        kw_metadata = {k.get('keyword', ''): k for k in keywords}
+    else:
+        kw_list = keywords
+        kw_metadata = {}
+
+    # Get volume data from Ahrefs (primary) or Keywords Everywhere (fallback)
+    volume_data = get_keyword_data_with_fallback(kw_list[:20])  # Limit API calls
+    volume_map = {}
+    if volume_data.get('success') and volume_data.get('data'):
+        for item in volume_data['data']:
+            volume_map[item.get('keyword', '').lower()] = item
+
+    for kw in kw_list[:30]:
+        kw_lower = kw.lower() if isinstance(kw, str) else kw.get('keyword', '').lower()
+        vol_info = volume_map.get(kw_lower, {})
+
+        volume = vol_info.get('vol', 0)
+        cpc = vol_info.get('cpc', {})
+        if isinstance(cpc, dict):
+            cpc = cpc.get('value', 0)
+        competition = vol_info.get('competition', 0)
+
+        # Get metadata if available
+        metadata = kw_metadata.get(kw, {})
+
+        # Calculate revenue potential
+        revenue_data = estimate_revenue_potential(
+            {'volume': volume, 'cpc': cpc},
+            {'view_pattern': 'no_data', 'video_count': 10},
+            niche,
+            keyword=kw if isinstance(kw, str) else kw.get('keyword', '')
+        )
+
+        # Calculate priority score
+        score = calculate_opportunity_score(
+            {'volume': volume, 'keyword_difficulty': competition * 100},
+            {'view_pattern': 'no_data', 'avg_views': 0}
+        )
+
+        # Generate recommendation
+        recommendation = generate_keyword_recommendation(kw if isinstance(kw, str) else kw.get('keyword', ''), volume, revenue_data)
+
+        enriched.append({
+            'keyword': kw if isinstance(kw, str) else kw.get('keyword', ''),
+            'volume': volume,
+            'cpc': cpc,
+            'competition': competition,
+            'keyword_type': revenue_data.get('keyword_type', 'other'),
+            'revenue_potential': revenue_data.get('moderate', 0),
+            'revenue_conservative': revenue_data.get('conservative', 0),
+            'revenue_optimistic': revenue_data.get('optimistic', 0),
+            'epv': revenue_data.get('epv', 0),
+            'priority_score': score,
+            'opportunity_tier': determine_tier(score),
+            'source_video': metadata.get('source_video', ''),
+            'source_channel': metadata.get('source_channel', ''),
+            'recommendation': recommendation
+        })
+
+    # Filter out low-value keywords
+    enriched = [k for k in enriched if k['volume'] > 0 or k['priority_score'] > 30]
+
+    return enriched
+
+def generate_keyword_recommendation(keyword, volume, revenue_data):
+    """Generate a recommendation for a keyword"""
+    kw_type = revenue_data.get('keyword_type', 'other')
+    rev = revenue_data.get('moderate', 0)
+
+    if kw_type == 'deal' and volume > 100:
+        return "High-intent deal keyword - prioritize!"
+    elif kw_type == 'comparison' and volume > 500:
+        return "Strong comparison opportunity"
+    elif kw_type == 'review' and volume > 1000:
+        return "High-volume review keyword"
+    elif kw_type == 'best_of' and volume > 2000:
+        return "Popular 'best of' search"
+    elif rev > 100:
+        return "Good revenue potential"
+    elif volume > 5000:
+        return "High volume, worth testing"
+    else:
+        return ""
+
+# ============================================
+# DOMINATION SCORE ENDPOINTS
+# ============================================
+
+DOMINATION_DATA_PATH = os.path.join(os.path.dirname(__file__), 'data', 'domination_data.json')
+BUNDLED_RANKING_PATH = os.path.join(os.path.dirname(__file__), 'data', 'ranking_results.json')
+KEYWORD_TRACKING_PATH = os.path.join(os.path.dirname(__file__), 'data', 'keyword_tracking.json')
+
+
+def load_keyword_tracking():
+    """Load the keyword tracking config (silos, groups, secondaries)."""
+    try:
+        if os.path.exists(KEYWORD_TRACKING_PATH):
+            with open(KEYWORD_TRACKING_PATH, 'r') as f:
+                return json.load(f)
+    except Exception as e:
+        print(f"[TRACKING] Error loading keyword_tracking.json: {e}")
+    return None
+
+
+def get_tracking_keywords_flat():
+    """Flatten keyword_tracking.json into a list of all keywords to audit.
+    Returns list of dicts: [{keyword, silo, group, is_secondary, revenue}]"""
+    config = load_keyword_tracking()
+    if not config:
+        return []
+
+    flat = []
+    for silo in config.get('silos', []):
+        silo_id = silo['id']
+        for group in silo.get('groups', []):
+            group_name = group['name']
+            for kw_entry in group.get('keywords', []):
+                keyword = kw_entry['keyword']
+                revenue = kw_entry.get('revenue', 0)
+                flat.append({
+                    'keyword': keyword,
+                    'silo': silo_id,
+                    'group': group_name,
+                    'is_secondary': False,
+                    'revenue': revenue
+                })
+                for sec in kw_entry.get('secondary', []):
+                    flat.append({
+                        'keyword': sec,
+                        'silo': silo_id,
+                        'group': group_name,
+                        'is_secondary': True,
+                        'revenue': 0
+                    })
+    return flat
+
+@app.route('/api/domination/data', methods=['GET'])
+@login_required
+def get_domination_data():
+    """Get domination data merged with tracking config, audit results, and targets."""
+    try:
+        # 1. Load audit results (local file → DB → bundled fallback)
+        audit_data = None
+        source = 'none'
+
+        if os.path.exists(DOMINATION_DATA_PATH):
+            with open(DOMINATION_DATA_PATH, 'r') as f:
+                audit_data = json.load(f)
+            source = 'local'
+
+        if not audit_data:
+            try:
+                conn = get_db()
+                c = conn.cursor()
+                c.execute('SELECT audit_json, created_at FROM domination_audits ORDER BY created_at DESC LIMIT 1')
+                row = c.fetchone()
+                conn.close()
+                if row and row[0]:
+                    audit_data = json.loads(row[0])
+                    source = 'database'
+            except Exception as db_err:
+                print(f"[DOMINATION] Postgres fallback error: {db_err}")
+                # Try REST API
+                try:
+                    rows = supabase_rest_select('domination_audits', select='audit_json,created_at',
+                                                 order='created_at.desc', limit=1)
+                    if rows and rows[0].get('audit_json'):
+                        audit_data = json.loads(rows[0]['audit_json'])
+                        source = 'rest_api'
+                except Exception as rest_err:
+                    print(f"[DOMINATION] REST API fallback error: {rest_err}")
+
+        if not audit_data and os.path.exists(BUNDLED_RANKING_PATH):
+            with open(BUNDLED_RANKING_PATH, 'r') as f:
+                audit_data = json.load(f)
+            source = 'bundled'
+
+        # 2. Load tracking config (silos/groups/secondaries)
+        tracking = load_keyword_tracking()
+
+        # 3. Load target scores from DB
+        targets = {}
+        try:
+            conn = get_db()
+            c = conn.cursor()
+            c.execute('SELECT keyword, target_dom_score, updated_by, updated_at FROM keyword_dom_targets')
+            for row in c.fetchall():
+                targets[row[0]] = {
+                    'target': row[1],
+                    'updated_by': row[2],
+                    'updated_at': str(row[3]) if row[3] else None
+                }
+            conn.close()
+        except Exception as e:
+            print(f"[DOMINATION] Error loading targets: {e}")
+
+        # 4. Build index of audit results by keyword for fast lookup
+        audit_results_by_kw = {}
+        if audit_data:
+            for result in audit_data.get('all_results', []):
+                kw = result.get('keyword', '')
+                if kw:
+                    audit_results_by_kw[kw] = result
+
+            # Also index ranking/not_ranking for revenue
+            for item in audit_data.get('ranking', []):
+                kw = item.get('keyword', '')
+                if kw and kw in audit_results_by_kw:
+                    audit_results_by_kw[kw]['_is_ranking'] = True
+                    audit_results_by_kw[kw]['_revenue'] = item.get('revenue', 0)
+            for item in audit_data.get('not_ranking', []):
+                kw = item.get('keyword', '')
+                if kw and kw in audit_results_by_kw:
+                    audit_results_by_kw[kw]['_is_ranking'] = False
+                    audit_results_by_kw[kw]['_revenue'] = item.get('revenue', 0)
+
+        # 5. Return combined response
+        return jsonify({
+            'success': True,
+            'source': source,
+            'tracking': tracking,
+            'targets': targets,
+            'audit_data': audit_data,
+            'audit_results_by_keyword': audit_results_by_kw,
+            'timestamp': audit_data.get('timestamp') if audit_data else None
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/domination/targets', methods=['GET'])
+@login_required
+def get_domination_targets():
+    """Get all keyword target dom scores."""
+    try:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute('SELECT keyword, target_dom_score, updated_by, updated_at FROM keyword_dom_targets')
+        rows = c.fetchall()
+        conn.close()
+        targets = {row[0]: {'target': row[1], 'updated_by': row[2], 'updated_at': str(row[3]) if row[3] else None} for row in rows}
+        return jsonify({'success': True, 'targets': targets})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/domination/targets', methods=['PUT'])
+@login_required
+def set_domination_target():
+    """Set target dom score for a keyword. Tracks who made the change."""
+    try:
+        data = request.get_json()
+        keyword = data.get('keyword', '').strip()
+        target = data.get('target_dom_score', 100)
+
+        if not keyword:
+            return jsonify({'success': False, 'error': 'keyword is required'}), 400
+        if not isinstance(target, (int, float)) or target < 0 or target > 100:
+            return jsonify({'success': False, 'error': 'target_dom_score must be 0-100'}), 400
+
+        user = get_current_user()
+        updated_by = user.get('email', 'unknown') if user else 'unknown'
+
+        conn = get_db()
+        c = conn.cursor()
+        c.execute('''
+            INSERT INTO keyword_dom_targets (keyword, target_dom_score, updated_by, updated_at)
+            VALUES (%s, %s, %s, NOW())
+            ON CONFLICT (keyword) DO UPDATE SET
+                target_dom_score = EXCLUDED.target_dom_score,
+                updated_by = EXCLUDED.updated_by,
+                updated_at = NOW()
+        ''', (keyword, int(target), updated_by))
+        conn.commit()
+        conn.close()
+
+        return jsonify({'success': True, 'keyword': keyword, 'target_dom_score': int(target), 'updated_by': updated_by})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/domination/data', methods=['POST'])
+def save_domination_data():
+    """Save domination/ranking data from check_rankings.py"""
+    try:
+        data = request.get_json()
+
+        if not data:
+            return jsonify({'success': False, 'error': 'No data provided'}), 400
+
+        # Ensure data directory exists
+        os.makedirs(os.path.dirname(DOMINATION_DATA_PATH), exist_ok=True)
+
+        # Save to file
+        with open(DOMINATION_DATA_PATH, 'w') as f:
+            json.dump(data, f, indent=2)
+
+        # Also store in database for historical tracking
+        store_ranking_snapshot(data)
+
+        return jsonify({'success': True, 'message': 'Data saved successfully'})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+def store_ranking_snapshot(data):
+    """Store ranking data snapshot in database for historical tracking.
+    Also stores full audit JSON for retrieval when local files are unavailable."""
+    try:
+        conn = get_db()
+        c = conn.cursor()
+
+        # Create tables if not exists
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS ranking_history (
+                id SERIAL PRIMARY KEY,
+                keyword TEXT NOT NULL,
+                revenue DOUBLE PRECISION,
+                domination_score DOUBLE PRECISION,
+                positions_owned TEXT,
+                snapshot_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS domination_audits (
+                id SERIAL PRIMARY KEY,
+                audit_json TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+
+        # Store each keyword's ranking data
+        timestamp = data.get('timestamp', datetime.now().isoformat())
+
+        for result in data.get('all_results', []):
+            if result.get('error'):
+                continue
+
+            keyword = result.get('keyword', '')
+
+            # Find revenue
+            kw_info = None
+            for r in data.get('ranking', []):
+                if r.get('keyword') == keyword:
+                    kw_info = r
+                    break
+            if not kw_info:
+                for r in data.get('not_ranking', []):
+                    if r.get('keyword') == keyword:
+                        kw_info = r
+                        break
+
+            revenue = kw_info.get('revenue', 0) if kw_info else 0
+
+            # Calculate domination score
+            score, positions_owned = calculate_domination_from_result(result)
+
+            c.execute('''
+                INSERT INTO ranking_history (keyword, revenue, domination_score, positions_owned, snapshot_date)
+                VALUES (%s, %s, %s, %s, %s)
+            ''', (keyword, revenue, score, json.dumps(positions_owned), timestamp))
+
+        # Store full audit JSON for retrieval (keep only last 10 audits)
+        c.execute('INSERT INTO domination_audits (audit_json) VALUES (%s)', (json.dumps(data),))
+        c.execute('''
+            DELETE FROM domination_audits
+            WHERE id NOT IN (SELECT id FROM domination_audits ORDER BY created_at DESC LIMIT 10)
+        ''')
+
+        conn.commit()
+        conn.close()
+        print(f"[AUDIT] Snapshot stored in DB ({len(data.get('all_results', []))} keywords)")
+    except Exception as e:
+        print(f"[AUDIT] Postgres store failed: {e}, trying REST API...")
+        # Fallback: store via Supabase REST API
+        try:
+            timestamp = data.get('timestamp', datetime.now().isoformat())
+            # Store ranking history rows
+            history_rows = []
+            for result in data.get('all_results', []):
+                if result.get('error'):
+                    continue
+                keyword = result.get('keyword', '')
+                kw_info = None
+                for r in data.get('ranking', []):
+                    if r.get('keyword') == keyword:
+                        kw_info = r
+                        break
+                if not kw_info:
+                    for r in data.get('not_ranking', []):
+                        if r.get('keyword') == keyword:
+                            kw_info = r
+                            break
+                revenue = kw_info.get('revenue', 0) if kw_info else 0
+                score, positions_owned = calculate_domination_from_result(result)
+                history_rows.append({
+                    'keyword': keyword, 'revenue': revenue,
+                    'domination_score': score,
+                    'positions_owned': json.dumps(positions_owned),
+                    'snapshot_date': timestamp
+                })
+
+            if history_rows:
+                # Insert in batches of 100
+                for i in range(0, len(history_rows), 100):
+                    supabase_rest_insert('ranking_history', history_rows[i:i+100])
+
+            # Store full audit JSON
+            supabase_rest_insert('domination_audits', [{'audit_json': json.dumps(data)}])
+            print(f"[AUDIT] Snapshot stored via REST API ({len(history_rows)} keywords)")
+        except Exception as rest_err:
+            print(f"[AUDIT] REST API store also failed: {rest_err}")
+
+def calculate_domination_from_result(result):
+    """Calculate domination score from a keyword result"""
+    YOUR_CHANNELS = [
+        'security hero', 'securityhero',
+        'cybersleuth', 'cyber sleuth', 'cyber_sleuth',
+        'techroost', 'tech roost',
+        'the opt out project', 'opt out project', 'optoutproject',
+        'the pampered pup', 'pampered pup', 'pamperedpup',
+        'the sniff test', 'sniff test', 'snifftest',
+        'cozy crates', 'cozycrates',
+    ]
+
+    WEIGHTS = {1: 50, 2: 25, 3: 15, 4: 5, 5: 5}
+
+    score = 0
+    positions_owned = []
+
+    top_10 = result.get('top_10', [])
+    for i in range(min(5, len(top_10))):
+        video = top_10[i]
+        channel = video.get('channel', '').lower()
+
+        for your_ch in YOUR_CHANNELS:
+            if your_ch in channel:
+                pos = i + 1
+                score += WEIGHTS[pos]
+                positions_owned.append(pos)
+                break
+
+    return score, positions_owned
+
+@app.route('/api/domination/audit', methods=['POST'])
+def run_domination_audit():
+    """
+    Run a domination score audit for all tracked keywords.
+    Accepts logged-in users (session) or CRON_SECRET for scheduled jobs.
+    """
+    import threading
+
+    # Allow access if logged in OR if valid cron secret provided
+    cron_secret = os.environ.get('CRON_SECRET', '')
+    provided_secret = request.headers.get('X-Cron-Secret', '') or request.args.get('secret', '')
+    has_valid_secret = not cron_secret or provided_secret == cron_secret
+
+    # Check session-based login (same logic as @login_required)
+    skip_auth = not os.environ.get('GOOGLE_CLIENT_ID')
+    is_logged_in = skip_auth or 'user' in session
+
+    if not is_logged_in and not has_valid_secret:
+        return jsonify({'success': False, 'error': 'Unauthorized'}), 401
+
+    # Run audit in background thread to avoid timeout
+    def run_audit_background():
+        try:
+            # Load current keywords from bundled file
+            if not os.path.exists(BUNDLED_RANKING_PATH):
+                print("Audit failed: No ranking data to audit")
+                return
+
+            with open(BUNDLED_RANKING_PATH, 'r') as f:
+                current_data = json.load(f)
+
+            # Get keywords to check
+            keywords_to_check = []
+            keyword_revenues = {}
+
+            for item in current_data.get('ranking', []):
+                keywords_to_check.append(item['keyword'])
+                keyword_revenues[item['keyword']] = item.get('revenue', 0)
+
+            for item in current_data.get('not_ranking', []):
+                keywords_to_check.append(item['keyword'])
+                keyword_revenues[item['keyword']] = item.get('revenue', 0)
+
+            if not keywords_to_check:
+                print("Audit failed: No keywords to audit")
+                return
+
+            # Run audit for each keyword
+            all_results = []
+            ranking = []
+            not_ranking = []
+
+            for keyword in keywords_to_check:
+                result = check_youtube_ranking(keyword)
+                result['keyword'] = keyword
+
+                all_results.append(result)
+
+                # Determine if ranking
+                is_ranking = False
+                if result.get('top_10'):
+                    for video in result['top_10'][:5]:
+                        channel = video.get('channel', '').lower()
+                        for your_ch in YOUR_CHANNELS_LIST:
+                            if your_ch in channel:
+                                is_ranking = True
+                                break
+                        if is_ranking:
+                            break
+
+                kw_data = {
+                    'keyword': keyword,
+                    'revenue': keyword_revenues.get(keyword, 0)
+                }
+
+                if is_ranking:
+                    ranking.append(kw_data)
+                else:
+                    not_ranking.append(kw_data)
+
+            # Build new audit data
+            audit_data = {
+                'timestamp': datetime.now().isoformat(),
+                'revenue_period': current_data.get('revenue_period', 'December 2025'),
+                'ranking': ranking,
+                'not_ranking': not_ranking,
+                'all_results': all_results
+            }
+
+            # Save to domination data path
+            os.makedirs(os.path.dirname(DOMINATION_DATA_PATH), exist_ok=True)
+            with open(DOMINATION_DATA_PATH, 'w') as f:
+                json.dump(audit_data, f, indent=2)
+
+            # Store snapshot in history
+            store_ranking_snapshot(audit_data)
+
+            print(f"Audit completed: {len(ranking)} ranking, {len(not_ranking)} not ranking")
+
+        except Exception as e:
+            print(f"Audit error: {str(e)}")
+
+    # Start background thread
+    thread = threading.Thread(target=run_audit_background)
+    thread.start()
+
+    # Return immediately
+    return jsonify({
+        'success': True,
+        'message': 'Audit started in background',
+        'status': 'processing'
+    })
+
+# Your channel names for audit matching
+YOUR_CHANNELS_LIST = [
+    'security hero', 'securityhero',
+    'cybersleuth', 'cyber sleuth', 'cyber_sleuth',
+    'techroost', 'tech roost',
+    'the opt out project', 'opt out project', 'optoutproject',
+    'the pampered pup', 'pampered pup', 'pamperedpup',
+    'the sniff test', 'sniff test', 'snifftest',
+    'cozy crates', 'cozycrates',
+]
+
+def check_youtube_ranking(keyword):
+    """Check YouTube ranking for a single keyword"""
+    try:
+        if not SERPAPI_API_KEY:
+            return {'error': 'SerpAPI key not configured'}
+
+        url = "https://serpapi.com/search.json"
+        params = {
+            "engine": "youtube",
+            "search_query": keyword,
+            "api_key": SERPAPI_API_KEY
+        }
+
+        response = requests.get(url, params=params, timeout=30)
+
+        if response.status_code == 200:
+            data = response.json()
+            videos = data.get('video_results', [])
+
+            top_10 = []
+            for video in videos[:10]:
+                top_10.append({
+                    'title': video.get('title', ''),
+                    'channel': video.get('channel', {}).get('name', '') if isinstance(video.get('channel'), dict) else video.get('channel', ''),
+                    'views': video.get('views', ''),
+                    'link': video.get('link', '')
+                })
+
+            return {'top_10': top_10}
+        else:
+            return {'error': f"SerpAPI error: {response.status_code}"}
+
+    except Exception as e:
+        return {'error': str(e)}
+
+@app.route('/api/domination/history')
+@login_required
+def get_domination_history():
+    """Get historical domination data for trend analysis"""
+    try:
+        keyword = request.args.get('keyword', '')
+
+        conn = get_db()
+        c = conn.cursor()
+
+        if keyword:
+            c.execute('''
+                SELECT keyword, revenue, domination_score, positions_owned, snapshot_date
+                FROM ranking_history
+                WHERE keyword = %s
+                ORDER BY snapshot_date DESC
+                LIMIT 30
+            ''', (keyword,))
+        else:
+            c.execute('''
+                SELECT keyword, revenue, domination_score, positions_owned, snapshot_date
+                FROM ranking_history
+                ORDER BY snapshot_date DESC
+                LIMIT 100
+            ''')
+
+        rows = c.fetchall()
+        conn.close()
+
+        history = [{
+            'keyword': row[0],
+            'revenue': row[1],
+            'domination_score': row[2],
+            'positions_owned': json.loads(row[3]) if row[3] else [],
+            'snapshot_date': row[4]
+        } for row in rows]
+
+        return jsonify({'success': True, 'history': history})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+# ============================================
+# CRON: COLLECT YOUTUBE DATA
+# ============================================
+
+# Track background job status
+yt_collection_status = {'running': False, 'last_run': None, 'last_results': None}
+
+def collect_yt_data_background(batch_size=50):
+    """Background task to collect YT data"""
+    import time
+    global yt_collection_status
+
+    yt_collection_status['running'] = True
+    results = {'processed': 0, 'success': 0, 'failed': 0, 'remaining': 0}
+
+    try:
+        conn = get_db()
+        c = conn.cursor()
+
+        # Get keywords already in our YT data table
+        c.execute('SELECT keyword FROM keyword_yt_data')
+        existing_yt_keywords = set(row[0].lower() for row in c.fetchall())
+
+        # Find keywords that need YT data
+        keywords_needing_data = []
+        for kw in KEYWORDS:
+            keyword_lower = kw['keyword'].lower()
+            if keyword_lower not in existing_yt_keywords and (not kw.get('ytViews') or kw.get('ytViews') == 0):
+                keywords_needing_data.append(kw['keyword'])
+
+        print(f"[CRON-YT] Found {len(keywords_needing_data)} keywords needing YT data")
+
+        keywords_to_process = keywords_needing_data[:batch_size]
+        results['remaining'] = len(keywords_needing_data) - len(keywords_to_process)
+
+        for keyword in keywords_to_process:
+            try:
+                print(f"[CRON-YT] Fetching data for: {keyword}")
+                yt_data = get_serpapi_youtube_data(keyword)
+
+                if yt_data.get('success'):
+                    top_video = yt_data.get('videos', [{}])[0] if yt_data.get('videos') else {}
+                    top_video_title = top_video.get('title', '')
+                    top_video_views = parse_view_count(top_video.get('views', '0'))
+                    top_video_channel = top_video.get('channel', {}).get('name', '') if isinstance(top_video.get('channel'), dict) else top_video.get('channel', '')
+
+                    c.execute('''
+                        INSERT INTO keyword_yt_data
+                        (keyword, yt_avg_views, yt_view_pattern, yt_top_video_title,
+                         yt_top_video_views, yt_top_video_channel, yt_total_views,
+                         yt_video_count, updated_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+                        ON CONFLICT (keyword) DO UPDATE SET
+                            yt_avg_views = EXCLUDED.yt_avg_views,
+                            yt_view_pattern = EXCLUDED.yt_view_pattern,
+                            yt_top_video_title = EXCLUDED.yt_top_video_title,
+                            yt_top_video_views = EXCLUDED.yt_top_video_views,
+                            yt_top_video_channel = EXCLUDED.yt_top_video_channel,
+                            yt_total_views = EXCLUDED.yt_total_views,
+                            yt_video_count = EXCLUDED.yt_video_count,
+                            updated_at = CURRENT_TIMESTAMP
+                    ''', (
+                        keyword,
+                        yt_data.get('avg_views', 0),
+                        yt_data.get('view_pattern', 'no_data'),
+                        top_video_title,
+                        top_video_views,
+                        top_video_channel,
+                        yt_data.get('total_views', 0),
+                        yt_data.get('video_count', 0)
+                    ))
+                    conn.commit()  # Commit after each to avoid losing progress
+                    results['success'] += 1
+                else:
+                    print(f"[CRON-YT] Failed for {keyword}: {yt_data.get('error')}")
+                    results['failed'] += 1
+
+                results['processed'] += 1
+                time.sleep(0.3)
+
+            except Exception as e:
+                print(f"[CRON-YT] Error processing {keyword}: {e}")
+                results['failed'] += 1
+                results['processed'] += 1
+
+        conn.close()
+        print(f"[CRON-YT] Complete: {results}")
+
+    except Exception as e:
+        print(f"[CRON-YT] Error: {e}")
+        results['error'] = str(e)
+
+    finally:
+        yt_collection_status['running'] = False
+        yt_collection_status['last_run'] = datetime.now().isoformat()
+        yt_collection_status['last_results'] = results
+
+@app.route('/api/cron/collect-yt-data')
+def cron_collect_yt_data():
+    """
+    Cron job to collect YouTube data for keywords missing it.
+    Call daily: GET /api/cron/collect-yt-data?secret=YOUR_CRON_SECRET
+    Runs in background and returns immediately.
+    """
+    import threading
+
+    # Verify cron secret
+    cron_secret = os.environ.get('CRON_SECRET', '')
+    provided_secret = request.args.get('secret', '')
+
+    if cron_secret and provided_secret != cron_secret:
+        return jsonify({'success': False, 'error': 'Unauthorized'}), 401
+
+    # Check if already running
+    if yt_collection_status['running']:
+        return jsonify({
+            'success': False,
+            'error': 'Collection already in progress',
+            'status': yt_collection_status
+        })
+
+    # Get batch size from query param (default 50)
+    batch_size = min(int(request.args.get('batch', 50)), 100)
+
+    # Run in background thread
+    thread = threading.Thread(target=collect_yt_data_background, args=(batch_size,))
+    thread.daemon = True
+    thread.start()
+
+    return jsonify({
+        'success': True,
+        'message': f'YT data collection started in background (batch size: {batch_size})',
+        'check_status': '/api/cron/yt-status'
+    })
+
+@app.route('/api/cron/yt-status')
+def cron_yt_status():
+    """Check status of YT data collection"""
+    try:
+        conn = get_db()
+        c = conn.cursor()
+
+        c.execute('SELECT COUNT(*) FROM keyword_yt_data')
+        collected_count = c.fetchone()[0]
+
+        conn.close()
+
+        # Count keywords needing data
+        keywords_without_yt = sum(1 for kw in KEYWORDS if not kw.get('ytViews') or kw.get('ytViews') == 0)
+
+        return jsonify({
+            'success': True,
+            'total_keywords': len(KEYWORDS),
+            'keywords_with_yt_in_csv': len(KEYWORDS) - keywords_without_yt,
+            'keywords_without_yt_in_csv': keywords_without_yt,
+            'collected_in_db': collected_count,
+            'still_needed': max(0, keywords_without_yt - collected_count),
+            'job_running': yt_collection_status['running'],
+            'last_run': yt_collection_status['last_run'],
+            'last_results': yt_collection_status['last_results']
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+# ============================================
+# GOOGLE TRENDS DATA COLLECTION
+# ============================================
+trends_collection_status = {
+    'running': False,
+    'last_run': None,
+    'last_results': None
+}
+
+@app.route('/api/keyword/trend', methods=['POST'])
+@login_required
+def get_keyword_trend():
+    """Fetch Google Trends data for a single keyword and cache it"""
+    data = request.get_json()
+    keyword = data.get('keyword', '').strip()
+
+    if not keyword:
+        return jsonify({'success': False, 'error': 'Keyword is required'}), 400
+
+    try:
+        # Check cache first (data less than 7 days old)
+        conn = get_db()
+        c = conn.cursor()
+        c.execute('''
+            SELECT trend, trend_change_pct, current_interest, data_points, updated_at
+            FROM keyword_trends WHERE keyword = %s
+            AND updated_at > NOW() - INTERVAL '7 days'
+        ''', (keyword,))
+        cached = c.fetchone()
+
+        if cached:
+            conn.close()
+            return jsonify({
+                'success': True,
+                'keyword': keyword,
+                'trend': cached[0],
+                'trend_change_pct': cached[1],
+                'current_interest': cached[2],
+                'data_points': cached[3],
+                'cached': True,
+                'updated_at': cached[4]
+            })
+
+        # Fetch from SerpAPI
+        trend_data = get_serpapi_google_trends(keyword)
+
+        if trend_data.get('success'):
+            c.execute('''
+                INSERT INTO keyword_trends (keyword, trend, trend_change_pct, current_interest, data_points, updated_at)
+                VALUES (%s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+                ON CONFLICT(keyword) DO UPDATE SET
+                    trend = EXCLUDED.trend,
+                    trend_change_pct = EXCLUDED.trend_change_pct,
+                    current_interest = EXCLUDED.current_interest,
+                    data_points = EXCLUDED.data_points,
+                    updated_at = CURRENT_TIMESTAMP
+            ''', (
+                keyword,
+                trend_data.get('trend', 'unknown'),
+                trend_data.get('trend_change_pct', 0),
+                trend_data.get('current_interest', 0),
+                trend_data.get('data_points', 0)
+            ))
+            conn.commit()
+
+        conn.close()
+
+        return jsonify({
+            'success': trend_data.get('success', False),
+            'keyword': keyword,
+            'trend': trend_data.get('trend', 'unknown'),
+            'trend_change_pct': trend_data.get('trend_change_pct', 0),
+            'current_interest': trend_data.get('current_interest', 0),
+            'data_points': trend_data.get('data_points', 0),
+            'cached': False,
+            'error': trend_data.get('error')
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+def collect_trends_data_background(batch_size=25):
+    """Background task to collect Google Trends data for keywords"""
+    import time as _time
+    global trends_collection_status
+
+    trends_collection_status['running'] = True
+    results = {'processed': 0, 'success': 0, 'failed': 0, 'remaining': 0}
+
+    try:
+        conn = get_db()
+        c = conn.cursor()
+
+        # Get keywords already collected (within last 7 days)
+        c.execute("SELECT keyword FROM keyword_trends WHERE updated_at > NOW() - INTERVAL '7 days'")
+        existing = set(row[0].lower() for row in c.fetchall())
+
+        # Find keywords needing trends data (prioritize A-tier and interested)
+        c.execute("SELECT keyword, label FROM keyword_labels WHERE label IN ('interested', 'researching')")
+        priority_keywords = set(row[0] for row in c.fetchall())
+
+        keywords_needing_data = []
+        # Add priority keywords first
+        for kw in KEYWORDS:
+            if kw['keyword'].lower() not in existing:
+                if kw['keyword'] in priority_keywords or 'A -' in kw.get('tier', ''):
+                    keywords_needing_data.insert(0, kw['keyword'])
+                else:
+                    keywords_needing_data.append(kw['keyword'])
+
+        print(f"[TRENDS] Found {len(keywords_needing_data)} keywords needing trends data")
+
+        keywords_to_process = keywords_needing_data[:batch_size]
+        results['remaining'] = len(keywords_needing_data) - len(keywords_to_process)
+
+        for keyword in keywords_to_process:
+            try:
+                print(f"[TRENDS] Fetching trend for: {keyword}")
+                trend_data = get_serpapi_google_trends(keyword)
+
+                if trend_data.get('success'):
+                    c.execute('''
+                        INSERT INTO keyword_trends (keyword, trend, trend_change_pct, current_interest, data_points, updated_at)
+                        VALUES (%s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+                        ON CONFLICT(keyword) DO UPDATE SET
+                            trend = EXCLUDED.trend,
+                            trend_change_pct = EXCLUDED.trend_change_pct,
+                            current_interest = EXCLUDED.current_interest,
+                            data_points = EXCLUDED.data_points,
+                            updated_at = CURRENT_TIMESTAMP
+                    ''', (
+                        keyword,
+                        trend_data.get('trend', 'unknown'),
+                        trend_data.get('trend_change_pct', 0),
+                        trend_data.get('current_interest', 0),
+                        trend_data.get('data_points', 0)
+                    ))
+                    conn.commit()
+                    results['success'] += 1
+                else:
+                    print(f"[TRENDS] Failed for {keyword}: {trend_data.get('error')}")
+                    results['failed'] += 1
+
+                results['processed'] += 1
+                _time.sleep(1)  # Rate limit: 1 request per second for Trends
+
+            except Exception as e:
+                print(f"[TRENDS] Error processing {keyword}: {e}")
+                results['failed'] += 1
+                results['processed'] += 1
+
+        conn.close()
+        print(f"[TRENDS] Complete: {results}")
+
+    except Exception as e:
+        print(f"[TRENDS] Error: {e}")
+        results['error'] = str(e)
+
+    finally:
+        trends_collection_status['running'] = False
+        trends_collection_status['last_run'] = datetime.now().isoformat()
+        trends_collection_status['last_results'] = results
+
+@app.route('/api/cron/collect-trends')
+def cron_collect_trends():
+    """
+    Collect Google Trends data for keywords missing it.
+    Call: GET /api/cron/collect-trends?secret=YOUR_CRON_SECRET&batch=25
+    Runs in background and returns immediately.
+    """
+    import threading
+
+    # Verify cron secret or login
+    cron_secret = os.environ.get('CRON_SECRET', '')
+    provided_secret = request.args.get('secret', '')
+    skip_auth = not os.environ.get('GOOGLE_CLIENT_ID')
+    is_logged_in = skip_auth or 'user' in session
+
+    if not is_logged_in and cron_secret and provided_secret != cron_secret:
+        return jsonify({'success': False, 'error': 'Unauthorized'}), 401
+
+    if trends_collection_status['running']:
+        return jsonify({
+            'success': False,
+            'error': 'Trends collection already in progress',
+            'status': trends_collection_status
+        })
+
+    batch_size = min(int(request.args.get('batch', 25)), 50)
+
+    thread = threading.Thread(target=collect_trends_data_background, args=(batch_size,))
+    thread.daemon = True
+    thread.start()
+
+    return jsonify({
+        'success': True,
+        'message': f'Trends data collection started in background (batch size: {batch_size})',
+        'check_status': '/api/cron/trends-status'
+    })
+
+@app.route('/api/cron/trends-status')
+def cron_trends_status():
+    """Check status of Google Trends data collection"""
+    try:
+        conn = get_db()
+        c = conn.cursor()
+
+        c.execute('SELECT COUNT(*) FROM keyword_trends')
+        collected_count = c.fetchone()[0]
+
+        c.execute("SELECT COUNT(*) FROM keyword_trends WHERE updated_at > NOW() - INTERVAL '7 days'")
+        fresh_count = c.fetchone()[0]
+
+        conn.close()
+
+        return jsonify({
+            'success': True,
+            'total_keywords': len(KEYWORDS),
+            'trends_collected_total': collected_count,
+            'trends_fresh_7d': fresh_count,
+            'still_needed': max(0, len(KEYWORDS) - fresh_count),
+            'job_running': trends_collection_status['running'],
+            'last_run': trends_collection_status['last_run'],
+            'last_results': trends_collection_status['last_results']
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+# ============================================
+# DOMINATION AUDIT JOB
+# ============================================
+def run_domination_audit_job():
+    """Background job to run domination score audit.
+    Primary source: keyword_tracking.json (silos/groups/secondaries).
+    Fallback: previous audit data from DB, then bundled file, then keywords_master."""
+    import threading
+
+    def _audit():
+        try:
+            keywords_to_check = []
+            keyword_meta = {}  # keyword -> {silo, group, is_secondary, revenue}
+
+            # Source 1 (preferred): keyword_tracking.json
+            tracking_keywords = get_tracking_keywords_flat()
+            if tracking_keywords:
+                for entry in tracking_keywords:
+                    kw = entry['keyword']
+                    keywords_to_check.append(kw)
+                    keyword_meta[kw] = entry
+                print(f"[AUDIT] Loaded {len(keywords_to_check)} keywords from keyword_tracking.json")
+            else:
+                # Source 2: Previous audit data (DB or local file)
+                current_data = None
+                data_path = DOMINATION_DATA_PATH if os.path.exists(DOMINATION_DATA_PATH) else BUNDLED_RANKING_PATH
+
+                if os.path.exists(data_path):
+                    with open(data_path, 'r') as f:
+                        current_data = json.load(f)
+
+                if not current_data:
+                    try:
+                        conn = get_db()
+                        c = conn.cursor()
+                        c.execute('SELECT audit_json FROM domination_audits ORDER BY created_at DESC LIMIT 1')
+                        row = c.fetchone()
+                        conn.close()
+                        if row and row[0]:
+                            current_data = json.loads(row[0])
+                    except Exception:
+                        pass
+
+                if current_data:
+                    for item in current_data.get('ranking', []):
+                        kw = item['keyword']
+                        keywords_to_check.append(kw)
+                        keyword_meta[kw] = {'revenue': item.get('revenue', 0), 'is_secondary': False}
+                    for item in current_data.get('not_ranking', []):
+                        kw = item['keyword']
+                        keywords_to_check.append(kw)
+                        keyword_meta[kw] = {'revenue': item.get('revenue', 0), 'is_secondary': False}
+
+                # Source 3: keywords_master fallback
+                if not keywords_to_check:
+                    try:
+                        conn = get_db()
+                        c = conn.cursor()
+                        c.execute('''
+                            SELECT keyword, revenue_potential FROM keywords_master
+                            WHERE intent_type IN ('review', 'comparison', 'best_of', 'deal')
+                            AND revenue_potential > 0
+                            ORDER BY revenue_potential DESC LIMIT 50
+                        ''')
+                        for row in c.fetchall():
+                            keywords_to_check.append(row[0])
+                            keyword_meta[row[0]] = {'revenue': row[1] or 0, 'is_secondary': False}
+                        conn.close()
+                    except Exception:
+                        pass
+
+            if not keywords_to_check:
+                print("[AUDIT] Skipped: No keywords to audit from any source")
+                return
+
+            print(f"[AUDIT] Starting audit for {len(keywords_to_check)} keywords...")
+            import time as _time
+            all_results = []
+            ranking = []
+            not_ranking = []
+
+            for i, keyword in enumerate(keywords_to_check):
+                result = check_youtube_ranking(keyword)
+                result['keyword'] = keyword
+                meta = keyword_meta.get(keyword, {})
+                result['silo'] = meta.get('silo', '')
+                result['group'] = meta.get('group', '')
+                result['is_secondary'] = meta.get('is_secondary', False)
+                all_results.append(result)
+
+                is_ranking = False
+                if result.get('top_10'):
+                    for video in result['top_10'][:5]:
+                        channel = video.get('channel', '').lower()
+                        for your_ch in YOUR_CHANNELS_LIST:
+                            if your_ch in channel:
+                                is_ranking = True
+                                break
+                        if is_ranking:
+                            break
+
+                kw_data = {
+                    'keyword': keyword,
+                    'revenue': meta.get('revenue', 0),
+                    'silo': meta.get('silo', ''),
+                    'group': meta.get('group', ''),
+                    'is_secondary': meta.get('is_secondary', False)
+                }
+
+                if is_ranking:
+                    ranking.append(kw_data)
+                else:
+                    not_ranking.append(kw_data)
+
+                if (i + 1) % 10 == 0:
+                    print(f"[AUDIT] Progress: {i + 1}/{len(keywords_to_check)}")
+                _time.sleep(1)  # Rate limit
+
+            audit_data = {
+                'timestamp': datetime.now().isoformat(),
+                'revenue_period': 'Current',
+                'ranking': ranking,
+                'not_ranking': not_ranking,
+                'all_results': all_results
+            }
+
+            os.makedirs(os.path.dirname(DOMINATION_DATA_PATH), exist_ok=True)
+            with open(DOMINATION_DATA_PATH, 'w') as f:
+                json.dump(audit_data, f, indent=2)
+
+            store_ranking_snapshot(audit_data)
+            print(f"[AUDIT] Completed: {len(ranking)} ranking, {len(not_ranking)} not ranking (total: {len(all_results)})")
+
+        except Exception as e:
+            print(f"[AUDIT] Error: {str(e)}")
+
+    thread = threading.Thread(target=_audit, daemon=True)
+    thread.start()
+
+
+# ============================================
+# DAILY SCHEDULER + STARTUP COLLECTION
+# ============================================
+
+def _make_naive(dt):
+    """Strip timezone info from a datetime for safe comparison with datetime.now()."""
+    if dt and hasattr(dt, 'tzinfo') and dt.tzinfo is not None:
+        return dt.replace(tzinfo=None)
+    return dt
+
+
+def check_data_staleness():
+    """Check if domination and trends data is stale and needs refreshing."""
+    staleness = {'domination_stale': True, 'trends_stale': True, 'domination_last': None, 'trends_last': None}
+
+    try:
+        conn = get_db()
+        c = conn.cursor()
+
+        # Check last domination snapshot from ranking_history
+        last_dom_dt = None
+        c.execute('SELECT MAX(snapshot_date) FROM ranking_history')
+        row = c.fetchone()
+        if row and row[0]:
+            staleness['domination_last'] = str(row[0])
+            try:
+                val = row[0]
+                if isinstance(val, datetime):
+                    last_dom_dt = _make_naive(val)
+                elif isinstance(val, str):
+                    last_dom_dt = datetime.fromisoformat(val.replace('Z', '+00:00')).replace(tzinfo=None) if 'T' in val else datetime.strptime(val, '%Y-%m-%d %H:%M:%S')
+                else:
+                    last_dom_dt = datetime.strptime(str(val), '%Y-%m-%d %H:%M:%S')
+            except Exception as parse_err:
+                print(f"[STALENESS] Date parse error (ranking_history): {parse_err}")
+
+        # Also check domination_audits as fallback freshness source
+        if not last_dom_dt:
+            try:
+                c.execute('SELECT MAX(created_at) FROM domination_audits')
+                row2 = c.fetchone()
+                if row2 and row2[0]:
+                    val2 = row2[0]
+                    if isinstance(val2, datetime):
+                        last_dom_dt = _make_naive(val2)
+                    elif isinstance(val2, str):
+                        last_dom_dt = datetime.fromisoformat(val2.replace('Z', '+00:00')).replace(tzinfo=None) if 'T' in val2 else datetime.strptime(val2, '%Y-%m-%d %H:%M:%S')
+                    staleness['domination_last'] = str(val2)
+            except Exception:
+                pass
+
+        if last_dom_dt:
+            staleness['domination_stale'] = (datetime.now() - last_dom_dt).total_seconds() > 86400  # >24h
+        else:
+            staleness['domination_stale'] = True
+
+        # Check last trends collection
+        c.execute("SELECT COUNT(*) FROM keyword_trends WHERE updated_at > NOW() - INTERVAL '7 days'")
+        fresh_trends = c.fetchone()[0]
+        staleness['trends_fresh'] = fresh_trends
+        staleness['trends_stale'] = fresh_trends < len(KEYWORDS) * 0.1  # <10% coverage = stale
+
+        conn.close()
+    except Exception as e:
+        print(f"[STALENESS] Error checking staleness: {e}")
+
+    # Fallback: check local domination_data.json file timestamp
+    if staleness['domination_last'] is None and os.path.exists(DOMINATION_DATA_PATH):
+        try:
+            with open(DOMINATION_DATA_PATH, 'r') as f:
+                local_data = json.load(f)
+            ts = local_data.get('timestamp')
+            if ts:
+                staleness['domination_last'] = ts
+                local_dt = datetime.fromisoformat(ts)
+                staleness['domination_stale'] = (datetime.now() - local_dt).total_seconds() > 86400
+        except Exception as file_err:
+            print(f"[STALENESS] Error reading local domination file: {file_err}")
+
+    return staleness
+
+
+def run_startup_collection():
+    """On app startup, check if data is stale and trigger background collection."""
+    import time as _time
+    _time.sleep(10)  # Wait for app to fully initialize
+
+    print("[STARTUP] Checking data staleness...")
+    staleness = check_data_staleness()
+    print(f"[STARTUP] Domination stale: {staleness['domination_stale']} (last: {staleness['domination_last']})")
+    print(f"[STARTUP] Trends stale: {staleness['trends_stale']} (fresh: {staleness.get('trends_fresh', 0)})")
+
+    if staleness['domination_stale']:
+        print("[STARTUP] Domination data is stale, triggering audit...")
+        run_domination_audit_job()
+
+    if staleness['trends_stale']:
+        print("[STARTUP] Trends data is stale, triggering collection...")
+        if not trends_collection_status['running']:
+            import threading
+            thread = threading.Thread(target=collect_trends_data_background, args=(25,))
+            thread.daemon = True
+            thread.start()
+
+
+def run_daily_collection_job():
+    """Combined daily job: domination audit + trends collection."""
+    print("[DAILY] Running combined daily collection...")
+    run_domination_audit_job()
+
+    # Wait a bit then start trends collection
+    import time as _time
+    _time.sleep(60)
+    if not trends_collection_status['running']:
+        collect_trends_data_background(batch_size=50)
+
+
+# Start scheduler - run every 6 hours to survive Railway restarts
+scheduler = BackgroundScheduler()
+scheduler.add_job(
+    run_daily_collection_job,
+    'interval',
+    hours=6,
+    id='periodic_collection',
+    replace_existing=True
+)
+scheduler.start()
+print("[SCHEDULER] Collection job scheduled every 6 hours")
+
+# Run startup collection in background thread
+import threading
+startup_thread = threading.Thread(target=run_startup_collection, daemon=True)
+startup_thread.start()
+print("[STARTUP] Startup staleness check queued")
+
+
+# ============================================
+# UNIFIED CRON ENDPOINT (for external triggers)
+# ============================================
+@app.route('/api/cron/run-all')
+def cron_run_all():
+    """
+    Single endpoint for external cron services to trigger all data collection.
+    Call daily: GET /api/cron/run-all?secret=YOUR_CRON_SECRET
+    Triggers domination audit + trends collection in background.
+    """
+    import threading
+
+    cron_secret = os.environ.get('CRON_SECRET', '')
+    provided_secret = request.args.get('secret', '')
+    skip_auth = not os.environ.get('GOOGLE_CLIENT_ID')
+    is_logged_in = skip_auth or 'user' in session
+
+    if not is_logged_in and cron_secret and provided_secret != cron_secret:
+        return jsonify({'success': False, 'error': 'Unauthorized'}), 401
+
+    thread = threading.Thread(target=run_daily_collection_job, daemon=True)
+    thread.start()
+
+    return jsonify({
+        'success': True,
+        'message': 'All collection jobs started in background',
+        'jobs': ['domination_audit', 'trends_collection'],
+        'check_status': {
+            'trends': '/api/cron/trends-status',
+            'staleness': '/api/data/staleness'
+        }
+    })
+
+
+@app.route('/api/data/staleness')
+@login_required
+def get_data_staleness():
+    """Returns freshness info for all data sources."""
+    staleness = check_data_staleness()
+    return jsonify({
+        'success': True,
+        **staleness,
+        'domination_audit_file_exists': os.path.exists(DOMINATION_DATA_PATH),
+        'bundled_data_exists': os.path.exists(BUNDLED_RANKING_PATH),
+        'keywords_in_memory': len(KEYWORDS),
+        'db_last_error': _last_db_error
+    })
+
+# ============================================
+# $3K OPPORTUNITY FINDER
+# ============================================
+
+@app.route('/api/opportunity-finder')
+@login_required
+def opportunity_finder():
+    """
+    Analyzes every keyword for $3K/mo revenue feasibility.
+    Returns keywords ranked by how achievable $3K/mo is.
+    """
+    TARGET = 3000  # $3K/mo target
+
+    user = get_current_user()
+    user_email = user.get('email', 'anonymous') if user else 'anonymous'
+
+    conn = get_db()
+    c = conn.cursor()
+
+    # Get labels (with attribution)
+    c.execute('SELECT keyword, label, is_favorite, notes, label_updated_by, favorite_updated_by, notes_updated_by FROM keyword_labels')
+    labels = {}
+    for row in c.fetchall():
+        labels[row[0]] = {
+            'label': row[1], 'favorite': bool(row[2]), 'notes': row[3],
+            'labelBy': row[4] or '', 'favoriteBy': row[5] or '', 'notesBy': row[6] or ''
+        }
+
+    # Get YT data
+    c.execute('SELECT keyword, yt_avg_views, yt_view_pattern FROM keyword_yt_data')
+    yt_db = {row[0].lower(): {'avg_views': row[1], 'view_pattern': row[2]} for row in c.fetchall()}
+
+    # Get trends
+    c.execute('SELECT keyword, trend, trend_change_pct, current_interest FROM keyword_trends')
+    trends = {row[0].lower(): {'trend': row[1], 'change': row[2], 'interest': row[3]} for row in c.fetchall()}
+
+    # Get vote scores
+    c.execute('''
+        SELECT keyword,
+               COALESCE(SUM(CASE WHEN vote = 1 THEN 1 ELSE 0 END), 0) -
+               COALESCE(SUM(CASE WHEN vote = -1 THEN 1 ELSE 0 END), 0) as score
+        FROM keyword_votes GROUP BY keyword
+    ''')
+    votes = {row[0]: row[1] for row in c.fetchall()}
+
+    # Get domination data if available
+    domination = {}
+    try:
+        dom_path = DOMINATION_DATA_PATH if os.path.exists(DOMINATION_DATA_PATH) else BUNDLED_RANKING_PATH
+        if os.path.exists(dom_path):
+            with open(dom_path, 'r') as f:
+                dom_data = json.load(f)
+            for item in dom_data.get('ranking', []):
+                kw = item.get('keyword', '').lower()
+                positions = item.get('positions', [])
+                score = 0
+                weights = {1: 50, 2: 25, 3: 15, 4: 5, 5: 5}
+                for pos in positions:
+                    p = pos.get('position', 0)
+                    if p in weights:
+                        score += weights[p]
+                domination[kw] = {
+                    'score': score,
+                    'positions_owned': len(positions),
+                    'revenue': item.get('revenue', 0)
+                }
+    except Exception as e:
+        print(f"[OPPORTUNITY] Error loading domination data: {e}")
+
+    conn.close()
+
+    opportunities = []
+    for k in KEYWORDS:
+        keyword = k['keyword']
+        keyword_lower = keyword.lower()
+        volume = k.get('volume', 0) or 0
+        niche = k.get('niche', 'general')
+
+        # Get YT data (prefer DB, fallback to CSV)
+        yt_data = yt_db.get(keyword_lower, {})
+        pattern = yt_data.get('view_pattern') or k.get('ytPattern', 'no_data') or 'no_data'
+        avg_views = yt_data.get('avg_views') or k.get('ytViews', 0) or 0
+
+        # Keyword type classification
+        keyword_type = classify_keyword_type(keyword)
+
+        # EPV
+        epv_by_type = {
+            'deal': 1.18, 'comparison': 0.53, 'review': 0.31,
+            'best_of': 0.16, 'informational': 0.31, 'other': 0.17
+        }
+        base_epv = epv_by_type.get(keyword_type, 0.17)
+
+        # Niche multiplier
+        niche_multipliers = {
+            'vpn': 1.5, 'identity_theft': 1.4, 'data_broker_removal': 1.3,
+            'antivirus': 1.2, 'web_hosting': 1.3, 'email_marketing': 1.2,
+            'parental_control': 1.1, 'home_security': 1.0, 'pet_tech': 1.0
+        }
+        niche_mult = niche_multipliers.get(niche, 1.0)
+        adjusted_epv = base_epv * niche_mult
+
+        # Capture rate
+        capture_rates = {
+            'distributed': 0.15, 'top_heavy': 0.08,
+            'winner_take_all': 0.03, 'no_data': 0.10
+        }
+        capture_rate = capture_rates.get(pattern, 0.10)
+
+        # Willingness
+        willingness = estimate_willingness_to_spend(keyword, keyword_type, niche)
+
+        # Current estimated revenue
+        monthly_traffic = volume * capture_rate
+        est_revenue = monthly_traffic * adjusted_epv * willingness
+
+        # Revenue at 75th percentile EPV (upside case)
+        epv_75th = {
+            'deal': 4.69, 'comparison': 1.27, 'review': 0.72,
+            'best_of': 0.42, 'informational': 0.50, 'other': 0.30
+        }
+        upside_epv = epv_75th.get(keyword_type, 0.30) * niche_mult
+        upside_revenue = monthly_traffic * upside_epv * willingness
+
+        # Volume needed to hit $3K at current EPV & capture
+        if adjusted_epv * capture_rate * willingness > 0:
+            volume_needed = TARGET / (adjusted_epv * capture_rate * willingness)
+        else:
+            volume_needed = float('inf')
+
+        # Gap analysis
+        revenue_gap = max(0, TARGET - est_revenue)
+        gap_percentage = (est_revenue / TARGET * 100) if TARGET > 0 else 0
+
+        # Trend data
+        trend_data = trends.get(keyword_lower, {})
+        trend_direction = trend_data.get('trend', 'unknown')
+        trend_change = trend_data.get('change', 0)
+
+        # Domination data
+        dom = domination.get(keyword_lower, {})
+        dom_score = dom.get('score', 0)
+        dom_actual_revenue = dom.get('revenue', 0)
+
+        # ============================================
+        # FEASIBILITY SCORE (0-100)
+        # ============================================
+        feasibility = 0
+
+        # 1. Revenue proximity (0-35 points)
+        # How close is current estimate to $3K?
+        if est_revenue >= TARGET:
+            feasibility += 35  # Already there!
+        elif est_revenue >= TARGET * 0.5:
+            feasibility += 25 + (est_revenue - TARGET * 0.5) / (TARGET * 0.5) * 10
+        elif est_revenue >= TARGET * 0.2:
+            feasibility += 15 + (est_revenue - TARGET * 0.2) / (TARGET * 0.3) * 10
+        elif est_revenue >= TARGET * 0.05:
+            feasibility += 5 + (est_revenue - TARGET * 0.05) / (TARGET * 0.15) * 10
+        else:
+            feasibility += min(5, est_revenue / (TARGET * 0.05) * 5)
+
+        # 2. Upside potential (0-20 points)
+        # Can this keyword reach $3K at 75th percentile EPV?
+        if upside_revenue >= TARGET:
+            feasibility += 20
+        elif upside_revenue >= TARGET * 0.5:
+            feasibility += 10 + (upside_revenue / TARGET) * 10
+        else:
+            feasibility += (upside_revenue / TARGET) * 10
+
+        # 3. Volume headroom (0-15 points)
+        # Is there enough search volume?
+        if volume >= volume_needed:
+            feasibility += 15
+        elif volume >= volume_needed * 0.5:
+            feasibility += 8 + (volume / volume_needed) * 7
+        elif volume > 0:
+            feasibility += (volume / volume_needed) * 8
+        # else: 0 points (no volume data)
+
+        # 4. Competition favorability (0-15 points)
+        pattern_scores = {
+            'distributed': 15, 'top_heavy': 8,
+            'winner_take_all': 3, 'no_data': 6
+        }
+        feasibility += pattern_scores.get(pattern, 6)
+
+        # 5. Trend momentum (0-10 points)
+        if trend_direction == 'rising':
+            feasibility += 10
+        elif trend_direction == 'stable':
+            feasibility += 5
+        elif trend_direction == 'declining':
+            feasibility += 0
+        else:
+            feasibility += 3  # Unknown, slight credit
+
+        # 6. Keyword type bonus (0-5 points)
+        type_bonus = {'deal': 5, 'comparison': 4, 'review': 3, 'best_of': 2, 'informational': 0, 'other': 1}
+        feasibility += type_bonus.get(keyword_type, 1)
+
+        feasibility = min(100, max(0, round(feasibility, 1)))
+
+        # Determine the primary lever to pull
+        levers = []
+        if volume < volume_needed and volume > 0:
+            levers.append(f"Need {int(volume_needed):,} monthly searches (have {volume:,})")
+        if pattern == 'winner_take_all':
+            levers.append("High competition - target long-tail variants")
+        elif pattern == 'top_heavy':
+            levers.append("Moderate competition - can outrank with quality")
+        if willingness < 0.5:
+            levers.append(f"Low buyer intent ({willingness:.0%}) - focus on purchase-intent angles")
+        if trend_direction == 'declining':
+            levers.append("Declining trend - consider timing risk")
+        if dom_score > 0 and dom_score < 50:
+            levers.append(f"Only {dom_score}% domination - room to grow rankings")
+        if not levers and est_revenue < TARGET:
+            levers.append("Increase content volume and ranking positions")
+
+        label_data = labels.get(keyword, {})
+
+        opportunities.append({
+            'keyword': keyword,
+            'niche': niche,
+            'keywordType': keyword_type,
+            'volume': volume,
+            'pattern': pattern,
+            'avgViews': avg_views,
+            'epv': round(adjusted_epv, 2),
+            'captureRate': round(capture_rate * 100, 1),
+            'willingness': willingness,
+            'estRevenue': round(est_revenue, 0),
+            'upsideRevenue': round(upside_revenue, 0),
+            'revenueGap': round(revenue_gap, 0),
+            'gapPercentage': round(gap_percentage, 1),
+            'volumeNeeded': round(volume_needed, 0) if volume_needed != float('inf') else None,
+            'feasibility': feasibility,
+            'trend': trend_direction,
+            'trendChange': trend_change,
+            'domScore': dom_score,
+            'domRevenue': dom_actual_revenue,
+            'voteScore': votes.get(keyword, 0),
+            'label': label_data.get('label', 'none'),
+            'favorite': label_data.get('favorite', False),
+            'tier': k.get('tier', 'D - Nurture'),
+            'levers': levers,
+            'nicheMult': niche_mult
+        })
+
+    # Sort by feasibility desc
+    opportunities.sort(key=lambda x: x['feasibility'], reverse=True)
+
+    # Add rank
+    for i, opp in enumerate(opportunities):
+        opp['rank'] = i + 1
+
+    # Summary stats
+    above_3k = sum(1 for o in opportunities if o['estRevenue'] >= TARGET)
+    above_1k = sum(1 for o in opportunities if o['estRevenue'] >= 1000)
+    above_500 = sum(1 for o in opportunities if o['estRevenue'] >= 500)
+    top_10_revenue = sum(o['estRevenue'] for o in opportunities[:10])
+
+    # Niche clusters: group top opportunities by niche to show cluster strategy
+    niche_clusters = {}
+    for opp in opportunities:
+        n = opp['niche']
+        if n not in niche_clusters:
+            niche_clusters[n] = {'niche': n, 'count': 0, 'totalRevenue': 0,
+                                 'totalUpside': 0, 'avgFeasibility': 0,
+                                 'bestKeyword': '', 'bestRevenue': 0}
+        niche_clusters[n]['count'] += 1
+        niche_clusters[n]['totalRevenue'] += opp['estRevenue']
+        niche_clusters[n]['totalUpside'] += opp['upsideRevenue']
+        niche_clusters[n]['avgFeasibility'] += opp['feasibility']
+        if opp['estRevenue'] > niche_clusters[n]['bestRevenue']:
+            niche_clusters[n]['bestRevenue'] = opp['estRevenue']
+            niche_clusters[n]['bestKeyword'] = opp['keyword']
+
+    clusters = []
+    for c_data in niche_clusters.values():
+        if c_data['count'] > 0:
+            c_data['avgFeasibility'] = round(c_data['avgFeasibility'] / c_data['count'], 1)
+            c_data['totalRevenue'] = round(c_data['totalRevenue'], 0)
+            c_data['totalUpside'] = round(c_data['totalUpside'], 0)
+            c_data['revenuePerKeyword'] = round(c_data['totalRevenue'] / c_data['count'], 0)
+            clusters.append(c_data)
+
+    clusters.sort(key=lambda x: x['totalRevenue'], reverse=True)
+
+    return jsonify({
+        'success': True,
+        'target': TARGET,
+        'opportunities': opportunities,
+        'clusters': clusters,
+        'summary': {
+            'total_keywords': len(opportunities),
+            'above_target': above_3k,
+            'above_1k': above_1k,
+            'above_500': above_500,
+            'top_10_combined_revenue': round(top_10_revenue, 0),
+            'top_10_feasibility_avg': round(sum(o['feasibility'] for o in opportunities[:10]) / min(10, len(opportunities)), 1)
+        }
+    })
+
+
+# ============================================
+# KEYWORD UNIVERSE MAPPER
+# ============================================
+
+# Comprehensive brand lists per niche
+UNIVERSE_BRANDS = {
+    'vpn': [
+        'nordvpn', 'expressvpn', 'surfshark', 'cyberghost', 'protonvpn',
+        'ipvanish', 'mullvad', 'pia', 'private internet access', 'windscribe',
+        'tunnelbear', 'hotspot shield', 'atlas vpn', 'norton vpn',
+        'kaspersky vpn', 'mozilla vpn', 'ivpn', 'airvpn', 'strongvpn',
+        'vyprvpn', 'purevpn', 'hide my ass', 'bitdefender vpn',
+        'avira vpn', 'zenmate'
+    ],
+    'home_security': [
+        'simplisafe', 'ring', 'adt', 'vivint', 'frontpoint', 'cove',
+        'abode', 'eufy', 'wyze', 'nest', 'arlo', 'guardian', 'brinks',
+        'scout', 'link interactive', 'deep sentinel', 'kangaroo',
+        'blue by adt', 'xfinity home', 'samsung smartthings'
+    ],
+    'web_hosting': [
+        'bluehost', 'siteground', 'hostinger', 'dreamhost', 'a2 hosting',
+        'inmotion', 'hostgator', 'godaddy', 'cloudways', 'wp engine',
+        'kinsta', 'flywheel', 'namecheap', 'ionos', 'greengeeks',
+        'fastcomet', 'scala hosting', 'liquid web', 'nexcess', 'pressable'
+    ],
+    'email_marketing': [
+        'convertkit', 'mailchimp', 'activecampaign', 'aweber', 'getresponse',
+        'mailerlite', 'drip', 'constant contact', 'brevo', 'sendinblue',
+        'hubspot', 'klaviyo', 'campaign monitor', 'omnisend', 'moosend',
+        'beehiiv', 'substack', 'buttondown', 'flodesk', 'kit'
+    ],
+    'identity_theft': [
+        'lifelock', 'aura', 'identityforce', 'id watchdog', 'identity guard',
+        'experian identityworks', 'mcafee identity', 'allstate identity',
+        'credit karma', 'idshield', 'zander insurance', 'identityiq',
+        'myfico', 'transunion', 'equifax'
+    ],
+    'data_broker_removal': [
+        'deleteme', 'incogni', 'privacy duck', 'kanary', 'optery',
+        'privacy bee', 'helloprivacy', 'onerep', 'removaly', 'brandyourself',
+        'reputation defender', 'ez remove'
+    ],
+    'parental_control': [
+        'bark', 'qustodio', 'net nanny', 'mspy', 'google family link',
+        'kaspersky safe kids', 'norton family', 'circle', 'mobicip',
+        'famisafe', 'ourpact', 'screen time', 'kidslox', 'eyezy',
+        'mmguardian', 'securly', 'boomerang', 'familytime'
+    ],
+    'antivirus': [
+        'norton', 'mcafee', 'bitdefender', 'kaspersky', 'avast', 'avg',
+        'trend micro', 'eset', 'malwarebytes', 'webroot', 'windows defender',
+        'avira', 'f-secure', 'sophos', 'totalav', 'pcprotect',
+        'intego', 'vipre', 'k7 antivirus', 'zonealarm'
+    ],
+    'pet_insurance': [
+        'lemonade', 'trupanion', 'pets best', 'aspca', 'embrace',
+        'healthy paws', 'nationwide', 'fetch', 'figo', 'spot',
+        'pawp', 'pumpkin', 'metlife', 'progressive', 'wagmo',
+        'odie', 'bivvy', 'prudent pet', 'manypets'
+    ],
+    'gps_dog_fence': [
+        'spoton', 'halo', 'fi collar', 'garmin', 'petsafe',
+        'invisible fence', 'dogwatch', 'sportdog', 'tractive',
+        'whistle', 'link aq', 'wagz', 'pawfit'
+    ],
+    'credit_repair': [
+        'credit saint', 'lexington law', 'sky blue credit', 'the credit pros',
+        'disputebee', 'self', 'credit strong', 'experian boost',
+        'credit karma', 'ovation credit', 'creditrepair.com',
+        'pinnacle credit repair', 'amc credit repair'
+    ]
+}
+
+# Intent modifiers for brand keywords
+BRAND_INTENTS = {
+    'review': ['{brand} review', '{brand} review 2026', '{brand} reviews',
+               '{brand} reviews reddit', 'is {brand} good', 'is {brand} legit',
+               'is {brand} safe', 'is {brand} worth it'],
+    'pricing': ['{brand} pricing', '{brand} cost', '{brand} plans',
+                '{brand} price', 'how much is {brand}', 'how much does {brand} cost',
+                '{brand} free trial', '{brand} money back guarantee',
+                '{brand} student discount', '{brand} military discount'],
+    'deal': ['{brand} coupon', '{brand} coupon code', '{brand} discount',
+             '{brand} promo code', '{brand} deal', '{brand} sale',
+             '{brand} black friday', '{brand} offer'],
+    'comparison': ['{brand} vs {other}', '{brand} or {other}',
+                   '{brand} compared to {other}', '{brand} versus {other}',
+                   '{brand} vs {other} reddit'],
+    'alternative': ['{brand} alternative', '{brand} alternatives',
+                    'best {brand} alternative', 'sites like {brand}',
+                    'apps like {brand}', '{brand} competitors'],
+    'cancel': ['{brand} cancel', '{brand} cancel subscription',
+               '{brand} refund', 'cancel {brand}', 'how to cancel {brand}'],
+    'setup': ['how to use {brand}', 'how to set up {brand}',
+              '{brand} tutorial', '{brand} setup guide', '{brand} download'],
+    'problems': ['{brand} not working', '{brand} slow', '{brand} problems',
+                 '{brand} issues', '{brand} complaints', '{brand} scam']
+}
+
+# "Best X for Y" use cases per niche
+BEST_OF_USE_CASES = {
+    'vpn': ['streaming', 'gaming', 'torrenting', 'china', 'netflix',
+            'firestick', 'android', 'iphone', 'mac', 'windows', 'linux',
+            'router', 'business', 'school', 'travel', 'privacy', 'speed',
+            'cheap', 'free', 'families', 'uk', 'australia', 'canada',
+            'chrome', 'firefox', 'kodi', 'roku', 'apple tv', 'ps5',
+            'xbox', 'small business', 'remote work', 'japan',
+            'india', 'dubai', 'turkey', 'russia', 'hulu', 'disney plus',
+            'bbc iplayer', 'amazon prime', 'spotify'],
+    'home_security': ['apartments', 'renters', 'no wifi', 'diy', 'no monthly fee',
+                      'outdoor', 'indoor', 'pets', 'smart home', 'elderly',
+                      'large property', 'rural areas', 'small business',
+                      'garage', 'front door', 'backyard', 'night vision',
+                      'wireless', 'wired', 'cheap', 'no contract',
+                      'alexa', 'google home', 'homekit'],
+    'web_hosting': ['wordpress', 'small business', 'ecommerce', 'blog',
+                    'beginners', 'developers', 'agencies', 'speed',
+                    'cheap', 'reseller', 'vps', 'dedicated', 'cloud',
+                    'woocommerce', 'drupal', 'magento', 'node js',
+                    'python', 'email hosting', 'high traffic'],
+    'email_marketing': ['small business', 'beginners', 'ecommerce', 'bloggers',
+                        'creators', 'nonprofits', 'agencies', 'automation',
+                        'free', 'cheap', 'shopify', 'wordpress',
+                        'deliverability', 'newsletters', 'course creators'],
+    'identity_theft': ['families', 'seniors', 'children', 'business',
+                       'cheap', 'free', 'credit monitoring', 'dark web monitoring',
+                       'social security', 'tax fraud', 'medical identity theft'],
+    'data_broker_removal': ['cheap', 'free', 'comprehensive', 'families',
+                            'business', 'celebrities', 'real estate agents',
+                            'doctors', 'lawyers', 'teachers'],
+    'parental_control': ['iphone', 'android', 'chromebook', 'windows',
+                         'mac', 'teens', 'toddlers', 'social media',
+                         'youtube', 'gaming', 'wifi router', 'free',
+                         'school', 'multiple devices', 'tiktok', 'snapchat',
+                         'instagram', 'discord'],
+    'antivirus': ['windows', 'mac', 'android', 'iphone', 'gaming',
+                  'business', 'free', 'cheap', 'lightweight', 'speed',
+                  'malware', 'ransomware', 'families', 'students',
+                  'chromebook', 'linux', 'multiple devices'],
+    'pet_insurance': ['dogs', 'cats', 'puppies', 'kittens', 'older dogs',
+                      'older cats', 'pre existing conditions', 'cheap',
+                      'large breeds', 'small breeds', 'exotic pets',
+                      'multiple pets', 'hereditary conditions', 'wellness'],
+    'gps_dog_fence': ['large dogs', 'small dogs', 'multiple dogs',
+                      'large yards', 'acreage', 'no wifi', 'hilly terrain',
+                      'rural', 'apartment', 'stubborn dogs', 'puppies'],
+    'credit_repair': ['fast', 'cheap', 'free', 'beginners', 'mortgage',
+                      'auto loan', 'collections', 'bankrupty',
+                      'student loans', 'medical debt']
+}
+
+# Problem keywords per niche (beyond brands)
+PROBLEM_KEYWORDS = {
+    'vpn': [
+        'is my internet secure', 'can my isp see what i do',
+        'how to hide ip address', 'how to unblock websites',
+        'how to watch netflix from another country', 'how to bypass geo restrictions',
+        'public wifi security', 'how to stop isp throttling',
+        'how to torrent safely', 'vpn vs proxy', 'vpn vs tor',
+        'do i need a vpn', 'what does a vpn do', 'how does a vpn work',
+        'vpn for remote work', 'double vpn', 'kill switch vpn',
+        'split tunneling vpn', 'vpn protocols explained', 'wireguard vs openvpn'
+    ],
+    'home_security': [
+        'how to secure my home', 'home break in prevention',
+        'package theft prevention', 'best doorbell camera',
+        'best outdoor security camera', 'best indoor security camera',
+        'security camera vs doorbell camera', 'smart lock vs deadbolt',
+        'diy home security', 'home security without subscription',
+        'how to install security cameras', 'security camera placement',
+        'motion sensor lights', 'window sensors', 'glass break sensors',
+        'security system monitoring', 'self monitored vs professional'
+    ],
+    'identity_theft': [
+        'what to do if identity stolen', 'how to check if identity stolen',
+        'someone opened account in my name', 'how to freeze credit',
+        'how to check dark web for my info', 'social security number stolen',
+        'credit card fraud what to do', 'phishing scam victim',
+        'data breach notification what to do', 'child identity theft',
+        'tax identity theft', 'medical identity theft', 'synthetic identity theft',
+        'how to protect social security number', 'identity theft insurance worth it'
+    ],
+    'data_broker_removal': [
+        'how to remove my info from google', 'how to remove yourself from spokeo',
+        'how to remove yourself from whitepages', 'how to remove yourself from beenverified',
+        'how to opt out of people search sites', 'how to remove mugshot from internet',
+        'how to remove personal info from internet', 'right to be forgotten',
+        'how to disappear from internet', 'people finder sites',
+        'data brokers list', 'who has my personal data',
+        'how to protect privacy online', 'doxxing prevention'
+    ],
+    'parental_control': [
+        'how to monitor kids phone', 'how to block websites on kids phone',
+        'how to set screen time limits', 'signs of cyberbullying',
+        'how to talk to kids about online safety', 'age appropriate screen time',
+        'how to monitor social media', 'parental controls on wifi router',
+        'parental controls on youtube', 'kid safe search engine',
+        'online predator warning signs', 'sexting prevention for parents',
+        'gaming addiction in kids', 'how to monitor discord'
+    ],
+    'antivirus': [
+        'how to tell if computer has virus', 'how to remove malware',
+        'computer running slow virus', 'ransomware protection',
+        'how to avoid phishing', 'free vs paid antivirus',
+        'do i need antivirus for mac', 'antivirus vs internet security',
+        'best firewall software', 'how to scan for viruses',
+        'antivirus slowing down computer', 'real time protection vs scan'
+    ],
+    'pet_insurance': [
+        'is pet insurance worth it', 'pet insurance vs savings account',
+        'when to get pet insurance', 'pet insurance pre existing conditions',
+        'how does pet insurance work', 'pet insurance deductible explained',
+        'average vet bill cost', 'emergency vet cost',
+        'most expensive dog breeds to insure', 'pet insurance waiting period',
+        'pet insurance claim denied', 'wellness plan vs pet insurance'
+    ],
+    'gps_dog_fence': [
+        'how to keep dog in yard without fence', 'invisible fence vs gps fence',
+        'do gps dog fences work', 'are invisible fences cruel',
+        'dog escapes invisible fence', 'how to train dog with invisible fence',
+        'gps dog fence accuracy', 'gps collar vs buried wire fence',
+        'best way to contain dog', 'dog fence for large property'
+    ],
+    'credit_repair': [
+        'how to improve credit score fast', 'how to dispute credit report',
+        'how to remove collections from credit report', 'credit score explained',
+        'what is a good credit score', 'credit repair vs credit counseling',
+        'how long does credit repair take', 'diy credit repair',
+        'credit repair scams to avoid', 'pay for delete letter',
+        'goodwill letter template', 'credit utilization explained'
+    ],
+    'web_hosting': [
+        'shared vs vps vs dedicated hosting', 'how to choose web hosting',
+        'website migration guide', 'hosting speed test',
+        'ssl certificate explained', 'managed vs unmanaged hosting',
+        'cloud hosting vs shared hosting', 'how to host a wordpress site',
+        'web hosting uptime explained', 'cPanel vs plesk'
+    ],
+    'email_marketing': [
+        'how to build email list', 'email marketing for beginners',
+        'how to improve open rates', 'email deliverability tips',
+        'email automation workflows', 'welcome email sequence',
+        'email list segmentation', 'email marketing vs social media',
+        'gdpr email marketing', 'email marketing roi'
+    ]
+}
+
+
+@app.route('/api/keyword-universe')
+@login_required
+def keyword_universe():
+    """
+    Maps the total keyword universe per niche, showing coverage gaps.
+    Generates all possible keyword combinations and cross-references
+    against the existing library.
+    """
+    # Build set of existing keywords (lowercased)
+    existing = set(k['keyword'].lower().strip() for k in KEYWORDS)
+
+    niches_analysis = []
+
+    for niche, brands in UNIVERSE_BRANDS.items():
+        universe = set()
+        categories = {}
+
+        # 1. Brand vs Brand comparisons
+        comparison_kws = set()
+        for i, brand_a in enumerate(brands):
+            for brand_b in brands[i+1:]:
+                comparison_kws.add(f"{brand_a} vs {brand_b}")
+                comparison_kws.add(f"{brand_b} vs {brand_a}")
+                comparison_kws.add(f"{brand_a} or {brand_b}")
+                comparison_kws.add(f"{brand_b} or {brand_a}")
+        universe.update(comparison_kws)
+        categories['comparisons'] = {
+            'total': len(comparison_kws),
+            'existing': len(comparison_kws & existing),
+            'gap': len(comparison_kws - existing),
+            'coverage_pct': round(len(comparison_kws & existing) / max(1, len(comparison_kws)) * 100, 1)
+        }
+
+        # 2. Brand + Intent (reviews, pricing, deals, etc.)
+        for intent_name, templates in BRAND_INTENTS.items():
+            if intent_name == 'comparison':
+                continue  # Already handled above
+            intent_kws = set()
+            for brand in brands:
+                for template in templates:
+                    if '{other}' in template:
+                        continue
+                    kw = template.replace('{brand}', brand)
+                    intent_kws.add(kw)
+            universe.update(intent_kws)
+            categories[intent_name] = {
+                'total': len(intent_kws),
+                'existing': len(intent_kws & existing),
+                'gap': len(intent_kws - existing),
+                'coverage_pct': round(len(intent_kws & existing) / max(1, len(intent_kws)) * 100, 1)
+            }
+
+        # 3. "Best X for Y" keywords
+        use_cases = BEST_OF_USE_CASES.get(niche, [])
+        niche_name = niche.replace('_', ' ')
+        bestof_kws = set()
+        for use_case in use_cases:
+            bestof_kws.add(f"best {niche_name} for {use_case}")
+            bestof_kws.add(f"best {niche_name} {use_case}")
+            # Also brand-specific best-of
+            for brand in brands[:10]:  # Top brands only
+                bestof_kws.add(f"{brand} for {use_case}")
+                bestof_kws.add(f"is {brand} good for {use_case}")
+        universe.update(bestof_kws)
+        categories['best_of'] = {
+            'total': len(bestof_kws),
+            'existing': len(bestof_kws & existing),
+            'gap': len(bestof_kws - existing),
+            'coverage_pct': round(len(bestof_kws & existing) / max(1, len(bestof_kws)) * 100, 1)
+        }
+
+        # 4. Problem/How-to keywords
+        problem_kws = set(PROBLEM_KEYWORDS.get(niche, []))
+        universe.update(problem_kws)
+        categories['problems'] = {
+            'total': len(problem_kws),
+            'existing': len(problem_kws & existing),
+            'gap': len(problem_kws - existing),
+            'coverage_pct': round(len(problem_kws & existing) / max(1, len(problem_kws)) * 100, 1)
+        }
+
+        # Overall stats
+        total_universe = len(universe)
+        total_existing = len(universe & existing)
+        total_gap = total_universe - total_existing
+
+        # Get existing count for this niche from the CSV
+        csv_niche_count = sum(1 for k in KEYWORDS if k.get('niche', '') == niche)
+
+        # Estimate revenue for the gap keywords
+        epv_by_type = {
+            'deal': 1.18, 'comparison': 0.53, 'review': 0.31,
+            'best_of': 0.16, 'informational': 0.31, 'other': 0.17
+        }
+        niche_multipliers = {
+            'vpn': 1.5, 'identity_theft': 1.4, 'data_broker_removal': 1.3,
+            'antivirus': 1.2, 'web_hosting': 1.3, 'email_marketing': 1.2,
+            'parental_control': 1.1, 'home_security': 1.0, 'pet_insurance': 1.0,
+            'gps_dog_fence': 1.0, 'credit_repair': 1.2
+        }
+        niche_mult = niche_multipliers.get(niche, 1.0)
+
+        # Rough revenue estimate for gaps (conservative: assume avg 1000 volume, 10% capture)
+        gap_revenue_estimates = {}
+        for cat_name, cat_data in categories.items():
+            cat_type = 'comparison' if cat_name == 'comparisons' else \
+                       'review' if cat_name == 'review' else \
+                       'deal' if cat_name == 'deal' else \
+                       'best_of' if cat_name == 'best_of' else 'other'
+            epv = epv_by_type.get(cat_type, 0.17)
+            # Conservative: avg 500 volume, 10% capture, with willingness
+            avg_rev_per_kw = 500 * 0.10 * epv * niche_mult * 0.6
+            gap_revenue_estimates[cat_name] = round(cat_data['gap'] * avg_rev_per_kw, 0)
+
+        # Top gap keywords (sample from each category)
+        top_gaps = []
+        for cat_name, cat_data in categories.items():
+            if cat_name == 'comparisons':
+                gap_set = comparison_kws - existing
+            elif cat_name == 'best_of':
+                gap_set = bestof_kws - existing
+            elif cat_name == 'problems':
+                gap_set = problem_kws - existing
+            else:
+                # Reconstruct intent gaps
+                gap_set = set()
+                templates = BRAND_INTENTS.get(cat_name, [])
+                for brand in brands:
+                    for template in templates:
+                        if '{other}' not in template:
+                            kw = template.replace('{brand}', brand)
+                            if kw not in existing:
+                                gap_set.add(kw)
+
+            # Pick representative gaps
+            sorted_gaps = sorted(gap_set)[:8]
+            for g in sorted_gaps:
+                top_gaps.append({
+                    'keyword': g,
+                    'category': cat_name,
+                    'type': 'comparison' if cat_name == 'comparisons' else
+                            'deal' if cat_name == 'deal' else
+                            'review' if cat_name == 'review' else
+                            'best_of' if cat_name == 'best_of' else 'other'
+                })
+
+        niches_analysis.append({
+            'niche': niche,
+            'brands': len(brands),
+            'csvKeywords': csv_niche_count,
+            'universeSize': total_universe,
+            'existing': total_existing,
+            'gap': total_gap,
+            'coveragePct': round(total_existing / max(1, total_universe) * 100, 1),
+            'categories': categories,
+            'gapRevenueEstimates': gap_revenue_estimates,
+            'totalGapRevenue': sum(gap_revenue_estimates.values()),
+            'topGaps': top_gaps[:40],
+            'nicheMult': niche_mult
+        })
+
+    # Sort by gap revenue (biggest opportunity first)
+    niches_analysis.sort(key=lambda x: x['totalGapRevenue'], reverse=True)
+
+    # Grand totals
+    grand_universe = sum(n['universeSize'] for n in niches_analysis)
+    grand_existing = sum(n['existing'] for n in niches_analysis)
+    grand_gap = sum(n['gap'] for n in niches_analysis)
+    grand_gap_revenue = sum(n['totalGapRevenue'] for n in niches_analysis)
+
+    return jsonify({
+        'success': True,
+        'niches': niches_analysis,
+        'grandTotals': {
+            'totalUniverse': grand_universe,
+            'totalExisting': grand_existing,
+            'totalGap': grand_gap,
+            'coveragePct': round(grand_existing / max(1, grand_universe) * 100, 1),
+            'totalGapRevenue': grand_gap_revenue,
+            'csvTotal': len(KEYWORDS)
+        }
+    })
+
+
+# ============================================
+# SMART PICKS - Guided keyword recommendations
+# ============================================
+
+def generate_video_title(keyword, keyword_type, niche):
+    """Generate a suggested YouTube video title for a keyword."""
+    kw_title = keyword.title()
+
+    if keyword_type == 'comparison':
+        parts = keyword.lower().replace(' or ', ' vs ').split(' vs ')
+        if len(parts) == 2:
+            a, b = parts[0].strip().title(), parts[1].strip().title()
+            titles = [
+                f"{a} vs {b} - Which One Should You ACTUALLY Get?",
+                f"{a} vs {b} - Honest Comparison After Testing Both",
+                f"I Tested {a} and {b} - Here's the Winner",
+            ]
+            return titles
+        return [f"{kw_title} - Complete Comparison"]
+
+    if keyword_type == 'review':
+        brand = keyword.lower().replace('review', '').replace('reviews', '').strip().title()
+        return [
+            f"{brand} Review - Is It Worth Your Money in 2026?",
+            f"My Honest {brand} Review After 6 Months",
+            f"{brand} Review - Watch Before You Buy",
+        ]
+
+    if keyword_type == 'deal':
+        brand = keyword.lower()
+        for term in ['coupon', 'coupon code', 'discount', 'promo code', 'deal', 'sale']:
+            brand = brand.replace(term, '').strip()
+        brand = brand.title()
+        return [
+            f"{brand} Coupon Code - Get the BEST Deal Available",
+            f"How to Get {brand} for the Cheapest Price (Working 2026)",
+        ]
+
+    if keyword_type == 'best_of':
+        return [
+            f"{kw_title} - Top 5 Picks Ranked",
+            f"{kw_title} - My #1 Pick Will Surprise You",
+        ]
+
+    # Problem/informational keywords
+    niche_solutions = {
+        'vpn': 'a VPN',
+        'identity_theft': 'identity theft protection',
+        'data_broker_removal': 'a data removal service',
+        'parental_control': 'parental controls',
+        'home_security': 'a security system',
+        'antivirus': 'antivirus software',
+        'web_hosting': 'the right web host',
+        'email_marketing': 'email marketing',
+        'pet_insurance': 'pet insurance',
+        'gps_dog_fence': 'a GPS dog fence',
+        'credit_repair': 'credit repair',
+    }
+    solution = niche_solutions.get(niche, 'the right solution')
+    return [
+        f"{kw_title} - Here's What To Do",
+        f"{kw_title} - How {solution.title()} Can Help",
+    ]
+
+
+def plain_english_reason(keyword_data, keyword_type):
+    """Generate a plain-English explanation of why this keyword is a good pick."""
+    reasons = []
+    revenue = keyword_data.get('revenue', 0)
+    volume = keyword_data.get('volume', 0)
+    pattern = keyword_data.get('ytPattern', 'no_data')
+    willingness = keyword_data.get('willingness', 0.5)
+    trend = keyword_data.get('trend', 'unknown')
+
+    # Revenue
+    if revenue >= 500:
+        reasons.append(f"High earning potential (${revenue:.0f}/mo est.)")
+    elif revenue >= 100:
+        reasons.append(f"Solid earning potential (${revenue:.0f}/mo est.)")
+    elif revenue > 0:
+        reasons.append(f"Moderate earning potential (${revenue:.0f}/mo est.)")
+
+    # Volume
+    if volume >= 10000:
+        reasons.append(f"Lots of people search this ({volume:,}/mo)")
+    elif volume >= 3000:
+        reasons.append(f"Good search volume ({volume:,}/mo)")
+    elif volume >= 1000:
+        reasons.append(f"Decent search volume ({volume:,}/mo)")
+
+    # Competition
+    if pattern == 'distributed':
+        reasons.append("Low competition - easier to rank")
+    elif pattern == 'top_heavy':
+        reasons.append("Moderate competition - quality content can win")
+    elif pattern == 'winner_take_all':
+        reasons.append("Competitive - but high reward if you rank")
+
+    # Buyer intent
+    if willingness >= 0.8:
+        reasons.append("Searchers are ready to buy")
+    elif willingness >= 0.6:
+        reasons.append("Good buyer intent")
+
+    # Trend
+    if trend == 'rising':
+        reasons.append("Trending up right now")
+    elif trend == 'declining':
+        reasons.append("Caution: search interest is declining")
+
+    # Keyword type advantage
+    if keyword_type == 'deal':
+        reasons.append("Deal seekers convert extremely well")
+    elif keyword_type == 'comparison':
+        reasons.append("People comparing products are close to buying")
+    elif keyword_type == 'review':
+        reasons.append("Review searchers are evaluating a purchase")
+
+    return reasons
+
+
+@app.route('/api/smart-picks')
+@login_required
+def smart_picks():
+    """
+    Beginner-friendly keyword recommendations.
+    No jargon. Clear ranking. Video title suggestions.
+    """
+    niche_filter = request.args.get('niche', '')
+
+    user = get_current_user()
+    user_email = user.get('email', 'anonymous') if user else 'anonymous'
+
+    conn = get_db()
+    c = conn.cursor()
+
+    # Get labels
+    c.execute('SELECT keyword, label, is_favorite FROM keyword_labels')
+    labels = {row[0]: {'label': row[1], 'favorite': bool(row[2])} for row in c.fetchall()}
+
+    # Get YT data
+    c.execute('SELECT keyword, yt_avg_views, yt_view_pattern FROM keyword_yt_data')
+    yt_db = {row[0].lower(): {'avg_views': row[1], 'view_pattern': row[2]} for row in c.fetchall()}
+
+    # Get trends
+    c.execute('SELECT keyword, trend, trend_change_pct, current_interest FROM keyword_trends')
+    trends = {row[0].lower(): {'trend': row[1], 'change': row[2], 'interest': row[3]} for row in c.fetchall()}
+
+    # Get vote scores
+    c.execute('''
+        SELECT keyword,
+               COALESCE(SUM(CASE WHEN vote = 1 THEN 1 ELSE 0 END), 0) -
+               COALESCE(SUM(CASE WHEN vote = -1 THEN 1 ELSE 0 END), 0) as score
+        FROM keyword_votes GROUP BY keyword
+    ''')
+    votes = {row[0]: row[1] for row in c.fetchall()}
+
+    conn.close()
+
+    picks = []
+    for k in KEYWORDS:
+        keyword = k['keyword']
+        keyword_lower = keyword.lower()
+        niche = k.get('niche', 'general')
+
+        if niche_filter and niche != niche_filter:
+            continue
+
+        volume = k.get('volume', 0) or 0
+        yt_data = yt_db.get(keyword_lower, {})
+        pattern = yt_data.get('view_pattern') or k.get('ytPattern', 'no_data') or 'no_data'
+        avg_views = yt_data.get('avg_views') or k.get('ytViews', 0) or 0
+
+        keyword_type = classify_keyword_type(keyword)
+        willingness = estimate_willingness_to_spend(keyword, keyword_type, niche)
+
+        # Revenue calculation
+        epv_by_type = {
+            'deal': 1.18, 'comparison': 0.53, 'review': 0.31,
+            'best_of': 0.16, 'informational': 0.31, 'other': 0.17
+        }
+        niche_multipliers = {
+            'vpn': 1.5, 'identity_theft': 1.4, 'data_broker_removal': 1.3,
+            'antivirus': 1.2, 'web_hosting': 1.3, 'email_marketing': 1.2,
+            'parental_control': 1.1, 'home_security': 1.0, 'pet_insurance': 1.0,
+            'gps_dog_fence': 1.0, 'credit_repair': 1.2
+        }
+        capture_rates = {
+            'distributed': 0.15, 'top_heavy': 0.08,
+            'winner_take_all': 0.03, 'no_data': 0.10
+        }
+        epv = epv_by_type.get(keyword_type, 0.17) * niche_multipliers.get(niche, 1.0)
+        capture = capture_rates.get(pattern, 0.10)
+        revenue = volume * capture * epv * willingness
+
+        trend_data = trends.get(keyword_lower, {})
+        trend_dir = trend_data.get('trend', 'unknown')
+
+        # ============================================
+        # SMART SCORE (0-100) - Beginner-optimized
+        # Weights what matters for someone starting out:
+        #   - Low competition (easiest to rank)
+        #   - Decent revenue (worth the effort)
+        #   - High buyer intent (converts better)
+        #   - Rising trend (growing opportunity)
+        # ============================================
+        smart_score = 0
+
+        # Competition easiness (0-35 pts) — biggest weight for beginners
+        comp_scores = {'distributed': 35, 'no_data': 20, 'top_heavy': 12, 'winner_take_all': 3}
+        smart_score += comp_scores.get(pattern, 15)
+
+        # Revenue potential (0-25 pts)
+        if revenue >= 500: smart_score += 25
+        elif revenue >= 200: smart_score += 20
+        elif revenue >= 100: smart_score += 15
+        elif revenue >= 50: smart_score += 10
+        elif revenue >= 20: smart_score += 5
+
+        # Buyer intent (0-20 pts)
+        smart_score += min(20, willingness * 25)
+
+        # Trend bonus (0-10 pts)
+        if trend_dir == 'rising': smart_score += 10
+        elif trend_dir == 'stable': smart_score += 5
+        elif trend_dir == 'unknown': smart_score += 3
+
+        # Keyword type bonus (0-10 pts) — deals/comparisons convert best
+        type_scores = {'deal': 10, 'comparison': 8, 'review': 6, 'best_of': 4, 'informational': 1, 'other': 2}
+        smart_score += type_scores.get(keyword_type, 2)
+
+        # Team vote boost
+        vote_score = votes.get(keyword, 0)
+        if vote_score > 0:
+            smart_score += min(5, vote_score * 2)
+
+        smart_score = min(100, max(0, round(smart_score, 1)))
+
+        # Difficulty label (plain English)
+        if pattern == 'distributed':
+            difficulty = 'Easy'
+            difficulty_detail = 'Views are spread across many channels - you can break in'
+        elif pattern == 'no_data':
+            difficulty = 'Unknown'
+            difficulty_detail = 'No YouTube data available yet'
+        elif pattern == 'top_heavy':
+            difficulty = 'Medium'
+            difficulty_detail = 'A few channels dominate - need strong content to compete'
+        else:
+            difficulty = 'Hard'
+            difficulty_detail = 'One channel owns most views - very competitive'
+
+        # Money rating (1-5 dollar signs)
+        if revenue >= 500: money_rating = 5
+        elif revenue >= 200: money_rating = 4
+        elif revenue >= 100: money_rating = 3
+        elif revenue >= 50: money_rating = 2
+        else: money_rating = 1
+
+        # Prepare enriched data
+        kw_data = {
+            'revenue': revenue,
+            'volume': volume,
+            'ytPattern': pattern,
+            'willingness': willingness,
+            'trend': trend_dir,
+        }
+
+        reasons = plain_english_reason(kw_data, keyword_type)
+        video_titles = generate_video_title(keyword, keyword_type, niche)
+
+        label_data = labels.get(keyword, {})
+
+        picks.append({
+            'keyword': keyword,
+            'niche': niche,
+            'keywordType': keyword_type,
+            'smartScore': smart_score,
+            'difficulty': difficulty,
+            'difficultyDetail': difficulty_detail,
+            'moneyRating': money_rating,
+            'revenue': round(revenue, 0),
+            'volume': volume,
+            'pattern': pattern,
+            'willingness': round(willingness, 2),
+            'trend': trend_dir,
+            'trendChange': trend_data.get('change', 0),
+            'reasons': reasons,
+            'videoTitles': video_titles,
+            'contentAngle': k.get('contentAngle', ''),
+            'label': label_data.get('label', 'none'),
+            'favorite': label_data.get('favorite', False),
+            'voteScore': vote_score,
+        })
+
+    # Sort by smart score
+    picks.sort(key=lambda x: x['smartScore'], reverse=True)
+
+    # Add rank
+    for i, p in enumerate(picks):
+        p['rank'] = i + 1
+
+    # Niche summary for the filter
+    niche_counts = {}
+    for p in picks:
+        n = p['niche']
+        if n not in niche_counts:
+            niche_counts[n] = {'count': 0, 'avgScore': 0, 'topRevenue': 0}
+        niche_counts[n]['count'] += 1
+        niche_counts[n]['avgScore'] += p['smartScore']
+        niche_counts[n]['topRevenue'] = max(niche_counts[n]['topRevenue'], p['revenue'])
+
+    niche_summary = []
+    for n, data in niche_counts.items():
+        data['avgScore'] = round(data['avgScore'] / data['count'], 1)
+        niche_summary.append({'niche': n, **data})
+    niche_summary.sort(key=lambda x: x['avgScore'], reverse=True)
+
+    return jsonify({
+        'success': True,
+        'picks': picks,
+        'nicheSummary': niche_summary,
+        'total': len(picks)
+    })
+
+
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
