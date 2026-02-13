@@ -1403,6 +1403,12 @@
                         <button class="label-btn" data-label="favorite">⭐ Favorites</button>
                     </div>
                 </div>
+                <div class="filter-group">
+                    <label>Source</label>
+                    <select id="source-filter" onchange="applyFilters()">
+                        <option value="">All Sources</option>
+                    </select>
+                </div>
                 <div class="filter-group" style="margin-left: auto;">
                     <label>&nbsp;</label>
                     <div style="display:flex;gap:8px;">
@@ -1473,7 +1479,7 @@
                                 <th data-sort="ytPattern">Pattern</th>
                                 <th data-sort="volume">Volume</th>
                                 <th data-sort="trendInterest">Trend</th>
-                                <th data-sort="addedByEmail">Added By</th>
+                                <th data-sort="source">Source</th>
                             </tr>
                         </thead>
                         <tbody id="table-body">
@@ -1510,7 +1516,12 @@
                     <button class="research-btn" onclick="showImportModal()" style="background:linear-gradient(135deg, #f59e0b, #ef4444);">
                         📥 Import Results JSON
                     </button>
+                    <button class="research-btn" onclick="openKeywordManager()" style="background:linear-gradient(135deg, #8b5cf6, #6d28d9);">
+                        <span id="manage-kw-btn-text">Manage Keywords</span>
+                        <div class="spinner" id="manage-kw-spinner" style="display:none;"></div>
+                    </button>
                 </div>
+                <div id="keyword-source-banner" style="display:none;padding:8px 16px;border-radius:8px;margin-bottom:8px;font-size:0.8rem;background:#1e293b;border:1px solid #334155;color:#94a3b8;"></div>
                 <div id="data-freshness-banner" style="display:none;padding:10px 16px;border-radius:8px;margin-bottom:20px;font-size:0.8rem;display:flex;align-items:center;gap:8px;"></div>
             </div>
 
@@ -1548,7 +1559,7 @@
                     <div class="value green" id="dom-at-target">0</div>
                 </div>
                 <div class="stat-card">
-                    <h3>Revenue</h3>
+                    <h3>CM Rev</h3>
                     <div class="value yellow" id="dom-total-revenue">$0</div>
                 </div>
                 <div class="stat-card">
@@ -1573,7 +1584,7 @@
                             <tr>
                                 <th data-sort="keyword">Keyword</th>
                                 <th data-sort="silo">Silo</th>
-                                <th data-sort="revenue">Revenue</th>
+                                <th data-sort="revenue">CM_Rev</th>
                                 <th data-sort="domination" class="sorted">Dom Score</th>
                                 <th data-sort="target">Target</th>
                                 <th data-sort="gap">Gap</th>
@@ -1671,12 +1682,108 @@
                             <tr style="border-bottom:1px solid rgba(71,85,105,0.5);">
                                 <th style="text-align:left;padding:8px;color:#94a3b8;">Date</th>
                                 <th style="text-align:right;padding:8px;color:#94a3b8;">Dom Score</th>
-                                <th style="text-align:right;padding:8px;color:#94a3b8;">Revenue</th>
+                                <th style="text-align:right;padding:8px;color:#94a3b8;">Daily Rev</th>
                                 <th style="text-align:left;padding:8px;color:#94a3b8;">Positions Owned</th>
                             </tr>
                         </thead>
                         <tbody id="history-table-body"></tbody>
                     </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- Keyword Manager Modal -->
+        <div class="modal-overlay" id="keyword-manager-modal">
+            <div class="modal" style="max-width:1000px;width:95%;max-height:90vh;display:flex;flex-direction:column;">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+                    <h3>Keyword Manager</h3>
+                    <div style="display:flex;align-items:center;gap:12px;">
+                        <span id="km-active-count" style="color:#10b981;font-size:0.85rem;font-weight:600;"></span>
+                        <button onclick="closeKeywordManager()" style="background:none;border:none;color:#94a3b8;font-size:1.5rem;cursor:pointer;">&times;</button>
+                    </div>
+                </div>
+
+                <!-- Search / Add + Filters -->
+                <div style="display:flex;gap:8px;margin-bottom:8px;flex-wrap:wrap;align-items:center;">
+                    <div style="flex:1;min-width:200px;position:relative;">
+                        <input type="text" id="km-search" placeholder="Search or add custom keyword..." oninput="kmSearchInput()" onkeydown="if(event.key==='Enter')kmSearchEnter()" style="width:100%;padding:8px 12px;background:rgba(15,23,42,0.8);border:1px solid rgba(71,85,105,0.5);color:#e2e8f0;border-radius:6px;font-size:0.85rem;box-sizing:border-box;">
+                        <button id="km-add-btn" onclick="showAddKeywordForm()" style="display:none;position:absolute;right:4px;top:50%;transform:translateY(-50%);padding:4px 10px;background:#8b5cf6;color:white;border:none;border-radius:4px;font-size:0.75rem;cursor:pointer;">+ Add</button>
+                    </div>
+                    <select id="km-status-filter" onchange="filterKmKeywords()" style="padding:8px;background:rgba(15,23,42,0.8);border:1px solid rgba(71,85,105,0.5);color:#e2e8f0;border-radius:6px;font-size:0.85rem;">
+                        <option value="all">All Keywords</option>
+                        <option value="active">Active Only</option>
+                        <option value="inactive">Inactive Only</option>
+                        <option value="bq">In BigQuery</option>
+                    </select>
+                    <select id="km-tier-filter" onchange="filterKmKeywords()" style="padding:8px;background:rgba(15,23,42,0.8);border:1px solid rgba(71,85,105,0.5);color:#e2e8f0;border-radius:6px;font-size:0.85rem;">
+                        <option value="">All Tiers</option>
+                        <option value="A">A - Top Priority</option>
+                        <option value="B">B - High Value</option>
+                        <option value="C">C - Medium</option>
+                        <option value="D">D - Lower</option>
+                        <option value="custom">Custom</option>
+                    </select>
+                    <select id="km-niche-filter" onchange="filterKmKeywords()" style="padding:8px;background:rgba(15,23,42,0.8);border:1px solid rgba(71,85,105,0.5);color:#e2e8f0;border-radius:6px;font-size:0.85rem;">
+                        <option value="">All Niches</option>
+                    </select>
+                    <button id="km-save-btn" onclick="saveKmChanges()" style="padding:6px 16px;background:#6b7280;color:white;border:none;border-radius:6px;font-size:0.8rem;cursor:pointer;opacity:0.5;pointer-events:none;" disabled>Save Changes</button>
+                    <span id="km-pending-count" style="color:#94a3b8;font-size:0.75rem;"></span>
+                </div>
+                <!-- Add Keyword Form (shown when adding new keyword) -->
+                <div id="km-add-form" style="display:none;margin-bottom:8px;padding:10px 12px;background:rgba(139,92,246,0.08);border:1px solid rgba(139,92,246,0.3);border-radius:8px;">
+                    <div style="display:flex;align-items:center;gap:6px;margin-bottom:8px;">
+                        <span style="color:#c4b5fd;font-size:0.8rem;font-weight:600;">Add keyword:</span>
+                        <span id="km-add-kw-label" style="color:#e2e8f0;font-size:0.85rem;"></span>
+                    </div>
+                    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+                        <select id="km-add-role" onchange="kmAddRoleChanged()" style="padding:6px 8px;background:rgba(15,23,42,0.8);border:1px solid rgba(71,85,105,0.5);color:#e2e8f0;border-radius:4px;font-size:0.8rem;">
+                            <option value="none">No role</option>
+                            <option value="primary">Primary keyword</option>
+                            <option value="secondary">Secondary keyword</option>
+                        </select>
+                        <select id="km-add-silo" style="padding:6px 8px;background:rgba(15,23,42,0.8);border:1px solid rgba(71,85,105,0.5);color:#e2e8f0;border-radius:4px;font-size:0.8rem;">
+                            <option value="">Select silo...</option>
+                            <option value="id_theft">ID Theft</option>
+                            <option value="dog">Dog</option>
+                            <option value="data_broker">Data Broker</option>
+                            <option value="parental_control">Parental Control</option>
+                            <option value="new">New / Other</option>
+                        </select>
+                        <select id="km-add-parent" style="display:none;padding:6px 8px;background:rgba(15,23,42,0.8);border:1px solid rgba(71,85,105,0.5);color:#e2e8f0;border-radius:4px;font-size:0.8rem;max-width:250px;">
+                            <option value="">Select primary keyword...</option>
+                        </select>
+                        <span id="km-add-auto-info" style="color:#94a3b8;font-size:0.75rem;"></span>
+                        <div style="margin-left:auto;display:flex;gap:6px;">
+                            <button onclick="addCustomKeyword()" style="padding:5px 14px;background:#8b5cf6;color:white;border:none;border-radius:4px;font-size:0.8rem;cursor:pointer;">Add Keyword</button>
+                            <button onclick="hideAddKeywordForm()" style="padding:5px 10px;background:transparent;color:#94a3b8;border:1px solid rgba(71,85,105,0.5);border-radius:4px;font-size:0.8rem;cursor:pointer;">Cancel</button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Keyword Table -->
+                <div style="flex:1;overflow-y:auto;border:1px solid rgba(71,85,105,0.3);border-radius:8px;">
+                    <table style="width:100%;border-collapse:collapse;font-size:0.82rem;" id="km-table">
+                        <thead style="position:sticky;top:0;background:#1e293b;z-index:1;">
+                            <tr style="border-bottom:1px solid rgba(71,85,105,0.5);">
+                                <th style="text-align:center;padding:8px;color:#94a3b8;width:35px;">#</th>
+                                <th id="km-th-is_active" style="text-align:center;padding:8px;color:#94a3b8;width:50px;cursor:pointer;user-select:none;" onclick="sortKmTable('is_active')">Active <span style="font-size:0.7rem;">&#9660;</span></th>
+                                <th id="km-th-keyword" style="text-align:left;padding:8px;color:#94a3b8;cursor:pointer;user-select:none;" onclick="sortKmTable('keyword')">Keyword</th>
+                                <th id="km-th-tier" style="text-align:center;padding:8px;color:#94a3b8;width:60px;cursor:pointer;user-select:none;" onclick="sortKmTable('tier')" title="Opportunity Tier: A = Top Priority, B = High Potential, C = Medium, D = Low Priority, Custom = User-added">Tier</th>
+                                <th id="km-th-niche" style="text-align:left;padding:8px;color:#94a3b8;width:120px;cursor:pointer;user-select:none;" onclick="sortKmTable('niche')">Niche</th>
+                                <th id="km-th-priority_score" style="text-align:right;padding:8px;color:#94a3b8;width:70px;cursor:pointer;user-select:none;" onclick="sortKmTable('priority_score')" title="Priority Score: Higher = better opportunity based on volume, competition, and revenue potential">Score</th>
+                                <th id="km-th-search_volume" style="text-align:right;padding:8px;color:#94a3b8;width:80px;cursor:pointer;user-select:none;" onclick="sortKmTable('search_volume')">Volume</th>
+                                <th id="km-th-source" style="text-align:center;padding:8px;color:#94a3b8;width:60px;cursor:pointer;user-select:none;" onclick="sortKmTable('source')" title="Source: TRK = Tracking list, CSV = Imported from CSV, BQ = Added from BigQuery, USR = Custom user-added">Source</th>
+                                <th id="km-th-in_bigquery" style="text-align:center;padding:8px;color:#94a3b8;width:50px;cursor:pointer;user-select:none;" onclick="sortKmTable('in_bigquery')" title="Has historical SERP data in BigQuery — keywords with data will show results immediately in audits">Data</th>
+                            </tr>
+                        </thead>
+                        <tbody id="km-table-body"></tbody>
+                    </table>
+                </div>
+
+                <!-- Footer -->
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-top:12px;padding-top:12px;border-top:1px solid #334155;">
+                    <span id="km-showing-count" style="color:#94a3b8;font-size:0.8rem;"></span>
+                    <span id="km-status" style="color:#94a3b8;font-size:0.8rem;"></span>
                 </div>
             </div>
         </div>
@@ -2975,6 +3082,15 @@
                 option.textContent = niche.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
                 nicheSelect.appendChild(option);
             });
+
+            const sources = [...new Set(allData.map(d => d.source || 'csv'))].sort();
+            const sourceSelect = document.getElementById('source-filter');
+            sources.forEach(src => {
+                const option = document.createElement('option');
+                option.value = src;
+                option.textContent = src.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
+                sourceSelect.appendChild(option);
+            });
         }
 
         function applyFilters() {
@@ -2982,6 +3098,7 @@
             const niche = document.getElementById('niche-filter').value;
             const tier = document.querySelector('.tier-btn.active').dataset.tier;
             const label = document.querySelector('.label-btn.active').dataset.label;
+            const source = document.getElementById('source-filter').value;
 
             filteredData = allData.filter(d => {
                 if (search && !d.keyword.toLowerCase().includes(search)) return false;
@@ -2989,6 +3106,7 @@
                 if (tier && d.tier !== tier) return false;
                 if (label === 'favorite' && !d.favorite) return false;
                 if (label && label !== 'favorite' && d.label !== label) return false;
+                if (source && (d.source || 'csv') !== source) return false;
                 return true;
             });
 
@@ -3724,13 +3842,19 @@
 
         // Channel mapping: abbreviated name -> patterns to match in YouTube channel names
         const CHANNEL_MAP = {
-            'SH': ['security hero', 'securityhero'],
-            'CS': ['cybersleuth', 'cyber sleuth', 'cyber_sleuth'],
-            'TR': ['techroost', 'tech roost'],
+            'SH':   ['security hero', 'securityhero', 'home security heroes'],
+            'CS':   ['cybersleuth', 'cyber sleuth', 'cyber_sleuth'],
+            'TR':   ['the tech roost', 'tech roost'],
             'TOOP': ['opt out project', 'optoutproject', 'the opt out'],
-            'TPP': ['pampered pup', 'pamperedpup', 'the pampered'],
-            'CC': ['cozy crates', 'cozycrates'],
-            'TST': ['sniff test', 'snifftest', 'the sniff']
+            'TPP':  ['pampered pup', 'pamperedpup', 'the pampered'],
+            'CC':   ['cozy crates', 'cozycrates'],
+            'TST':  ['sniff test', 'snifftest', 'the sniff'],
+            'ATNM': ['all tech no money', 'alltechnomoney'],
+            'BB':   ['better bets', 'betterbets'],
+            'CH':   ['casino hunt', 'casinohunt'],
+            'PF':   ['privacy freak', 'privacyfreak'],
+            'RZ':   ['reviewszy'],
+            'SBS':  ['small biz smarts', 'smallbizsmarts']
         };
 
         // Your channel names - abbreviated for display
@@ -3972,8 +4096,8 @@
             return { score, positions, channels: yourChannels };
         }
 
-        const SILO_LABELS = {id_theft:'ID Theft',dog:'Dog',data_broker:'Data Broker',parental_control:'Parental Control'};
-        const SILO_COLORS = {id_theft:'#818cf8',dog:'#fb923c',data_broker:'#34d399',parental_control:'#f472b6'};
+        const SILO_LABELS = {id_theft:'ID Theft',dog:'Dog',data_broker:'Data Broker',parental_control:'Parental Control',new_keywords:'New Keywords'};
+        const SILO_COLORS = {id_theft:'#818cf8',dog:'#fb923c',data_broker:'#34d399',parental_control:'#f472b6',new_keywords:'#facc15'};
 
         function displayDominationData(apiResp) {
             // apiResp has: tracking, targets, audit_data, audit_results_by_keyword
@@ -4005,6 +4129,7 @@
                                 leftOnTable = revenue * 5;
                             }
 
+                            const isNew = !result;
                             processedKeywords.push({
                                 keyword, revenue, domination: domination.score,
                                 target, gap, leftOnTable,
@@ -4014,7 +4139,8 @@
                                 yourChannels: domination.channels,
                                 top10: result?.top_10 || [],
                                 targetUpdatedBy: targetInfo?.updated_by || null,
-                                targetUpdatedAt: targetInfo?.updated_at || null
+                                targetUpdatedAt: targetInfo?.updated_at || null,
+                                isNew: isNew
                             });
 
                             // Process secondary keywords
@@ -4030,7 +4156,8 @@
                                     positions: secDom.positions,
                                     yourChannels: secDom.channels,
                                     top10: secResult?.top_10 || [],
-                                    targetUpdatedBy: null, targetUpdatedAt: null
+                                    targetUpdatedBy: null, targetUpdatedAt: null,
+                                    isNew: !secResult
                                 });
                             }
                         }
@@ -4085,6 +4212,34 @@
             document.getElementById('dom-no-presence').textContent = noPresence;
             document.getElementById('dom-total-revenue').textContent = '$' + totalRevenue.toLocaleString();
             document.getElementById('dom-left-on-table').textContent = '$' + Math.round(totalLeftOnTable).toLocaleString();
+
+            // Show keyword source banner
+            const kwSourceBanner = document.getElementById('keyword-source-banner');
+            const kwSource = auditData?.keyword_source || 'keyword_tracking';
+            const sourceLabels = {
+                'priority_keywords': 'Priority Keywords DB',
+                'keyword_tracking': 'Tracking Config',
+                'previous_audit': 'Previous Audit',
+                'keywords_master': 'Keywords Master DB'
+            };
+            kwSourceBanner.innerHTML = `Keywords from: <strong style="color:#e2e8f0;">${sourceLabels[kwSource] || kwSource}</strong> (${processedKeywords.length} total, ${primaryOnly.length} primary)`;
+            kwSourceBanner.style.display = 'block';
+
+            // Dynamically add/remove "New Keywords" silo tab
+            const existingNewTab = document.querySelector('#dom-silo-filters .tab[data-silo="new_keywords"]');
+            const hasNewKws = processedKeywords.some(k => k.silo === 'new_keywords');
+            if (hasNewKws && !existingNewTab) {
+                const container = document.querySelector('#dom-silo-filters > div');
+                const btn = document.createElement('button');
+                btn.className = 'tab';
+                btn.dataset.silo = 'new_keywords';
+                btn.onclick = function() { filterDomBySilo('new_keywords', this); };
+                btn.textContent = 'New Keywords';
+                btn.style.borderColor = '#facc15';
+                container.appendChild(btn);
+            } else if (!hasNewKws && existingNewTab) {
+                existingNewTab.remove();
+            }
 
             // Show UI
             document.getElementById('domination-stats').style.display = 'grid';
@@ -4223,28 +4378,30 @@
                     ? k.yourChannels.map(c => `#${c.position}: ${c.channel.substring(0, 15)}`).join(', ')
                     : '<span style="color:#f87171;">Not ranking</span>';
 
-                rows += `<tr>
+                const newBadge = k.isNew ? ' <span style="background:#facc15;color:#1e1b4b;padding:1px 6px;border-radius:4px;font-size:0.6rem;font-weight:700;margin-left:4px;">NEW</span>' : '';
+
+                rows += `<tr${k.isNew ? ' style="background:rgba(250,204,21,0.05);"' : ''}>
                     <td class="keyword-cell">
-                        <span style="cursor:pointer;border-bottom:1px dashed #64748b;" onclick="showKeywordHistory('${escapeHtml(k.keyword).replace(/'/g, "\\'")}')">${escapeHtml(k.keyword)}</span>
+                        <span style="cursor:pointer;border-bottom:1px dashed #64748b;" onclick="showKeywordHistory('${escapeHtml(k.keyword).replace(/'/g, "\\'")}')">${escapeHtml(k.keyword)}</span>${newBadge}
                     </td>
                     <td><span style="background:${siloColor}22;color:${siloColor};padding:2px 8px;border-radius:10px;font-size:0.7rem;font-weight:600;">${siloLabel}</span></td>
-                    <td class="number-cell" style="color:#4ade80;font-weight:600;">$${k.revenue.toLocaleString()}</td>
+                    <td class="number-cell" style="color:#4ade80;font-weight:600;">${k.isNew ? '<span style="color:#64748b;font-size:0.75rem;">-</span>' : '$' + k.revenue.toLocaleString()}</td>
                     <td style="text-align:center;">
-                        <div style="display:flex;align-items:center;gap:6px;">
+                        ${k.isNew ? '<span style="color:#facc15;font-size:0.75rem;">No data yet</span>' : `<div style="display:flex;align-items:center;gap:6px;">
                             <div style="width:50px;height:7px;background:rgba(71,85,105,0.5);border-radius:4px;overflow:hidden;">
                                 <div style="width:${k.domination}%;height:100%;background:${scoreColor};border-radius:4px;"></div>
                             </div>
                             <span style="color:${scoreColor};font-weight:700;font-size:0.85rem;">${k.domination}%</span>
-                        </div>
+                        </div>`}
                     </td>
                     <td style="text-align:center;cursor:pointer;" title="${targetTitle}" onclick="promptDomTarget('${escapeHtml(k.keyword).replace(/'/g, "\\'")}', ${k.target})">
                         <span style="color:#94a3b8;font-size:0.85rem;border-bottom:1px dashed #475569;">${k.target}%</span>
                     </td>
                     <td style="text-align:center;color:${gapCol};font-weight:600;font-size:0.85rem;">
-                        ${k.gap > 0 ? '-' + k.gap + '%' : k.gap === 0 ? '&#10003;' : '+' + Math.abs(k.gap) + '%'}
+                        ${k.isNew ? '<span style="color:#64748b;">-</span>' : (k.gap > 0 ? '-' + k.gap + '%' : k.gap === 0 ? '&#10003;' : '+' + Math.abs(k.gap) + '%')}
                     </td>
-                    ${positionCells}
-                    <td style="font-size:0.7rem;max-width:180px;">${channelSummary}</td>
+                    ${k.isNew ? '<td colspan="5" style="text-align:center;color:#64748b;font-size:0.75rem;">Run audit to get SERP data</td>' : positionCells}
+                    <td style="font-size:0.7rem;max-width:180px;">${k.isNew ? '' : channelSummary}</td>
                 </tr>`;
             }
             tbody.innerHTML = rows;
@@ -4309,22 +4466,24 @@
                     ? k.yourChannels.map(c => `#${c.position}: ${c.channel.substring(0, 15)}`).join(', ')
                     : '<span style="color:#f87171;">Not ranking</span>';
 
-                rows += `<tr>
+                const detailNewBadge = k.isNew ? ' <span style="background:#facc15;color:#1e1b4b;padding:1px 6px;border-radius:4px;font-size:0.6rem;font-weight:700;margin-left:4px;">NEW</span>' : '';
+
+                rows += `<tr${k.isNew ? ' style="background:rgba(250,204,21,0.05);"' : ''}>
                     <td class="keyword-cell">
                         ${hasSecondaries ? `<span style="cursor:pointer;margin-right:4px;font-size:0.7rem;color:#64748b;" onclick="toggleSecondaries('${kwId}',this)">&#9654;</span>` : '<span style="display:inline-block;width:16px;"></span>'}
-                        <span style="cursor:pointer;border-bottom:1px dashed #64748b;" onclick="showKeywordHistory('${escapeHtml(k.keyword).replace(/'/g, "\\'")}')">${escapeHtml(k.keyword)}</span>
+                        <span style="cursor:pointer;border-bottom:1px dashed #64748b;" onclick="showKeywordHistory('${escapeHtml(k.keyword).replace(/'/g, "\\'")}')">${escapeHtml(k.keyword)}</span>${detailNewBadge}
                     </td>
                     <td><span style="background:${siloColor}22;color:${siloColor};padding:2px 8px;border-radius:10px;font-size:0.7rem;font-weight:600;">${siloLabel}</span></td>
                     <td style="text-align:center;">
-                        <div style="display:flex;align-items:center;gap:6px;">
+                        ${k.isNew ? '<span style="color:#facc15;font-size:0.75rem;">No data yet</span>' : `<div style="display:flex;align-items:center;gap:6px;">
                             <div style="width:50px;height:7px;background:rgba(71,85,105,0.5);border-radius:4px;overflow:hidden;">
                                 <div style="width:${k.domination}%;height:100%;background:${scoreColor};border-radius:4px;"></div>
                             </div>
                             <span style="color:${scoreColor};font-weight:700;font-size:0.85rem;">${k.domination}%</span>
-                        </div>
+                        </div>`}
                     </td>
-                    ${positionCells}
-                    <td style="font-size:0.7rem;max-width:180px;">${channelSummary}</td>
+                    ${k.isNew ? '<td colspan="5" style="text-align:center;color:#64748b;font-size:0.75rem;">Run audit to get SERP data</td>' : positionCells}
+                    <td style="font-size:0.7rem;max-width:180px;">${k.isNew ? '' : channelSummary}</td>
                 </tr>`;
 
                 // Secondary keyword rows (collapsed by default)
@@ -4448,7 +4607,7 @@
                             fill: true
                         },
                         {
-                            label: 'Revenue ($)',
+                            label: 'Daily Rev ($)',
                             data: revenues,
                             borderColor: '#f59e0b',
                             backgroundColor: 'rgba(245, 158, 11, 0.1)',
@@ -4497,7 +4656,7 @@
                             grid: { drawOnChartArea: false },
                             title: {
                                 display: true,
-                                text: 'Revenue ($)',
+                                text: 'Daily Rev ($)',
                                 color: '#f59e0b'
                             }
                         }
@@ -4637,6 +4796,657 @@
             }
 
             return { recommendations, inTop5, notInTop5, niche };
+        }
+
+        // ============================================
+        // KEYWORD MANAGER
+        // ============================================
+        let kmAllKeywords = [];
+        let kmFilteredKeywords = [];
+        let kmSortCol = 'is_active';
+        let kmSortDir = 'desc';
+
+        async function openKeywordManager() {
+            const btn = document.getElementById('manage-kw-btn-text');
+            const spinner = document.getElementById('manage-kw-spinner');
+            btn.textContent = 'Loading...';
+            spinner.style.display = 'inline-block';
+
+            try {
+                const resp = await fetch('/api/keywords/available');
+                const data = await resp.json();
+                if (!data.success) throw new Error(data.error || 'Failed to load keywords');
+
+                kmAllKeywords = data.keywords;
+
+                // Populate niche filter with keyword counts
+                const nicheCounts = {};
+                kmAllKeywords.forEach(k => {
+                    if (k.niche) {
+                        if (!nicheCounts[k.niche]) nicheCounts[k.niche] = {total: 0, active: 0};
+                        nicheCounts[k.niche].total++;
+                        if (k.is_active) nicheCounts[k.niche].active++;
+                    }
+                });
+                const niches = Object.keys(nicheCounts).sort();
+                const nicheSelect = document.getElementById('km-niche-filter');
+                nicheSelect.innerHTML = '<option value="">All Niches (' + kmAllKeywords.length + ')</option>' +
+                    niches.map(n => `<option value="${n}">${n} (${nicheCounts[n].active}/${nicheCounts[n].total})</option>`).join('');
+
+                document.getElementById('km-search').value = '';
+                document.getElementById('km-status-filter').value = 'all';
+                document.getElementById('km-tier-filter').value = '';
+                kmSortCol = 'is_active';
+                kmSortDir = 'desc';
+
+                // Snapshot original active state and reset pending changes
+                kmOriginalState = {};
+                kmPendingChanges = {};
+                kmAllKeywords.forEach(k => { kmOriginalState[k.keyword] = k.is_active; });
+                updateSaveButton();
+
+                // Set initial sort arrow indicators
+                for (const [key, label] of Object.entries(kmSortLabels)) {
+                    const th = document.getElementById('km-th-' + key);
+                    if (th) th.innerHTML = key === kmSortCol ? label + ' <span style="font-size:0.7rem;">&#9660;</span>' : label;
+                }
+
+                filterKmKeywords();
+                document.getElementById('keyword-manager-modal').classList.add('active');
+            } catch (e) {
+                alert('Error loading keywords: ' + e.message);
+            } finally {
+                btn.textContent = 'Manage Keywords';
+                spinner.style.display = 'none';
+            }
+        }
+
+        function closeKeywordManager() {
+            document.getElementById('keyword-manager-modal').classList.remove('active');
+            if (kmDashboardDirty) {
+                kmDashboardDirty = false;
+                reloadDominationDashboard();
+            }
+        }
+
+        async function reloadDominationDashboard() {
+            try {
+                const response = await fetch('/api/domination/data');
+                const data = await response.json();
+                if (data.success) {
+                    domTrackingConfig = data.tracking;
+                    domTargets = data.targets || {};
+                    domAuditResults = data.audit_results_by_keyword || {};
+                    dominationData = data.audit_data;
+                    displayDominationData(data);
+                }
+            } catch (e) {
+                console.error('Dashboard reload error:', e);
+            }
+        }
+
+        function filterKmKeywords() {
+            const search = (document.getElementById('km-search').value || '').toLowerCase().trim();
+            const niche = document.getElementById('km-niche-filter').value;
+            const status = document.getElementById('km-status-filter').value;
+            const tier = document.getElementById('km-tier-filter').value;
+
+            let filtered = kmAllKeywords;
+
+            // Status filter
+            if (status === 'active') filtered = filtered.filter(k => k.is_active);
+            else if (status === 'inactive') filtered = filtered.filter(k => !k.is_active);
+            else if (status === 'bq') filtered = filtered.filter(k => k.in_bigquery);
+
+            // Tier filter
+            if (tier) filtered = filtered.filter(k => k.tier === tier);
+
+            // Search filter
+            if (search) filtered = filtered.filter(k => k.keyword.includes(search));
+
+            // Niche filter
+            if (niche) filtered = filtered.filter(k => k.niche === niche);
+
+            // Sort
+            filtered.sort((a, b) => {
+                let va = a[kmSortCol], vb = b[kmSortCol];
+                if (typeof va === 'string') { va = va.toLowerCase(); vb = (vb||'').toLowerCase(); }
+                if (va < vb) return kmSortDir === 'asc' ? -1 : 1;
+                if (va > vb) return kmSortDir === 'asc' ? 1 : -1;
+                return 0;
+            });
+
+            kmFilteredKeywords = filtered;
+            renderKmTable(filtered);
+            updateKmCounts();
+        }
+
+        const kmSortLabels = {is_active:'Active',keyword:'Keyword',tier:'Tier',niche:'Niche',priority_score:'Score',search_volume:'Volume',source:'Source',in_bigquery:'Data'};
+
+        function sortKmTable(col) {
+            if (kmSortCol === col) kmSortDir = kmSortDir === 'asc' ? 'desc' : 'asc';
+            else { kmSortCol = col; kmSortDir = 'desc'; }
+            // Update sort indicators on all headers
+            for (const [key, label] of Object.entries(kmSortLabels)) {
+                const th = document.getElementById('km-th-' + key);
+                if (th) th.innerHTML = key === kmSortCol ? label + ' <span style="font-size:0.7rem;">' + (kmSortDir === 'asc' ? '&#9650;' : '&#9660;') + '</span>' : label;
+            }
+            filterKmKeywords();
+        }
+
+        const TIER_COLORS = {A:'#10b981', B:'#3b82f6', C:'#f59e0b', D:'#6b7280', custom:'#8b5cf6', '':'#475569'};
+
+        const TIER_TOOLTIPS = {A:'Top Priority',B:'High Potential',C:'Medium',D:'Low Priority',custom:'User-added','':''};
+
+        function renderKmTable(keywords) {
+            const tbody = document.getElementById('km-table-body');
+            if (!keywords.length) {
+                tbody.innerHTML = '<tr><td colspan="9" style="text-align:center;padding:24px;color:#64748b;">No keywords match current filters</td></tr>';
+                return;
+            }
+
+            // Limit render to 500 for performance
+            const display = keywords.slice(0, 500);
+            tbody.innerHTML = display.map((k, idx) => {
+                const tierColor = TIER_COLORS[k.tier] || TIER_COLORS[''];
+                const tierLabel = k.tier || '-';
+                const tierTip = TIER_TOOLTIPS[k.tier] || '';
+                const srcLabel = k.source === 'tracking' ? 'TRK' : k.source === 'csv' ? 'CSV' : k.source === 'bigquery' ? 'BQ' : k.source === 'custom' ? 'USR' : k.source || '-';
+                const srcTip = k.source === 'tracking' ? 'From keyword tracking list' : k.source === 'csv' ? 'Imported from CSV' : k.source === 'bigquery' ? 'Added from BigQuery' : k.source === 'custom' ? 'Custom user-added' : '';
+                const escKw = k.keyword.replace(/'/g,"\\'");
+                const deleteBtn = k.source === 'custom' ? `<button onclick="deleteKmKeyword('${escKw}')" style="background:none;border:none;color:#ef4444;cursor:pointer;font-size:1rem;padding:0 4px;" title="Delete this keyword">&times;</button>` : '';
+                const dataIcon = k.in_bigquery ? '<span style="color:#10b981;" title="Has historical SERP data">&#10003;</span>' : '<span style="color:#475569;">-</span>';
+                const scoreTip = k.priority_score ? `Priority Score: ${Math.round(k.priority_score)} — Higher = better opportunity` : '';
+                let roleTag = '';
+                if (k.is_primary && k.secondaries && k.secondaries.length) {
+                    roleTag = ` <span style="color:#64748b;font-size:0.65rem;background:rgba(100,116,139,0.15);padding:1px 5px;border-radius:3px;cursor:help;" title="Secondary keywords:\n${k.secondaries.join('\n')}">primary</span>`;
+                } else if (k.secondary_of && k.secondary_of.length) {
+                    roleTag = ` <span style="color:#64748b;font-size:0.65rem;background:rgba(100,116,139,0.15);padding:1px 5px;border-radius:3px;cursor:help;" title="Secondary of:\n${k.secondary_of.join('\n')}">secondary</span>`;
+                }
+                return `<tr style="border-bottom:1px solid rgba(71,85,105,0.2);">
+                    <td style="text-align:center;padding:6px 8px;color:#475569;font-size:0.75rem;">${idx + 1}</td>
+                    <td style="text-align:center;padding:6px 8px;">
+                        <input type="checkbox" ${k.is_active ? 'checked' : ''} ${(k.is_primary && k.secondaries && k.secondaries.length) ? 'disabled title="Has secondary keywords — remove them first to deactivate"' : ''} onchange="toggleKmKeyword('${escKw}', this.checked)" style="cursor:pointer;width:16px;height:16px;${(k.is_primary && k.secondaries && k.secondaries.length) ? 'opacity:0.6;' : ''}">
+                    </td>
+                    <td style="padding:6px 8px;color:#e2e8f0;max-width:400px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${k.keyword}${deleteBtn}${roleTag}</td>
+                    <td style="text-align:center;padding:6px 8px;" title="${tierTip}"><span style="color:${tierColor};font-weight:600;font-size:0.8rem;">${tierLabel}</span></td>
+                    <td style="padding:6px 8px;color:#94a3b8;font-size:0.8rem;">${k.niche || '-'}</td>
+                    <td style="text-align:right;padding:6px 8px;color:#e2e8f0;" title="${scoreTip}">${k.priority_score ? Math.round(k.priority_score) : '-'}</td>
+                    <td style="text-align:right;padding:6px 8px;color:#e2e8f0;">${k.search_volume ? k.search_volume.toLocaleString() : '-'}</td>
+                    <td style="text-align:center;padding:6px 8px;color:#64748b;font-size:0.75rem;" title="${srcTip}">${srcLabel}</td>
+                    <td style="text-align:center;padding:6px 8px;">${dataIcon}</td>
+                </tr>`;
+            }).join('');
+
+            if (keywords.length > 500) {
+                tbody.innerHTML += `<tr><td colspan="9" style="text-align:center;padding:12px;color:#64748b;font-size:0.8rem;">Showing 500 of ${keywords.length} — use search to narrow down</td></tr>`;
+            }
+        }
+
+        function updateKmCounts() {
+            const activeCount = kmAllKeywords.filter(k => k.is_active).length;
+            document.getElementById('km-active-count').textContent = `${activeCount} active / ${kmAllKeywords.length} total`;
+            document.getElementById('km-showing-count').textContent = `Showing ${Math.min(kmFilteredKeywords.length, 500)} of ${kmFilteredKeywords.length} keywords`;
+        }
+
+        // Track pending changes: {keyword: true/false}
+        let kmPendingChanges = {};
+        // Snapshot of original is_active state when modal opened
+        let kmOriginalState = {};
+        // Track if keyword manager made changes that need dashboard refresh
+        let kmDashboardDirty = false;
+
+        function toggleKmKeyword(keyword, active) {
+            const kw = kmAllKeywords.find(k => k.keyword === keyword);
+            // Block deactivation of primary keywords that have secondaries
+            if (kw && kw.is_primary && !active && kw.secondaries && kw.secondaries.length) {
+                document.getElementById('km-status').textContent = 'Has secondary keywords — remove them first to deactivate';
+                setTimeout(() => { document.getElementById('km-status').textContent = ''; }, 2000);
+                filterKmKeywords();
+                return;
+            }
+            if (kw) kw.is_active = active;
+
+            // Track if this differs from original
+            if (kmOriginalState[keyword] !== undefined && kmOriginalState[keyword] !== active) {
+                kmPendingChanges[keyword] = active;
+            } else {
+                delete kmPendingChanges[keyword];
+            }
+
+            updateKmCounts();
+            updateSaveButton();
+        }
+
+        async function deleteKmKeyword(keyword) {
+            const kw = kmAllKeywords.find(k => k.keyword === keyword);
+            if (kw && kw.is_primary && kw.secondaries && kw.secondaries.length > 0) {
+                alert(`Cannot delete "${keyword}" — it has ${kw.secondaries.length} secondary keyword(s):\n\n${kw.secondaries.join('\n')}\n\nRemove or reassign the secondary keywords first.`);
+                return;
+            }
+            if (!confirm(`Delete "${keyword}" from your keyword list?`)) return;
+            try {
+                const resp = await fetch('/api/keywords/priority', {
+                    method: 'DELETE',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({keywords: [keyword]})
+                });
+                const data = await resp.json();
+                if (!data.success) throw new Error(data.error);
+
+                // Remove from local state and cleanup tracking
+                kmAllKeywords = kmAllKeywords.filter(k => k.keyword !== keyword);
+                kmFilteredKeywords = kmFilteredKeywords.filter(k => k.keyword !== keyword);
+                delete kmOriginalState[keyword];
+                delete kmPendingChanges[keyword];
+                renderKmTable(kmFilteredKeywords);
+                updateKmCounts();
+                updateSaveButton();
+                document.getElementById('km-status').textContent = `"${keyword}" deleted`;
+                setTimeout(() => { document.getElementById('km-status').textContent = ''; }, 2000);
+                kmDashboardDirty = true;
+            } catch (e) {
+                alert('Error: ' + e.message);
+            }
+        }
+
+        function updateSaveButton() {
+            const btn = document.getElementById('km-save-btn');
+            const count = Object.keys(kmPendingChanges).length;
+            const countEl = document.getElementById('km-pending-count');
+            if (count > 0) {
+                btn.disabled = false;
+                btn.style.opacity = '1';
+                btn.style.pointerEvents = 'auto';
+                btn.style.background = '#8b5cf6';
+                btn.textContent = `Save Changes (${count})`;
+                const added = Object.values(kmPendingChanges).filter(v => v).length;
+                const removed = Object.values(kmPendingChanges).filter(v => !v).length;
+                let parts = [];
+                if (added) parts.push(`+${added} added`);
+                if (removed) parts.push(`-${removed} removed`);
+                countEl.textContent = parts.join(', ');
+            } else {
+                btn.disabled = true;
+                btn.style.opacity = '0.5';
+                btn.style.pointerEvents = 'none';
+                btn.style.background = '#6b7280';
+                btn.textContent = 'Save Changes';
+                countEl.textContent = '';
+            }
+        }
+
+        async function saveKmChanges() {
+            const changes = {...kmPendingChanges};
+            const activated = Object.entries(changes).filter(([k,v]) => v).map(([k]) => k);
+            const deactivated = Object.entries(changes).filter(([k,v]) => !v).map(([k]) => k);
+
+            if (!activated.length && !deactivated.length) return;
+
+            // If there are activated keywords, show role config first
+            if (activated.length) {
+                showRoleConfigModal(activated, deactivated, changes);
+                return;
+            }
+
+            // No activated — save directly
+            await executeSave(activated, deactivated, changes, []);
+        }
+
+        function showRoleConfigModal(activated, deactivated, changes) {
+            const primaries = kmAllKeywords.filter(k => k.is_primary).sort((a,b) => a.keyword.localeCompare(b.keyword));
+            const primaryOpts = primaries.map(p => `<option value="${p.keyword}">${p.keyword}</option>`).join('');
+
+            let html = '<div style="max-height:50vh;overflow-y:auto;">';
+            html += `<p style="color:#94a3b8;font-size:0.8rem;margin-bottom:12px;">Set role and silo for newly activated keywords. Primary keywords are always included in audits.</p>`;
+            html += activated.map((kw, i) => {
+                const k = kmAllKeywords.find(x => x.keyword === kw);
+                const hasBQ = k && k.in_bigquery;
+                const currentNiche = k ? (k.niche || '') : '';
+                const nicheToSilo = {'ID Theft':'id_theft','Dog':'dog','Data Broker':'data_broker','Parental Control':'parental_control'};
+                const autoSilo = nicheToSilo[currentNiche] || '';
+                return `<div style="display:flex;align-items:center;gap:8px;padding:8px 0;border-bottom:1px solid rgba(71,85,105,0.2);flex-wrap:wrap;">
+                    <span style="color:#e2e8f0;font-size:0.83rem;min-width:160px;flex:1;">${kw}${hasBQ ? ' <span style="color:#10b981;font-size:0.7rem;">has data</span>' : ''}</span>
+                    <select id="km-role-${i}" onchange="kmRoleSelChanged(${i})" style="padding:4px 6px;background:rgba(15,23,42,0.8);border:1px solid rgba(71,85,105,0.5);color:#e2e8f0;border-radius:4px;font-size:0.78rem;">
+                        <option value="none">No role</option>
+                        <option value="primary">Primary</option>
+                        <option value="secondary">Secondary</option>
+                    </select>
+                    <select id="km-silo-${i}" style="padding:4px 6px;background:rgba(15,23,42,0.8);border:1px solid rgba(71,85,105,0.5);color:#e2e8f0;border-radius:4px;font-size:0.78rem;">
+                        <option value=""${!autoSilo ? ' selected' : ''}>Silo...</option>
+                        <option value="id_theft"${autoSilo==='id_theft'?' selected':''}>ID Theft</option>
+                        <option value="dog"${autoSilo==='dog'?' selected':''}>Dog</option>
+                        <option value="data_broker"${autoSilo==='data_broker'?' selected':''}>Data Broker</option>
+                        <option value="parental_control"${autoSilo==='parental_control'?' selected':''}>Parental Control</option>
+                        <option value="new">New / Other</option>
+                    </select>
+                    <select id="km-parent-${i}" style="display:none;padding:4px 6px;background:rgba(15,23,42,0.8);border:1px solid rgba(71,85,105,0.5);color:#e2e8f0;border-radius:4px;font-size:0.78rem;max-width:200px;">
+                        <option value="">Select primary...</option>
+                        ${primaryOpts}
+                    </select>
+                </div>`;
+            }).join('');
+            html += '</div>';
+
+            if (deactivated.length) {
+                html += `<div style="margin-top:12px;padding:8px 12px;background:rgba(239,68,68,0.08);border-radius:6px;color:#94a3b8;font-size:0.8rem;">${deactivated.length} keyword${deactivated.length > 1 ? 's' : ''} will be deactivated.</div>`;
+            }
+
+            const overlay = document.createElement('div');
+            overlay.id = 'km-role-config';
+            overlay.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.7);z-index:10001;display:flex;align-items:center;justify-content:center;';
+            overlay.innerHTML = `
+                <div style="background:#1e293b;border:1px solid #334155;border-radius:12px;padding:24px;max-width:600px;width:90%;box-shadow:0 20px 60px rgba(0,0,0,0.5);">
+                    <h3 style="color:#e2e8f0;margin-bottom:12px;">Configure Keywords (${activated.length} activating)</h3>
+                    ${html}
+                    <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:16px;">
+                        <button onclick="document.getElementById('km-role-config').remove()" style="padding:8px 16px;background:transparent;color:#94a3b8;border:1px solid rgba(71,85,105,0.5);border-radius:6px;cursor:pointer;font-size:0.85rem;">Cancel</button>
+                        <button onclick="confirmRoleSave()" style="padding:8px 20px;background:#8b5cf6;color:white;border:none;border-radius:6px;cursor:pointer;font-size:0.85rem;">Confirm & Save</button>
+                    </div>
+                </div>
+            `;
+            overlay.dataset.activated = JSON.stringify(activated);
+            overlay.dataset.deactivated = JSON.stringify(deactivated);
+            overlay.dataset.changes = JSON.stringify(changes);
+            document.body.appendChild(overlay);
+        }
+
+        function kmRoleSelChanged(idx) {
+            const role = document.getElementById('km-role-' + idx).value;
+            document.getElementById('km-parent-' + idx).style.display = role === 'secondary' ? 'block' : 'none';
+        }
+
+        async function confirmRoleSave() {
+            const overlay = document.getElementById('km-role-config');
+            const activated = JSON.parse(overlay.dataset.activated);
+            const deactivated = JSON.parse(overlay.dataset.deactivated);
+            const changes = JSON.parse(overlay.dataset.changes);
+
+            const roles = [];
+            activated.forEach((kw, i) => {
+                const role = document.getElementById('km-role-' + i).value;
+                const silo = document.getElementById('km-silo-' + i).value;
+                const parent = role === 'secondary' ? document.getElementById('km-parent-' + i).value : '';
+                roles.push({keyword: kw, role, parent_keyword: parent, silo});
+            });
+
+            const missingParent = roles.find(r => r.role === 'secondary' && !r.parent_keyword);
+            if (missingParent) {
+                alert(`Please select a primary keyword for "${missingParent.keyword}"`);
+                return;
+            }
+
+            overlay.remove();
+            await executeSave(activated, deactivated, changes, roles);
+        }
+
+        async function executeSave(activated, deactivated, changes, roles) {
+            const btn = document.getElementById('km-save-btn');
+            btn.textContent = 'Saving...';
+            btn.disabled = true;
+
+            try {
+                if (activated.length) {
+                    for (let i = 0; i < activated.length; i += 200) {
+                        const batch = activated.slice(i, i + 200);
+                        const resp = await fetch('/api/keywords/priority/toggle', {
+                            method: 'PUT',
+                            headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify({keywords: batch, active: true})
+                        });
+                        const data = await resp.json();
+                        if (!data.success) throw new Error(data.error);
+                    }
+                }
+
+                if (deactivated.length) {
+                    for (let i = 0; i < deactivated.length; i += 200) {
+                        const batch = deactivated.slice(i, i + 200);
+                        const resp = await fetch('/api/keywords/priority/toggle', {
+                            method: 'PUT',
+                            headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify({keywords: batch, active: false})
+                        });
+                        const data = await resp.json();
+                        if (!data.success) throw new Error(data.error);
+                    }
+                }
+
+                // Update roles if any were set
+                if (roles.length) {
+                    const resp = await fetch('/api/keywords/priority/roles', {
+                        method: 'PUT',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({roles})
+                    });
+                    const data = await resp.json();
+                    if (!data.success) throw new Error(data.error);
+
+                    for (const r of roles) {
+                        const kw = kmAllKeywords.find(k => k.keyword === r.keyword);
+                        if (kw) {
+                            kw.is_primary = r.role === 'primary';
+                            kw.parent_keyword = r.parent_keyword || '';
+                            if (r.role === 'secondary') kw.secondary_of = [r.parent_keyword];
+                        }
+                    }
+                }
+
+                for (const [kw, active] of Object.entries(changes)) {
+                    kmOriginalState[kw] = active;
+                }
+                kmPendingChanges = {};
+                updateSaveButton();
+                filterKmKeywords();
+
+                kmDashboardDirty = true;
+                showKmSaveSummary(activated, deactivated);
+
+            } catch (e) {
+                alert('Error saving: ' + e.message);
+                btn.textContent = 'Save Changes';
+                btn.disabled = false;
+            }
+        }
+
+        function showKmSaveSummary(activated, deactivated) {
+            // Check which activated keywords have BQ data
+            const activatedWithBQ = activated.filter(kw => {
+                const k = kmAllKeywords.find(x => x.keyword === kw);
+                return k && k.in_bigquery;
+            });
+            const activatedNoBQ = activated.filter(kw => {
+                const k = kmAllKeywords.find(x => x.keyword === kw);
+                return !k || !k.in_bigquery;
+            });
+
+            // Build summary content
+            let html = '<div style="max-height:60vh;overflow-y:auto;">';
+
+            if (activated.length) {
+                html += `<div style="margin-bottom:16px;">`;
+                html += `<h4 style="color:#10b981;margin-bottom:8px;">Added to Priority (${activated.length})</h4>`;
+                html += `<div style="background:rgba(16,185,129,0.1);border:1px solid rgba(16,185,129,0.3);border-radius:8px;padding:12px;max-height:200px;overflow-y:auto;">`;
+                html += activated.map(kw => {
+                    const hasBQ = activatedWithBQ.includes(kw);
+                    return `<div style="padding:3px 0;color:#e2e8f0;font-size:0.85rem;">${kw}${hasBQ ? ' <span style="color:#10b981;font-size:0.75rem;">(has historical data)</span>' : ''}</div>`;
+                }).join('');
+                html += `</div>`;
+                if (activatedWithBQ.length) {
+                    html += `<div style="margin-top:8px;padding:8px 12px;background:rgba(16,185,129,0.08);border-radius:6px;color:#10b981;font-size:0.8rem;">${activatedWithBQ.length} keyword${activatedWithBQ.length > 1 ? 's have' : ' has'} existing historical data. Results will show immediately in the next domination audit run.</div>`;
+                }
+                if (activatedNoBQ.length) {
+                    html += `<div style="margin-top:6px;padding:8px 12px;background:rgba(245,158,11,0.08);border-radius:6px;color:#f59e0b;font-size:0.8rem;">${activatedNoBQ.length} keyword${activatedNoBQ.length > 1 ? 's are' : ' is'} not yet tracked in BigQuery — data will appear once SERP tracking begins.</div>`;
+                }
+                html += `</div>`;
+            }
+
+            if (deactivated.length) {
+                const deactivatedWithBQ = deactivated.filter(kw => {
+                    const k = kmAllKeywords.find(x => x.keyword === kw);
+                    return k && k.in_bigquery;
+                });
+
+                html += `<div style="margin-bottom:16px;">`;
+                html += `<h4 style="color:#ef4444;margin-bottom:8px;">Removed from Priority (${deactivated.length})</h4>`;
+                html += `<div style="background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:8px;padding:12px;max-height:200px;overflow-y:auto;">`;
+                html += deactivated.map(kw => {
+                    const hasBQ = deactivatedWithBQ.includes(kw);
+                    return `<div style="padding:3px 0;color:#e2e8f0;font-size:0.85rem;">${kw}${hasBQ ? ' <span style="color:#f59e0b;font-size:0.75rem;">(has historical data)</span>' : ''}</div>`;
+                }).join('');
+                html += `</div>`;
+                html += `<div style="margin-top:8px;padding:8px 12px;background:rgba(239,68,68,0.08);border-radius:6px;color:#94a3b8;font-size:0.8rem;">These keywords will be excluded from the next domination audit run.</div>`;
+                if (deactivatedWithBQ.length) {
+                    html += `<div style="margin-top:6px;padding:8px 12px;background:rgba(245,158,11,0.08);border-radius:6px;color:#f59e0b;font-size:0.8rem;">${deactivatedWithBQ.length} keyword${deactivatedWithBQ.length > 1 ? 's have' : ' has'} historical data that will no longer be visible in audits. You can re-add ${deactivatedWithBQ.length > 1 ? 'them' : 'it'} anytime to restore visibility.</div>`;
+                }
+                html += `</div>`;
+            }
+
+            html += '</div>';
+
+            // Create overlay
+            const overlay = document.createElement('div');
+            overlay.id = 'km-save-summary';
+            overlay.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.7);z-index:10001;display:flex;align-items:center;justify-content:center;';
+            overlay.innerHTML = `
+                <div style="background:#1e293b;border:1px solid #334155;border-radius:12px;padding:24px;max-width:500px;width:90%;box-shadow:0 20px 60px rgba(0,0,0,0.5);">
+                    <h3 style="color:#e2e8f0;margin-bottom:16px;">Changes Saved</h3>
+                    ${html}
+                    <div style="text-align:right;margin-top:16px;">
+                        <button onclick="document.getElementById('km-save-summary').remove()" style="padding:8px 20px;background:#8b5cf6;color:white;border:none;border-radius:6px;cursor:pointer;font-size:0.9rem;">OK</button>
+                    </div>
+                </div>
+            `;
+            document.body.appendChild(overlay);
+        }
+
+        function kmSearchInput() {
+            filterKmKeywords();
+            const val = (document.getElementById('km-search').value || '').trim().toLowerCase();
+            const addBtn = document.getElementById('km-add-btn');
+            if (val.length >= 2 && !kmAllKeywords.find(k => k.keyword === val)) {
+                addBtn.style.display = 'block';
+                addBtn.textContent = '+ Add "' + (val.length > 20 ? val.substring(0, 20) + '...' : val) + '"';
+            } else {
+                addBtn.style.display = 'none';
+                hideAddKeywordForm();
+            }
+        }
+
+        function kmSearchEnter() {
+            const val = (document.getElementById('km-search').value || '').trim().toLowerCase();
+            if (val.length >= 2 && !kmAllKeywords.find(k => k.keyword === val)) {
+                showAddKeywordForm();
+            }
+        }
+
+        function showAddKeywordForm() {
+            const val = (document.getElementById('km-search').value || '').trim().toLowerCase();
+            if (val.length < 2) return;
+            document.getElementById('km-add-kw-label').textContent = '"' + val + '"';
+            document.getElementById('km-add-role').value = 'none';
+            document.getElementById('km-add-silo').value = '';
+            document.getElementById('km-add-parent').style.display = 'none';
+            document.getElementById('km-add-auto-info').textContent = '';
+            // Populate parent keyword dropdown with all primary keywords
+            const parentSelect = document.getElementById('km-add-parent');
+            const primaries = kmAllKeywords.filter(k => k.is_primary).sort((a,b) => a.keyword.localeCompare(b.keyword));
+            parentSelect.innerHTML = '<option value="">Select primary keyword...</option>' +
+                primaries.map(p => `<option value="${p.keyword}">${p.keyword}</option>`).join('');
+            document.getElementById('km-add-form').style.display = 'block';
+        }
+
+        function hideAddKeywordForm() {
+            document.getElementById('km-add-form').style.display = 'none';
+        }
+
+        function kmAddRoleChanged() {
+            const role = document.getElementById('km-add-role').value;
+            const parentSelect = document.getElementById('km-add-parent');
+            const info = document.getElementById('km-add-auto-info');
+            if (role === 'secondary') {
+                parentSelect.style.display = 'block';
+                info.textContent = 'Tier & score will inherit from parent primary';
+            } else if (role === 'primary') {
+                parentSelect.style.display = 'none';
+                info.textContent = 'Will be auto-activated as primary keyword';
+            } else {
+                parentSelect.style.display = 'none';
+                info.textContent = '';
+            }
+        }
+
+        async function addCustomKeyword() {
+            const input = document.getElementById('km-search');
+            const keyword = (input.value || '').trim().toLowerCase();
+            if (!keyword || keyword.length < 2) return;
+
+            const existing = kmAllKeywords.find(k => k.keyword === keyword);
+            if (existing) {
+                document.getElementById('km-status').textContent = `"${keyword}" already exists`;
+                setTimeout(() => { document.getElementById('km-status').textContent = ''; }, 2000);
+                return;
+            }
+
+            const role = document.getElementById('km-add-role').value;
+            const silo = document.getElementById('km-add-silo').value;
+            const parentKw = role === 'secondary' ? document.getElementById('km-add-parent').value : '';
+
+            if (!silo) {
+                alert('Please select a silo for this keyword');
+                return;
+            }
+
+            if (role === 'secondary' && !parentKw) {
+                alert('Please select a primary keyword for this secondary keyword');
+                return;
+            }
+
+            try {
+                const resp = await fetch('/api/keywords/priority/custom', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({keyword, role, parent_keyword: parentKw, silo})
+                });
+                const data = await resp.json();
+                if (!data.success) throw new Error(data.error);
+
+                // Add to local state with returned values
+                const siloLabels = {id_theft:'ID Theft',dog:'Dog',data_broker:'Data Broker',parental_control:'Parental Control',new:''};
+                const newKw = {
+                    keyword, tier: data.tier || 'custom', niche: data.niche || siloLabels[silo] || '',
+                    priority_score: data.priority_score || 0,
+                    search_volume: 0, source: 'custom', is_active: true,
+                    added_by: '', in_bigquery: false,
+                    is_primary: data.is_primary || false,
+                    parent_keyword: data.parent_keyword || '',
+                    secondary_of: parentKw ? [parentKw] : [],
+                    secondaries: []
+                };
+                kmAllKeywords.push(newKw);
+
+                // If secondary, add to parent's secondaries list
+                if (parentKw) {
+                    const parent = kmAllKeywords.find(k => k.keyword === parentKw);
+                    if (parent && parent.secondaries) parent.secondaries.push(keyword);
+                }
+
+                kmOriginalState[keyword] = true;
+                delete kmPendingChanges[keyword];
+                updateSaveButton();
+
+                input.value = '';
+                document.getElementById('km-add-btn').style.display = 'none';
+                hideAddKeywordForm();
+                filterKmKeywords();
+
+                const roleLabel = role === 'primary' ? ' as primary' : role === 'secondary' ? ` as secondary of "${parentKw}"` : '';
+                document.getElementById('km-status').textContent = `Added "${keyword}"${roleLabel}`;
+                setTimeout(() => { document.getElementById('km-status').textContent = ''; }, 3000);
+                kmDashboardDirty = true;
+            } catch (e) {
+                alert('Error: ' + e.message);
+            }
         }
 
         async function loadContentPlannerData() {

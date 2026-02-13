@@ -1,3 +1,6 @@
+from dotenv import load_dotenv
+load_dotenv()
+
 from flask import Flask, render_template, jsonify, request, Response, redirect, url_for, session
 import csv
 import json
@@ -174,6 +177,111 @@ YOUTUBE_API_KEY = os.environ.get('YOUTUBE_API_KEY', '').strip()  # For comprehen
 print(f"Keywords Everywhere API key configured: {bool(KEYWORDS_EVERYWHERE_API_KEY)} (length: {len(KEYWORDS_EVERYWHERE_API_KEY)})")
 print(f"DataForSEO configured: {bool(DATAFORSEO_LOGIN and DATAFORSEO_PASSWORD)}")
 print(f"YouTube Data API key configured: {bool(YOUTUBE_API_KEY)}")
+
+# ============================================
+# BIGQUERY CLIENT (YouTube SERP data source)
+# ============================================
+BQ_PROJECT_ID = "company-wide-370010"
+BQ_SERP_TABLE = "`company-wide-370010.1_YT_Serp_result.ALL_Time YT Serp`"
+BQ_METRICS_TABLE = "`company-wide-370010.Digibot.Metrics_by_Month`"
+BQ_DAILY_REV_TABLE = "`company-wide-370010.Digibot.Daily_Rev_Metrics_by_Video_ID`"
+BQ_GENERAL_INFO_TABLE = "`company-wide-370010.Digibot.Digibot_General_info`"
+
+_bq_client = None
+
+def get_bq_client():
+    """Lazy-init BigQuery client from service account JSON."""
+    global _bq_client
+    if _bq_client is not None:
+        return _bq_client
+
+    sa_json = os.environ.get('GOOGLE_SERVICE_ACCOUNT_JSON', '')
+    if not sa_json:
+        print("[BQ] WARNING: GOOGLE_SERVICE_ACCOUNT_JSON not set")
+        return None
+
+    try:
+        from google.cloud import bigquery
+        from google.oauth2.service_account import Credentials
+
+        if sa_json.strip().startswith('{'):
+            info = json.loads(sa_json)
+            creds = Credentials.from_service_account_info(info)
+        else:
+            creds = Credentials.from_service_account_file(sa_json)
+
+        _bq_client = bigquery.Client(credentials=creds, project=BQ_PROJECT_ID)
+        print("[BQ] BigQuery client initialized successfully")
+        return _bq_client
+    except Exception as e:
+        print(f"[BQ] Error initializing BigQuery client: {e}")
+        return None
+
+# ============================================
+# DIGIDOM CHANNEL REGISTRY (single source of truth)
+# ============================================
+DIGIDOM_CHANNELS = {
+    'SH': {
+        'bq_names': ['Home Security Heroes'],
+        'match_patterns': ['security hero', 'securityhero', 'home security heroes'],
+    },
+    'CS': {
+        'bq_names': ['Cyber Sleuth'],
+        'match_patterns': ['cybersleuth', 'cyber sleuth', 'cyber_sleuth'],
+    },
+    'TR': {
+        'bq_names': ['The Tech Roost'],
+        'match_patterns': ['the tech roost', 'tech roost'],
+    },
+    'TOOP': {
+        'bq_names': ['The Opt Out Project'],
+        'match_patterns': ['opt out project', 'optoutproject', 'the opt out'],
+    },
+    'TPP': {
+        'bq_names': ['The Pampered Pup'],
+        'match_patterns': ['pampered pup', 'pamperedpup', 'the pampered'],
+    },
+    'TST': {
+        'bq_names': ['The Sniff Test'],
+        'match_patterns': ['sniff test', 'snifftest', 'the sniff'],
+    },
+    'CC': {
+        'bq_names': ['Cozy Crates'],
+        'match_patterns': ['cozy crates', 'cozycrates'],
+    },
+    'ATNM': {
+        'bq_names': ['All Tech No Money'],
+        'match_patterns': ['all tech no money', 'alltechnomoney'],
+    },
+    'BB': {
+        'bq_names': ['Better Bets'],
+        'match_patterns': ['better bets', 'betterbets'],
+    },
+    'CH': {
+        'bq_names': ['Casino Hunt'],
+        'match_patterns': ['casino hunt', 'casinohunt'],
+    },
+    'PF': {
+        'bq_names': ['Privacy Freak'],
+        'match_patterns': ['privacy freak', 'privacyfreak'],
+    },
+    'RZ': {
+        'bq_names': ['Reviewszy'],
+        'match_patterns': ['reviewszy'],
+    },
+    'SBS': {
+        'bq_names': ['Small Biz Smarts'],
+        'match_patterns': ['small biz smarts', 'smallbizsmarts'],
+    },
+}
+
+ALL_BQ_CHANNEL_NAMES = []
+for _ch_data in DIGIDOM_CHANNELS.values():
+    ALL_BQ_CHANNEL_NAMES.extend(_ch_data['bq_names'])
+
+ALL_MATCH_PATTERNS = []
+for _ch_data in DIGIDOM_CHANNELS.values():
+    ALL_MATCH_PATTERNS.extend(_ch_data['match_patterns'])
 
 # ============================================
 # DATABASE SETUP (Supabase Postgres)
@@ -488,6 +596,21 @@ def init_db():
         )
     ''')
 
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS priority_keywords (
+            id SERIAL PRIMARY KEY,
+            keyword TEXT UNIQUE NOT NULL,
+            tier TEXT DEFAULT 'A',
+            niche TEXT DEFAULT '',
+            priority_score REAL DEFAULT 0,
+            search_volume INTEGER DEFAULT 0,
+            source TEXT DEFAULT 'tracking',
+            is_active BOOLEAN DEFAULT TRUE,
+            added_by TEXT DEFAULT 'system',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+
     conn.commit()
     conn.close()
 
@@ -495,6 +618,125 @@ try:
     init_db()
 except Exception as e:
     print(f"[DB] Warning: Could not initialize DB (tables may already exist): {e}")
+
+
+def seed_priority_keywords():
+    """Seed priority_keywords table from keyword_tracking.json (22 primary keywords).
+    Only runs if the table is empty. CSV keywords loaded as inactive for browsing.
+    Uses autocommit mode to avoid Supabase statement_timeout on long transactions."""
+    try:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute('SELECT COUNT(*) FROM priority_keywords')
+        count = c.fetchone()[0]
+        if count > 0:
+            print(f"[SEED] priority_keywords already has {count} rows, skipping seed")
+            conn.close()
+            return
+        conn.close()
+
+        # Re-open with autocommit to avoid Supabase statement_timeout
+        conn = get_db()
+        conn.autocommit = True
+        c = conn.cursor()
+
+        # Source 1: keyword_tracking.json — 22 primary keywords as ACTIVE defaults
+        tracking_path = os.path.join(os.path.dirname(__file__), 'data', 'keyword_tracking.json')
+        tracking_keywords = set()
+        if os.path.exists(tracking_path):
+            with open(tracking_path) as f:
+                config = json.load(f)
+            for silo in config.get('silos', []):
+                silo_id = silo.get('id', '')
+                for group in silo.get('groups', []):
+                    for kw_entry in group.get('keywords', []):
+                        kw = kw_entry['keyword'].lower().strip()
+                        tracking_keywords.add(kw)
+                        c.execute('''
+                            INSERT INTO priority_keywords (keyword, tier, niche, priority_score, source, is_active, added_by)
+                            VALUES (%s, 'A', %s, 100, 'tracking', TRUE, 'system')
+                            ON CONFLICT (keyword) DO NOTHING
+                        ''', (kw, silo_id))
+                        # Also add secondaries as active (included in audits)
+                        for sec in kw_entry.get('secondary', []):
+                            sec_kw = sec.lower().strip()
+                            tracking_keywords.add(sec_kw)
+                            c.execute('''
+                                INSERT INTO priority_keywords (keyword, tier, niche, priority_score, source, is_active, added_by)
+                                VALUES (%s, 'A', %s, 90, 'tracking', TRUE, 'system')
+                                ON CONFLICT (keyword) DO NOTHING
+                            ''', (sec_kw, silo_id))
+            print(f"[SEED] Inserted {len(tracking_keywords)} keywords from keyword_tracking.json (active)")
+
+        # Source 2: keywords.csv — remaining keywords as INACTIVE (available to activate)
+        csv_path = os.path.join(os.path.dirname(__file__), 'data', 'keywords.csv')
+        csv_count = 0
+        if os.path.exists(csv_path):
+            import csv as csv_mod
+            with open(csv_path) as f:
+                reader = csv_mod.DictReader(f)
+                for row in reader:
+                    kw = row.get('keyword', '').lower().strip()
+                    if not kw or kw in tracking_keywords:
+                        continue
+                    tier_raw = row.get('opportunity_tier', '').strip()
+                    tier = tier_raw[0] if tier_raw else 'D'  # A, B, C, D
+                    niche = row.get('niche', '').strip()
+                    score = float(row.get('priority_score', 0) or 0)
+                    volume = int(row.get('volume', 0) or 0)
+                    c.execute('''
+                        INSERT INTO priority_keywords (keyword, tier, niche, priority_score, search_volume, source, is_active, added_by)
+                        VALUES (%s, %s, %s, %s, %s, 'csv', FALSE, 'system')
+                        ON CONFLICT (keyword) DO NOTHING
+                    ''', (kw, tier, niche, score, volume))
+                    csv_count += 1
+            print(f"[SEED] Inserted {csv_count} keywords from keywords.csv (inactive)")
+
+        conn.close()
+        print(f"[SEED] Priority keywords seeded successfully")
+    except Exception as e:
+        print(f"[SEED] Error seeding priority_keywords: {e}")
+
+try:
+    seed_priority_keywords()
+except Exception as e:
+    print(f"[SEED] Warning: Could not seed priority keywords: {e}")
+
+# Startup migration: add is_primary/parent_keyword columns + seed relationships from tracking JSON
+try:
+    _conn = get_db()
+    _conn.autocommit = True
+    _c = _conn.cursor()
+    # Add columns if missing
+    _c.execute("SELECT column_name FROM information_schema.columns WHERE table_name = 'priority_keywords' AND column_name = 'is_primary'")
+    if not _c.fetchone():
+        _c.execute("ALTER TABLE priority_keywords ADD COLUMN is_primary BOOLEAN DEFAULT FALSE")
+        _c.execute("ALTER TABLE priority_keywords ADD COLUMN parent_keyword TEXT DEFAULT ''")
+        print("[SEED-FIX] Added is_primary and parent_keyword columns")
+
+    # Seed primary/secondary relationships from keyword_tracking.json
+    tracking_path = os.path.join(os.path.dirname(__file__), 'data', 'keyword_tracking.json')
+    if os.path.exists(tracking_path):
+        with open(tracking_path) as f:
+            _cfg = json.load(f)
+        _fixed = 0
+        for _silo in _cfg.get('silos', []):
+            for _grp in _silo.get('groups', []):
+                for _ke in _grp.get('keywords', []):
+                    _pk = _ke['keyword'].lower().strip()
+                    # Mark primary
+                    _c.execute("UPDATE priority_keywords SET is_primary = TRUE, is_active = TRUE WHERE keyword = %s AND is_primary IS NOT TRUE", (_pk,))
+                    _fixed += _c.rowcount
+                    # Mark secondaries with parent
+                    for _s in _ke.get('secondary', []):
+                        _sk = _s.lower().strip()
+                        _c.execute("UPDATE priority_keywords SET is_primary = FALSE, parent_keyword = %s, is_active = TRUE WHERE keyword = %s AND (parent_keyword IS NULL OR parent_keyword = '')", (_pk, _sk))
+                        _fixed += _c.rowcount
+        if _fixed > 0:
+            print(f"[SEED-FIX] Updated {_fixed} keyword relationships from tracking JSON")
+    _conn.close()
+except Exception as e:
+    print(f"[SEED-FIX] Warning: {e}")
 
 # ============================================
 # CSV → DB MIGRATION (one-time import into Supabase)
@@ -5036,6 +5278,189 @@ BUNDLED_RANKING_PATH = os.path.join(os.path.dirname(__file__), 'data', 'ranking_
 KEYWORD_TRACKING_PATH = os.path.join(os.path.dirname(__file__), 'data', 'keyword_tracking.json')
 
 
+def fetch_domination_from_bigquery(keywords):
+    """Fetch YouTube SERP ranking data from BigQuery for given keywords.
+
+    Returns dict keyed by lowercase keyword with:
+    {top_10, domination_score, positions_owned, scrape_date, search_volume}
+    """
+    from google.cloud import bigquery as bq
+
+    client = get_bq_client()
+    if not client:
+        print("[BQ] No BigQuery client available")
+        return {}
+
+    if not keywords:
+        return {}
+
+    # Build parameterized keyword list
+    kw_lower = [kw.lower() for kw in keywords]
+    kw_params = [bq.ScalarQueryParameter(f"kw_{i}", "STRING", kw) for i, kw in enumerate(kw_lower)]
+    kw_placeholders = ', '.join(f"@kw_{i}" for i in range(len(kw_lower)))
+
+    query = f"""
+    SELECT
+        Keyword,
+        Channel_title,
+        Rank,
+        Views,
+        Video_title,
+        Search_Volume,
+        Scrape_date,
+        competitor_checker
+    FROM {BQ_SERP_TABLE}
+    WHERE LOWER(Keyword) IN ({kw_placeholders})
+      AND Scrape_date = BQ_asia_scrape_date
+      AND Rank BETWEEN 1 AND 10
+      AND Scrape_date = (
+          SELECT Scrape_date FROM (
+              SELECT Scrape_date, COUNT(*) as row_cnt
+              FROM {BQ_SERP_TABLE}
+              WHERE Scrape_date = BQ_asia_scrape_date
+                AND Scrape_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
+              GROUP BY Scrape_date
+              HAVING COUNT(*) > 5000
+              ORDER BY Scrape_date DESC
+              LIMIT 1
+          )
+      )
+    ORDER BY Keyword, Rank
+    """
+
+    job_config = bq.QueryJobConfig(query_parameters=kw_params)
+
+    try:
+        rows = client.query(query, job_config=job_config).result()
+
+        # Group by keyword (lowercase key)
+        keyword_data = {}
+        for row in rows:
+            kw_key = row.Keyword.lower() if row.Keyword else ''
+            if kw_key not in keyword_data:
+                keyword_data[kw_key] = {
+                    'top_10': [],
+                    'scrape_date': str(row.Scrape_date),
+                    'search_volume': row.Search_Volume or 0,
+                }
+
+            keyword_data[kw_key]['top_10'].append({
+                'channel': row.Channel_title or '',
+                'title': row.Video_title or '',
+                'views': row.Views or 0,
+                'rank': row.Rank,
+                'link': '',
+            })
+
+        # Calculate domination scores
+        WEIGHTS = {1: 50, 2: 25, 3: 15, 4: 5, 5: 5}
+        bq_names_lower = {n.lower() for n in ALL_BQ_CHANNEL_NAMES}
+
+        for kw_key, data in keyword_data.items():
+            score = 0
+            positions_owned = []
+
+            for entry in data['top_10'][:5]:
+                rank = entry['rank']
+                channel_lower = entry['channel'].lower()
+                is_digidom = channel_lower in bq_names_lower
+                if is_digidom and rank in WEIGHTS:
+                    score += WEIGHTS[rank]
+                    positions_owned.append(rank)
+
+            data['domination_score'] = min(score, 100)
+            data['positions_owned'] = positions_owned
+
+        print(f"[BQ] Fetched domination data for {len(keyword_data)}/{len(keywords)} keywords")
+        return keyword_data
+
+    except Exception as e:
+        print(f"[BQ] Query error: {e}")
+        return {}
+
+
+def fetch_domination_history_from_bigquery(keyword, days=90):
+    """Fetch historical domination scores for a keyword from BigQuery.
+
+    BigQuery has ~2 years of daily scrapes vs. handful of points in Supabase.
+    Returns list of dicts: [{scrape_date, domination_score, positions_owned, search_volume}]
+    """
+    from google.cloud import bigquery as bq
+
+    client = get_bq_client()
+    if not client:
+        return []
+
+    ch_names_str = ', '.join(f"'{name}'" for name in ALL_BQ_CHANNEL_NAMES)
+
+    query = f"""
+    WITH ranked_data AS (
+        SELECT
+            Scrape_date,
+            Channel_title,
+            Rank,
+            Search_Volume
+        FROM {BQ_SERP_TABLE}
+        WHERE LOWER(Keyword) = LOWER(@keyword)
+          AND Scrape_date = BQ_asia_scrape_date
+          AND Rank BETWEEN 1 AND 5
+          AND Scrape_date >= DATE_SUB(CURRENT_DATE(), INTERVAL @days DAY)
+    ),
+    daily_scores AS (
+        SELECT
+            Scrape_date,
+            MAX(Search_Volume) as search_volume,
+            SUM(CASE
+                WHEN Channel_title IN ({ch_names_str}) THEN
+                    CASE Rank
+                        WHEN 1 THEN 50
+                        WHEN 2 THEN 25
+                        WHEN 3 THEN 15
+                        WHEN 4 THEN 5
+                        WHEN 5 THEN 5
+                        ELSE 0
+                    END
+                ELSE 0
+            END) as raw_score,
+            ARRAY_AGG(
+                CASE WHEN Channel_title IN ({ch_names_str}) THEN Rank END
+                IGNORE NULLS
+            ) as owned_positions
+        FROM ranked_data
+        GROUP BY Scrape_date
+    )
+    SELECT
+        Scrape_date as scrape_date,
+        LEAST(raw_score, 100) as domination_score,
+        owned_positions,
+        search_volume
+    FROM daily_scores
+    ORDER BY Scrape_date DESC
+    """
+
+    job_config = bq.QueryJobConfig(query_parameters=[
+        bq.ScalarQueryParameter("keyword", "STRING", keyword),
+        bq.ScalarQueryParameter("days", "INT64", days),
+    ])
+
+    try:
+        rows = client.query(query, job_config=job_config).result()
+        history = []
+        for row in rows:
+            history.append({
+                'scrape_date': str(row.scrape_date),
+                'snapshot_date': str(row.scrape_date),
+                'domination_score': row.domination_score,
+                'positions_owned': list(row.owned_positions) if row.owned_positions else [],
+                'search_volume': row.search_volume or 0,
+                'revenue': 0,
+            })
+        return history
+    except Exception as e:
+        print(f"[BQ] History query error: {e}")
+        return []
+
+
 def load_keyword_tracking():
     """Load the keyword tracking config (silos, groups, secondaries)."""
     try:
@@ -5054,6 +5479,9 @@ def get_tracking_keywords_flat():
     if not config:
         return []
 
+    # Fetch BQ revenue to override hardcoded JSON values
+    bq_revenue = fetch_current_month_revenue_from_bq()
+
     flat = []
     for silo in config.get('silos', []):
         silo_id = silo['id']
@@ -5061,7 +5489,7 @@ def get_tracking_keywords_flat():
             group_name = group['name']
             for kw_entry in group.get('keywords', []):
                 keyword = kw_entry['keyword']
-                revenue = kw_entry.get('revenue', 0)
+                revenue = bq_revenue.get(keyword.lower(), kw_entry.get('revenue', 0))
                 flat.append({
                     'keyword': keyword,
                     'silo': silo_id,
@@ -5078,6 +5506,487 @@ def get_tracking_keywords_flat():
                         'revenue': 0
                     })
     return flat
+
+
+def fetch_current_month_revenue_from_bq():
+    """Fetch current month revenue per keyword from BQ Metrics_by_Month table.
+
+    Revenue in BQ is per-video per-month, so we SUM across all videos/channels
+    for each keyword to get keyword-level revenue.
+
+    Returns dict: {keyword_lower: revenue_float}
+    Cached for 30 minutes.
+    """
+    global _bq_revenue_cache
+    now = datetime.now()
+    if _bq_revenue_cache['data'] is not None and _bq_revenue_cache['timestamp']:
+        age = (now - _bq_revenue_cache['timestamp']).total_seconds()
+        if age < BQ_REVENUE_CACHE_TTL:
+            return _bq_revenue_cache['data']
+
+    client = get_bq_client()
+    if not client:
+        print("[BQ] No BigQuery client available for revenue query")
+        return {}
+
+    try:
+        query = f"""
+        SELECT
+            LOWER(Video_main_keyword) as keyword,
+            SUM(revenue) as total_revenue
+        FROM {BQ_METRICS_TABLE}
+        WHERE Metrics_month_year = DATE_TRUNC(CURRENT_DATE(), MONTH)
+          AND Video_main_keyword IS NOT NULL
+          AND Video_main_keyword != ''
+        GROUP BY LOWER(Video_main_keyword)
+        HAVING SUM(revenue) > 0
+        """
+
+        results = {}
+        for row in client.query(query).result():
+            results[row.keyword] = round(row.total_revenue, 2)
+
+        _bq_revenue_cache['data'] = results
+        _bq_revenue_cache['timestamp'] = now
+        print(f"[BQ] Cached current month revenue for {len(results)} keywords")
+        return results
+    except Exception as e:
+        print(f"[BQ] Error fetching current month revenue: {e}")
+        return _bq_revenue_cache.get('data') or {}
+
+
+def fetch_daily_revenue_history_from_bq(keyword, days=90):
+    """Fetch daily revenue history for a specific keyword from BQ.
+
+    Joins Daily_Rev_Metrics_by_Video_ID with Digibot_General_info
+    to map video_id -> main_keyword, then SUMs daily revenue across all videos.
+
+    Returns dict: {date_str: revenue_float} for easy lookup by date.
+    """
+    from google.cloud import bigquery as bq
+
+    client = get_bq_client()
+    if not client:
+        return {}
+
+    try:
+        query = f"""
+        SELECT
+            rev.Metrics_date as rev_date,
+            SUM(rev.revenue) as daily_revenue
+        FROM {BQ_DAILY_REV_TABLE} rev
+        LEFT JOIN {BQ_GENERAL_INFO_TABLE} info
+          ON rev.video_id = info.video_id
+        WHERE LOWER(info.main_keyword) = LOWER(@keyword)
+          AND rev.Metrics_date >= DATE_SUB(CURRENT_DATE(), INTERVAL @days DAY)
+        GROUP BY rev.Metrics_date
+        ORDER BY rev.Metrics_date ASC
+        """
+
+        job_config = bq.QueryJobConfig(query_parameters=[
+            bq.ScalarQueryParameter("keyword", "STRING", keyword),
+            bq.ScalarQueryParameter("days", "INT64", days),
+        ])
+
+        results = {}
+        for row in client.query(query, job_config=job_config).result():
+            results[str(row.rev_date)] = round(row.daily_revenue, 2)
+        return results
+    except Exception as e:
+        print(f"[BQ] Error fetching daily revenue history for '{keyword}': {e}")
+        return {}
+
+
+# ============================================
+# PRIORITY KEYWORD MANAGEMENT ENDPOINTS
+# ============================================
+
+# In-memory cache for BQ available keywords (avoid repeated BQ queries)
+_bq_keywords_cache = {'data': None, 'timestamp': None}
+BQ_CACHE_TTL = 3600  # 1 hour
+
+# In-memory cache for BQ revenue data (current month)
+_bq_revenue_cache = {'data': None, 'timestamp': None}
+BQ_REVENUE_CACHE_TTL = 1800  # 30 min — revenue is monthly, safe to cache
+
+def _get_bq_available_keywords():
+    """Fetch distinct tracked keywords from BigQuery (cached 1 hour)."""
+    now = datetime.now()
+    if _bq_keywords_cache['data'] and _bq_keywords_cache['timestamp']:
+        age = (now - _bq_keywords_cache['timestamp']).total_seconds()
+        if age < BQ_CACHE_TTL:
+            return _bq_keywords_cache['data']
+
+    client = get_bq_client()
+    if not client:
+        return []
+
+    try:
+        q = f"""
+        SELECT
+            LOWER(Keyword) as keyword,
+            MAX(Search_Volume) as search_volume,
+            MAX(Silo) as silo,
+            MAX(CASE WHEN competitor_checker = 'Digidom' THEN 1 ELSE 0 END) as has_digidom
+        FROM {BQ_SERP_TABLE}
+        WHERE Scrape_date = BQ_asia_scrape_date
+          AND Scrape_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
+          AND competitor_checker IS NOT NULL
+        GROUP BY LOWER(Keyword)
+        ORDER BY keyword
+        """
+        results = []
+        for row in client.query(q).result():
+            results.append({
+                'keyword': row.keyword,
+                'search_volume': row.search_volume or 0,
+                'silo': row.silo or '',
+                'has_digidom': bool(row.has_digidom),
+            })
+        _bq_keywords_cache['data'] = results
+        _bq_keywords_cache['timestamp'] = now
+        print(f"[BQ] Cached {len(results)} available keywords from BigQuery")
+        return results
+    except Exception as e:
+        print(f"[BQ] Error fetching available keywords: {e}")
+        return _bq_keywords_cache.get('data') or []
+
+
+@app.route('/api/keywords/available', methods=['GET'])
+@login_required
+def get_available_keywords():
+    """Get all keywords from DB + any BQ keywords not yet in DB."""
+    try:
+        # Get all priority_keywords from DB
+        conn = get_db()
+        c = conn.cursor()
+        c.execute('SELECT keyword, tier, niche, priority_score, search_volume, source, is_active, added_by, is_primary, parent_keyword FROM priority_keywords ORDER BY priority_score DESC, keyword')
+        db_rows = c.fetchall()
+        conn.close()
+
+        db_keywords = {}
+        for row in db_rows:
+            db_keywords[row[0]] = {
+                'keyword': row[0],
+                'tier': row[1] or 'A',
+                'niche': row[2] or '',
+                'priority_score': row[3] or 0,
+                'search_volume': row[4] or 0,
+                'source': row[5] or 'csv',
+                'is_active': row[6],
+                'added_by': row[7] or 'system',
+                'in_bigquery': False,
+                'is_primary': row[8] if row[8] is not None else False,
+                'parent_keyword': row[9] or '',
+            }
+
+        # Get BQ keywords and merge
+        bq_keywords = _get_bq_available_keywords()
+        for bq in bq_keywords:
+            kw = bq['keyword']
+            if kw in db_keywords:
+                db_keywords[kw]['in_bigquery'] = True
+                if bq['search_volume'] > db_keywords[kw]['search_volume']:
+                    db_keywords[kw]['search_volume'] = bq['search_volume']
+            else:
+                db_keywords[kw] = {
+                    'keyword': kw,
+                    'tier': '',
+                    'niche': bq.get('silo', ''),
+                    'priority_score': 0,
+                    'search_volume': bq['search_volume'],
+                    'source': 'bigquery',
+                    'is_active': False,
+                    'added_by': '',
+                    'in_bigquery': True,
+                    'is_primary': False,
+                    'parent_keyword': '',
+                }
+
+        # Build primary/secondary mappings from keyword_tracking.json
+        sec_to_primary = {}
+        primary_to_sec = {}
+        primary_set = set()
+        try:
+            _tk_path = os.path.join(os.path.dirname(__file__), 'data', 'keyword_tracking.json')
+            if os.path.exists(_tk_path):
+                with open(_tk_path) as _f:
+                    _tk = json.load(_f)
+                for _silo in _tk.get('silos', []):
+                    for _grp in _silo.get('groups', []):
+                        for _ke in _grp.get('keywords', []):
+                            _pk = _ke['keyword'].lower().strip()
+                            primary_set.add(_pk)
+                            secs = []
+                            for _s in _ke.get('secondary', []):
+                                _sk = _s.lower().strip()
+                                secs.append(_sk)
+                                if _sk not in sec_to_primary:
+                                    sec_to_primary[_sk] = []
+                                sec_to_primary[_sk].append(_pk)
+                            primary_to_sec[_pk] = secs
+        except Exception:
+            pass
+
+        # Also build reverse map from DB-stored parent_keyword relationships
+        for kw_data in db_keywords.values():
+            pk = kw_data.get('parent_keyword', '')
+            if pk and pk in db_keywords:
+                if pk not in primary_to_sec:
+                    primary_to_sec[pk] = []
+                if kw_data['keyword'] not in primary_to_sec[pk]:
+                    primary_to_sec[pk].append(kw_data['keyword'])
+                if kw_data['keyword'] not in sec_to_primary:
+                    sec_to_primary[kw_data['keyword']] = []
+                if pk not in sec_to_primary[kw_data['keyword']]:
+                    sec_to_primary[kw_data['keyword']].append(pk)
+
+        for kw_data in db_keywords.values():
+            kw = kw_data['keyword']
+            kw_data['secondary_of'] = sec_to_primary.get(kw, [])
+            kw_data['secondaries'] = primary_to_sec.get(kw, [])
+            # Use DB is_primary if set, otherwise infer from tracking JSON
+            if not kw_data['is_primary']:
+                kw_data['is_primary'] = kw in primary_set
+
+        all_kw = sorted(db_keywords.values(), key=lambda x: (-x['is_active'], -x['priority_score'], x['keyword']))
+        active_count = sum(1 for k in all_kw if k['is_active'])
+
+        return jsonify({
+            'success': True,
+            'keywords': all_kw,
+            'total': len(all_kw),
+            'active_count': active_count,
+        })
+    except Exception as e:
+        print(f"[API] Error in get_available_keywords: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/keywords/priority', methods=['GET'])
+@login_required
+def get_priority_keywords():
+    """Get active priority keywords only."""
+    try:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute('SELECT keyword, tier, niche, priority_score, search_volume, source FROM priority_keywords WHERE is_active = TRUE ORDER BY priority_score DESC, keyword')
+        rows = c.fetchall()
+        conn.close()
+
+        keywords = [{
+            'keyword': r[0], 'tier': r[1], 'niche': r[2],
+            'priority_score': r[3], 'search_volume': r[4], 'source': r[5]
+        } for r in rows]
+
+        return jsonify({'success': True, 'keywords': keywords, 'count': len(keywords)})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/keywords/priority/toggle', methods=['PUT'])
+@login_required
+def toggle_priority_keywords():
+    """Toggle keywords active/inactive. For BQ keywords not in DB, inserts them."""
+    data = request.get_json()
+    keywords = data.get('keywords', [])
+    active = data.get('active', True)
+    user = get_current_user()
+    email = user.get('email', 'unknown') if user else 'unknown'
+
+    if not keywords:
+        return jsonify({'success': False, 'error': 'No keywords provided'}), 400
+
+    try:
+        conn = get_db()
+        c = conn.cursor()
+        updated = 0
+        inserted = 0
+        for kw in keywords:
+            kw_lower = kw.lower().strip()
+            if not kw_lower:
+                continue
+            # Try update first (block deactivating primary keywords that have secondaries)
+            if not active:
+                c.execute("""UPDATE priority_keywords SET is_active = %s WHERE keyword = %s
+                    AND NOT (is_primary = TRUE AND EXISTS (
+                        SELECT 1 FROM priority_keywords sk WHERE sk.parent_keyword = priority_keywords.keyword AND sk.parent_keyword != ''
+                    ))""", (active, kw_lower))
+            else:
+                c.execute('UPDATE priority_keywords SET is_active = %s WHERE keyword = %s', (active, kw_lower))
+            if c.rowcount > 0:
+                updated += 1
+            else:
+                # Not in DB yet (BQ keyword) — insert it
+                c.execute('''
+                    INSERT INTO priority_keywords (keyword, tier, source, is_active, added_by)
+                    VALUES (%s, '', 'bigquery', %s, %s)
+                    ON CONFLICT (keyword) DO UPDATE SET is_active = %s
+                ''', (kw_lower, active, email, active))
+                inserted += 1
+        conn.commit()
+        conn.close()
+        return jsonify({'success': True, 'updated': updated, 'inserted': inserted})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/keywords/priority/custom', methods=['POST'])
+@login_required
+def add_custom_keyword():
+    """Add a user-typed custom keyword with optional primary/secondary role."""
+    data = request.get_json()
+    keyword = (data.get('keyword', '') or '').lower().strip()
+    role = data.get('role', 'none')  # 'primary', 'secondary', or 'none'
+    parent_keyword = (data.get('parent_keyword', '') or '').lower().strip()
+    silo = (data.get('silo', '') or '').strip()
+    user = get_current_user()
+    email = user.get('email', 'unknown') if user else 'unknown'
+
+    if not keyword or len(keyword) < 2:
+        return jsonify({'success': False, 'error': 'Keyword too short'}), 400
+
+    # Map silo IDs to niche labels
+    silo_to_niche = {
+        'id_theft': 'ID Theft', 'dog': 'Dog',
+        'data_broker': 'Data Broker', 'parental_control': 'Parental Control',
+        'new': ''
+    }
+
+    is_primary = role == 'primary'
+    parent_kw = parent_keyword if role == 'secondary' else ''
+
+    try:
+        conn = get_db()
+        c = conn.cursor()
+
+        # If secondary, inherit tier/niche from parent
+        tier = 'custom'
+        niche = silo_to_niche.get(silo, silo) if silo else ''
+        priority_score = 0
+        if parent_kw:
+            c.execute('SELECT tier, niche, priority_score FROM priority_keywords WHERE keyword = %s', (parent_kw,))
+            parent_row = c.fetchone()
+            if parent_row:
+                tier = parent_row[0] or 'custom'
+                niche = parent_row[1] or ''
+                priority_score = (parent_row[2] or 0) * 0.9  # secondary gets 90% of parent score
+
+        c.execute('''
+            INSERT INTO priority_keywords (keyword, tier, niche, priority_score, source, is_active, added_by, is_primary, parent_keyword)
+            VALUES (%s, %s, %s, %s, 'custom', TRUE, %s, %s, %s)
+            ON CONFLICT (keyword) DO UPDATE SET is_active = TRUE, source = 'custom', added_by = %s, is_primary = %s, parent_keyword = %s
+        ''', (keyword, tier, niche, priority_score, email, is_primary, parent_kw, email, is_primary, parent_kw))
+        conn.commit()
+        conn.close()
+        return jsonify({
+            'success': True, 'keyword': keyword,
+            'tier': tier, 'niche': niche, 'priority_score': priority_score,
+            'is_primary': is_primary, 'parent_keyword': parent_kw
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/keywords/priority', methods=['DELETE'])
+@login_required
+def delete_priority_keywords():
+    """Hard-delete keywords from priority list."""
+    data = request.get_json()
+    keywords = data.get('keywords', [])
+
+    if not keywords:
+        return jsonify({'success': False, 'error': 'No keywords provided'}), 400
+
+    try:
+        conn = get_db()
+        c = conn.cursor()
+        kw_lower = [kw.lower().strip() for kw in keywords if kw.strip()]
+
+        # Check if any primary keywords have secondaries
+        c.execute("""
+            SELECT pk.keyword, COUNT(sk.keyword) as sec_count
+            FROM priority_keywords pk
+            LEFT JOIN priority_keywords sk ON sk.parent_keyword = pk.keyword AND sk.parent_keyword != ''
+            WHERE pk.keyword = ANY(%s) AND pk.is_primary = TRUE
+            GROUP BY pk.keyword
+            HAVING COUNT(sk.keyword) > 0
+        """, (kw_lower,))
+        blocked = c.fetchall()
+        if blocked:
+            blocked_list = [f"{row[0]} ({row[1]} secondaries)" for row in blocked]
+            conn.close()
+            return jsonify({'success': False, 'error': f"Cannot delete primary keywords with secondaries: {', '.join(blocked_list)}. Remove secondaries first."}), 400
+
+        c.execute('DELETE FROM priority_keywords WHERE keyword = ANY(%s)', (kw_lower,))
+        deleted = c.rowcount
+        conn.commit()
+        conn.close()
+        return jsonify({'success': True, 'deleted': deleted})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/keywords/priority/roles', methods=['PUT'])
+@login_required
+def update_keyword_roles():
+    """Update primary/secondary roles for keywords."""
+    data = request.get_json()
+    roles = data.get('roles', [])  # [{keyword, role, parent_keyword}, ...]
+
+    if not roles:
+        return jsonify({'success': True, 'updated': 0})
+
+    silo_to_niche = {
+        'id_theft': 'ID Theft', 'dog': 'Dog',
+        'data_broker': 'Data Broker', 'parental_control': 'Parental Control',
+        'new': ''
+    }
+
+    try:
+        conn = get_db()
+        c = conn.cursor()
+        updated = 0
+        for r in roles:
+            kw = (r.get('keyword', '') or '').lower().strip()
+            role = r.get('role', 'none')
+            parent = (r.get('parent_keyword', '') or '').lower().strip()
+            silo = r.get('silo', '')
+            niche = silo_to_niche.get(silo, silo) if silo else None
+            if not kw:
+                continue
+
+            is_primary = role == 'primary'
+            parent_kw = parent if role == 'secondary' else ''
+
+            # If secondary, inherit tier/niche from parent
+            if parent_kw:
+                c.execute('SELECT tier, niche, priority_score FROM priority_keywords WHERE keyword = %s', (parent_kw,))
+                prow = c.fetchone()
+                if prow:
+                    c.execute('UPDATE priority_keywords SET is_primary = %s, parent_keyword = %s, tier = %s, niche = %s, priority_score = %s WHERE keyword = %s',
+                              (is_primary, parent_kw, prow[0] or '', prow[1] or '', (prow[2] or 0) * 0.9, kw))
+                    updated += c.rowcount
+                    continue
+
+            # Update role and optionally niche/silo
+            if niche is not None:
+                c.execute('UPDATE priority_keywords SET is_primary = %s, parent_keyword = %s, niche = %s WHERE keyword = %s',
+                          (is_primary, parent_kw, niche, kw))
+            else:
+                c.execute('UPDATE priority_keywords SET is_primary = %s, parent_keyword = %s WHERE keyword = %s',
+                          (is_primary, parent_kw, kw))
+            # If set as primary, ensure it's active
+            if is_primary:
+                c.execute('UPDATE priority_keywords SET is_active = TRUE WHERE keyword = %s', (kw,))
+            updated += c.rowcount
+
+        conn.commit()
+        conn.close()
+        return jsonify({'success': True, 'updated': updated})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
 
 @app.route('/api/domination/data', methods=['GET'])
 @login_required
@@ -5120,8 +6029,86 @@ def get_domination_data():
                 audit_data = json.load(f)
             source = 'bundled'
 
-        # 2. Load tracking config (silos/groups/secondaries)
+        # 2. Load tracking config (silos/groups/secondaries) and merge with priority DB
         tracking = load_keyword_tracking()
+
+        # 2b. Merge active priority keywords from DB that aren't in tracking config
+        try:
+            conn2 = get_db()
+            c2 = conn2.cursor()
+            c2.execute("""
+                SELECT keyword, is_primary, parent_keyword, tier, niche, priority_score
+                FROM priority_keywords
+                WHERE is_active = TRUE
+            """)
+            db_keywords = c2.fetchall()
+            conn2.close()
+
+            # Build set of keywords already in tracking config
+            tracking_kws = set()
+            if tracking and tracking.get('silos'):
+                for silo in tracking['silos']:
+                    for group in silo.get('groups', []):
+                        for kw_entry in group.get('keywords', []):
+                            tracking_kws.add(kw_entry['keyword'])
+                            for sec in kw_entry.get('secondary', []):
+                                tracking_kws.add(sec)
+
+            # Find primary keywords not in tracking
+            new_primaries = []
+            new_secondaries = {}  # parent -> [secondary keywords]
+            for row in db_keywords:
+                kw, is_primary, parent_kw, tier, niche, score = row
+                if kw not in tracking_kws:
+                    if is_primary:
+                        new_primaries.append({
+                            'keyword': kw, 'tier': tier, 'niche': niche or '',
+                            'priority_score': score or 0, 'revenue': 0, 'secondary': []
+                        })
+                    elif parent_kw:
+                        new_secondaries.setdefault(parent_kw, []).append(kw)
+
+            # Attach secondaries to their new primaries
+            for p in new_primaries:
+                p['secondary'] = new_secondaries.get(p['keyword'], [])
+
+            # Also attach secondaries to existing tracking primaries
+            if tracking and tracking.get('silos'):
+                for silo in tracking['silos']:
+                    for group in silo.get('groups', []):
+                        for kw_entry in group.get('keywords', []):
+                            extra_secs = new_secondaries.get(kw_entry['keyword'], [])
+                            if extra_secs:
+                                existing = kw_entry.get('secondary', [])
+                                kw_entry['secondary'] = existing + [s for s in extra_secs if s not in existing]
+
+            # Add new primaries as a new silo if any exist
+            if new_primaries:
+                # Group by niche
+                niche_groups = {}
+                for p in new_primaries:
+                    niche = p.get('niche') or 'Unassigned'
+                    niche_groups.setdefault(niche, []).append(p)
+
+                new_silo = {
+                    'id': 'new_keywords',
+                    'label': 'New Keywords',
+                    'groups': []
+                }
+                for niche, kws in niche_groups.items():
+                    new_silo['groups'].append({
+                        'name': niche,
+                        'keywords': kws
+                    })
+
+                if not tracking:
+                    tracking = {'silos': []}
+                if not tracking.get('silos'):
+                    tracking['silos'] = []
+                tracking['silos'].append(new_silo)
+
+        except Exception as e:
+            print(f"[DOMINATION] Error merging priority keywords: {e}")
 
         # 3. Load target scores from DB
         targets = {}
@@ -5159,7 +6146,17 @@ def get_domination_data():
                     audit_results_by_kw[kw]['_is_ranking'] = False
                     audit_results_by_kw[kw]['_revenue'] = item.get('revenue', 0)
 
-        # 5. Return combined response
+        # 5. Fetch current month revenue from BigQuery (replaces hardcoded JSON values)
+        bq_revenue = fetch_current_month_revenue_from_bq()
+        if bq_revenue and tracking and tracking.get('silos'):
+            for silo in tracking['silos']:
+                for group in silo.get('groups', []):
+                    for kw_entry in group.get('keywords', []):
+                        kw_lower = kw_entry['keyword'].lower()
+                        if kw_lower in bq_revenue:
+                            kw_entry['revenue'] = bq_revenue[kw_lower]
+
+        # 6. Return combined response
         return jsonify({
             'success': True,
             'source': source,
@@ -5167,7 +6164,8 @@ def get_domination_data():
             'targets': targets,
             'audit_data': audit_data,
             'audit_results_by_keyword': audit_results_by_kw,
-            'timestamp': audit_data.get('timestamp') if audit_data else None
+            'timestamp': audit_data.get('timestamp') if audit_data else None,
+            'revenue_source': 'bigquery' if bq_revenue else 'config'
         })
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -5356,16 +6354,6 @@ def store_ranking_snapshot(data):
 
 def calculate_domination_from_result(result):
     """Calculate domination score from a keyword result"""
-    YOUR_CHANNELS = [
-        'security hero', 'securityhero',
-        'cybersleuth', 'cyber sleuth', 'cyber_sleuth',
-        'techroost', 'tech roost',
-        'the opt out project', 'opt out project', 'optoutproject',
-        'the pampered pup', 'pampered pup', 'pamperedpup',
-        'the sniff test', 'sniff test', 'snifftest',
-        'cozy crates', 'cozycrates',
-    ]
-
     WEIGHTS = {1: 50, 2: 25, 3: 15, 4: 5, 5: 5}
 
     score = 0
@@ -5376,23 +6364,19 @@ def calculate_domination_from_result(result):
         video = top_10[i]
         channel = video.get('channel', '').lower()
 
-        for your_ch in YOUR_CHANNELS:
-            if your_ch in channel:
+        for pattern in ALL_MATCH_PATTERNS:
+            if pattern in channel:
                 pos = i + 1
                 score += WEIGHTS[pos]
                 positions_owned.append(pos)
                 break
 
-    return score, positions_owned
+    return min(score, 100), positions_owned
 
 @app.route('/api/domination/audit', methods=['POST'])
 def run_domination_audit():
-    """
-    Run a domination score audit for all tracked keywords.
-    Accepts logged-in users (session) or CRON_SECRET for scheduled jobs.
-    """
-    import threading
-
+    """Run a domination score audit using BigQuery data.
+    Accepts logged-in users (session) or CRON_SECRET for scheduled jobs."""
     # Allow access if logged in OR if valid cron secret provided
     cron_secret = os.environ.get('CRON_SECRET', '')
     provided_secret = request.headers.get('X-Cron-Secret', '') or request.args.get('secret', '')
@@ -5405,112 +6389,22 @@ def run_domination_audit():
     if not is_logged_in and not has_valid_secret:
         return jsonify({'success': False, 'error': 'Unauthorized'}), 401
 
-    # Run audit in background thread to avoid timeout
-    def run_audit_background():
-        try:
-            # Load current keywords from bundled file
-            if not os.path.exists(BUNDLED_RANKING_PATH):
-                print("Audit failed: No ranking data to audit")
-                return
+    # Run the BigQuery-based audit in background
+    run_domination_audit_job()
 
-            with open(BUNDLED_RANKING_PATH, 'r') as f:
-                current_data = json.load(f)
-
-            # Get keywords to check
-            keywords_to_check = []
-            keyword_revenues = {}
-
-            for item in current_data.get('ranking', []):
-                keywords_to_check.append(item['keyword'])
-                keyword_revenues[item['keyword']] = item.get('revenue', 0)
-
-            for item in current_data.get('not_ranking', []):
-                keywords_to_check.append(item['keyword'])
-                keyword_revenues[item['keyword']] = item.get('revenue', 0)
-
-            if not keywords_to_check:
-                print("Audit failed: No keywords to audit")
-                return
-
-            # Run audit for each keyword
-            all_results = []
-            ranking = []
-            not_ranking = []
-
-            for keyword in keywords_to_check:
-                result = check_youtube_ranking(keyword)
-                result['keyword'] = keyword
-
-                all_results.append(result)
-
-                # Determine if ranking
-                is_ranking = False
-                if result.get('top_10'):
-                    for video in result['top_10'][:5]:
-                        channel = video.get('channel', '').lower()
-                        for your_ch in YOUR_CHANNELS_LIST:
-                            if your_ch in channel:
-                                is_ranking = True
-                                break
-                        if is_ranking:
-                            break
-
-                kw_data = {
-                    'keyword': keyword,
-                    'revenue': keyword_revenues.get(keyword, 0)
-                }
-
-                if is_ranking:
-                    ranking.append(kw_data)
-                else:
-                    not_ranking.append(kw_data)
-
-            # Build new audit data
-            audit_data = {
-                'timestamp': datetime.now().isoformat(),
-                'revenue_period': current_data.get('revenue_period', 'December 2025'),
-                'ranking': ranking,
-                'not_ranking': not_ranking,
-                'all_results': all_results
-            }
-
-            # Save to domination data path
-            os.makedirs(os.path.dirname(DOMINATION_DATA_PATH), exist_ok=True)
-            with open(DOMINATION_DATA_PATH, 'w') as f:
-                json.dump(audit_data, f, indent=2)
-
-            # Store snapshot in history
-            store_ranking_snapshot(audit_data)
-
-            print(f"Audit completed: {len(ranking)} ranking, {len(not_ranking)} not ranking")
-
-        except Exception as e:
-            print(f"Audit error: {str(e)}")
-
-    # Start background thread
-    thread = threading.Thread(target=run_audit_background)
-    thread.start()
-
-    # Return immediately
     return jsonify({
         'success': True,
-        'message': 'Audit started in background',
+        'message': 'BigQuery audit started in background',
         'status': 'processing'
     })
 
-# Your channel names for audit matching
-YOUR_CHANNELS_LIST = [
-    'security hero', 'securityhero',
-    'cybersleuth', 'cyber sleuth', 'cyber_sleuth',
-    'techroost', 'tech roost',
-    'the opt out project', 'opt out project', 'optoutproject',
-    'the pampered pup', 'pampered pup', 'pamperedpup',
-    'the sniff test', 'sniff test', 'snifftest',
-    'cozy crates', 'cozycrates',
-]
+# Your channel names for audit matching (uses central registry)
+YOUR_CHANNELS_LIST = ALL_MATCH_PATTERNS
 
 def check_youtube_ranking(keyword):
-    """Check YouTube ranking for a single keyword"""
+    """DEPRECATED for domination scoring (now uses BigQuery).
+    Still used by YouTube research features.
+    Check YouTube ranking for a single keyword via SerpAPI."""
     try:
         if not SERPAPI_API_KEY:
             return {'error': 'SerpAPI key not configured'}
@@ -5547,10 +6441,31 @@ def check_youtube_ranking(keyword):
 @app.route('/api/domination/history')
 @login_required
 def get_domination_history():
-    """Get historical domination data for trend analysis"""
+    """Get historical domination data. Primary: BigQuery (~2yr daily). Fallback: Supabase."""
     try:
         keyword = request.args.get('keyword', '')
+        days = int(request.args.get('days', 90))
 
+        if keyword:
+            # Try BigQuery first (much richer history)
+            history = fetch_domination_history_from_bigquery(keyword, days=days)
+
+            if history:
+                # Fetch daily revenue from BQ (Daily_Rev joined with General_info)
+                daily_rev = fetch_daily_revenue_history_from_bq(keyword, days=days)
+
+                # Assign each daily domination entry its matching daily revenue
+                for entry in history:
+                    entry['revenue'] = daily_rev.get(entry['scrape_date'], 0)
+
+                return jsonify({
+                    'success': True,
+                    'source': 'bigquery',
+                    'history': history,
+                    'total_days': len(history),
+                })
+
+        # Fallback: Supabase ranking_history
         conn = get_db()
         c = conn.cursor()
 
@@ -5560,8 +6475,8 @@ def get_domination_history():
                 FROM ranking_history
                 WHERE keyword = %s
                 ORDER BY snapshot_date DESC
-                LIMIT 30
-            ''', (keyword,))
+                LIMIT %s
+            ''', (keyword, days))
         else:
             c.execute('''
                 SELECT keyword, revenue, domination_score, positions_owned, snapshot_date
@@ -5581,7 +6496,7 @@ def get_domination_history():
             'snapshot_date': row[4]
         } for row in rows]
 
-        return jsonify({'success': True, 'history': history})
+        return jsonify({'success': True, 'source': 'supabase', 'history': history})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
@@ -5980,26 +6895,64 @@ def cron_trends_status():
 # DOMINATION AUDIT JOB
 # ============================================
 def run_domination_audit_job():
-    """Background job to run domination score audit.
-    Primary source: keyword_tracking.json (silos/groups/secondaries).
-    Fallback: previous audit data from DB, then bundled file, then keywords_master."""
+    """Background job to run domination score audit using BigQuery data.
+    Primary keyword source: priority_keywords table (active keywords).
+    Fallback: keyword_tracking.json, then previous audit data, then keywords_master."""
     import threading
 
     def _audit():
         try:
             keywords_to_check = []
             keyword_meta = {}  # keyword -> {silo, group, is_secondary, revenue}
+            keyword_source = 'unknown'
 
-            # Source 1 (preferred): keyword_tracking.json
-            tracking_keywords = get_tracking_keywords_flat()
-            if tracking_keywords:
-                for entry in tracking_keywords:
-                    kw = entry['keyword']
-                    keywords_to_check.append(kw)
-                    keyword_meta[kw] = entry
-                print(f"[AUDIT] Loaded {len(keywords_to_check)} keywords from keyword_tracking.json")
-            else:
-                # Source 2: Previous audit data (DB or local file)
+            # Source 1 (preferred): priority_keywords table
+            try:
+                conn = get_db()
+                c = conn.cursor()
+                c.execute('SELECT keyword, niche, priority_score, search_volume FROM priority_keywords WHERE is_active = TRUE ORDER BY priority_score DESC')
+                priority_rows = c.fetchall()
+                conn.close()
+
+                if priority_rows:
+                    # Also load revenue from keyword_tracking.json for enrichment
+                    tracking_flat = get_tracking_keywords_flat()
+                    tracking_revenue = {e['keyword'].lower(): e.get('revenue', 0) for e in tracking_flat}
+                    tracking_meta = {e['keyword'].lower(): e for e in tracking_flat}
+
+                    for row in priority_rows:
+                        kw = row[0]
+                        kw_lower = kw.lower()
+                        keywords_to_check.append(kw)
+                        # Merge: use tracking meta if available, else build from DB
+                        if kw_lower in tracking_meta:
+                            keyword_meta[kw] = tracking_meta[kw_lower]
+                        else:
+                            keyword_meta[kw] = {
+                                'keyword': kw,
+                                'silo': row[1] or '',
+                                'group': '',
+                                'is_secondary': False,
+                                'revenue': tracking_revenue.get(kw_lower, 0),
+                            }
+                    keyword_source = 'priority_keywords'
+                    print(f"[AUDIT-BQ] Loaded {len(keywords_to_check)} keywords from priority_keywords table")
+            except Exception as e:
+                print(f"[AUDIT-BQ] Could not read priority_keywords: {e}")
+
+            # Source 2 (fallback): keyword_tracking.json
+            if not keywords_to_check:
+                tracking_keywords = get_tracking_keywords_flat()
+                if tracking_keywords:
+                    for entry in tracking_keywords:
+                        kw = entry['keyword']
+                        keywords_to_check.append(kw)
+                        keyword_meta[kw] = entry
+                    keyword_source = 'keyword_tracking'
+                    print(f"[AUDIT-BQ] Loaded {len(keywords_to_check)} keywords from keyword_tracking.json")
+
+            # Source 3 (fallback): Previous audit data
+            if not keywords_to_check:
                 current_data = None
                 data_path = DOMINATION_DATA_PATH if os.path.exists(DOMINATION_DATA_PATH) else BUNDLED_RANKING_PATH
 
@@ -6028,8 +6981,9 @@ def run_domination_audit_job():
                         kw = item['keyword']
                         keywords_to_check.append(kw)
                         keyword_meta[kw] = {'revenue': item.get('revenue', 0), 'is_secondary': False}
+                    keyword_source = 'previous_audit'
 
-                # Source 3: keywords_master fallback
+                # Source 4: keywords_master fallback
                 if not keywords_to_check:
                     try:
                         conn = get_db()
@@ -6044,62 +6998,85 @@ def run_domination_audit_job():
                             keywords_to_check.append(row[0])
                             keyword_meta[row[0]] = {'revenue': row[1] or 0, 'is_secondary': False}
                         conn.close()
+                        keyword_source = 'keywords_master'
                     except Exception:
                         pass
 
             if not keywords_to_check:
-                print("[AUDIT] Skipped: No keywords to audit from any source")
+                print("[AUDIT-BQ] Skipped: No keywords to audit from any source")
                 return
 
-            print(f"[AUDIT] Starting audit for {len(keywords_to_check)} keywords...")
-            import time as _time
+            print(f"[AUDIT-BQ] Starting BigQuery audit for {len(keywords_to_check)} keywords...")
+
+            # Single batch query to BigQuery (replaces N individual SerpAPI calls)
+            bq_results = fetch_domination_from_bigquery(keywords_to_check)
+
+            if not bq_results:
+                print("[AUDIT-BQ] WARNING: No results from BigQuery")
+                return
+
             all_results = []
             ranking = []
             not_ranking = []
+            scrape_date = None
 
-            for i, keyword in enumerate(keywords_to_check):
-                result = check_youtube_ranking(keyword)
-                result['keyword'] = keyword
+            for keyword in keywords_to_check:
                 meta = keyword_meta.get(keyword, {})
-                result['silo'] = meta.get('silo', '')
-                result['group'] = meta.get('group', '')
-                result['is_secondary'] = meta.get('is_secondary', False)
-                all_results.append(result)
+                bq_data = bq_results.get(keyword.lower())
 
-                is_ranking = False
-                if result.get('top_10'):
-                    for video in result['top_10'][:5]:
-                        channel = video.get('channel', '').lower()
-                        for your_ch in YOUR_CHANNELS_LIST:
-                            if your_ch in channel:
-                                is_ranking = True
-                                break
-                        if is_ranking:
-                            break
+                if bq_data:
+                    if not scrape_date:
+                        scrape_date = bq_data.get('scrape_date')
 
-                kw_data = {
-                    'keyword': keyword,
-                    'revenue': meta.get('revenue', 0),
-                    'silo': meta.get('silo', ''),
-                    'group': meta.get('group', ''),
-                    'is_secondary': meta.get('is_secondary', False)
-                }
+                    result = {
+                        'keyword': keyword,
+                        'top_10': bq_data['top_10'],
+                        'silo': meta.get('silo', ''),
+                        'group': meta.get('group', ''),
+                        'is_secondary': meta.get('is_secondary', False),
+                        'search_volume': bq_data.get('search_volume', 0),
+                    }
+                    all_results.append(result)
 
-                if is_ranking:
-                    ranking.append(kw_data)
+                    is_ranking = bq_data['domination_score'] > 0
+                    kw_data = {
+                        'keyword': keyword,
+                        'revenue': meta.get('revenue', 0),
+                        'silo': meta.get('silo', ''),
+                        'group': meta.get('group', ''),
+                        'is_secondary': meta.get('is_secondary', False),
+                    }
+                    if is_ranking:
+                        ranking.append(kw_data)
+                    else:
+                        not_ranking.append(kw_data)
                 else:
-                    not_ranking.append(kw_data)
-
-                if (i + 1) % 10 == 0:
-                    print(f"[AUDIT] Progress: {i + 1}/{len(keywords_to_check)}")
-                _time.sleep(1)  # Rate limit
+                    # Keyword not found in BigQuery SERP data
+                    result = {
+                        'keyword': keyword,
+                        'top_10': [],
+                        'silo': meta.get('silo', ''),
+                        'group': meta.get('group', ''),
+                        'is_secondary': meta.get('is_secondary', False),
+                    }
+                    all_results.append(result)
+                    not_ranking.append({
+                        'keyword': keyword,
+                        'revenue': meta.get('revenue', 0),
+                        'silo': meta.get('silo', ''),
+                        'group': meta.get('group', ''),
+                        'is_secondary': meta.get('is_secondary', False),
+                    })
 
             audit_data = {
                 'timestamp': datetime.now().isoformat(),
+                'source': 'bigquery',
+                'keyword_source': keyword_source,
+                'scrape_date': scrape_date,
                 'revenue_period': 'Current',
                 'ranking': ranking,
                 'not_ranking': not_ranking,
-                'all_results': all_results
+                'all_results': all_results,
             }
 
             os.makedirs(os.path.dirname(DOMINATION_DATA_PATH), exist_ok=True)
@@ -6107,10 +7084,13 @@ def run_domination_audit_job():
                 json.dump(audit_data, f, indent=2)
 
             store_ranking_snapshot(audit_data)
-            print(f"[AUDIT] Completed: {len(ranking)} ranking, {len(not_ranking)} not ranking (total: {len(all_results)})")
+            print(f"[AUDIT-BQ] Completed: {len(ranking)} ranking, {len(not_ranking)} not ranking "
+                  f"(total: {len(all_results)}, scrape_date: {scrape_date})")
 
         except Exception as e:
-            print(f"[AUDIT] Error: {str(e)}")
+            print(f"[AUDIT-BQ] Error: {str(e)}")
+            import traceback
+            traceback.print_exc()
 
     thread = threading.Thread(target=_audit, daemon=True)
     thread.start()
@@ -6129,60 +7109,72 @@ def _make_naive(dt):
 
 def check_data_staleness():
     """Check if domination and trends data is stale and needs refreshing."""
-    staleness = {'domination_stale': True, 'trends_stale': True, 'domination_last': None, 'trends_last': None}
+    staleness = {'domination_stale': True, 'trends_stale': True, 'domination_last': None, 'trends_last': None, 'bq_last_scrape': None}
 
+    # Check BigQuery freshness first (primary source)
     try:
-        conn = get_db()
-        c = conn.cursor()
+        client = get_bq_client()
+        if client:
+            bq_query = f"""
+            SELECT MAX(Scrape_date) as latest
+            FROM {BQ_SERP_TABLE}
+            WHERE Scrape_date = BQ_asia_scrape_date
+            """
+            bq_result = list(client.query(bq_query).result())
+            if bq_result and bq_result[0].latest:
+                from datetime import date
+                latest_date = bq_result[0].latest
+                staleness['bq_last_scrape'] = str(latest_date)
+                staleness['domination_last'] = str(latest_date)
+                days_old = (date.today() - latest_date).days
+                staleness['domination_stale'] = days_old > 2  # BQ scraper runs daily, allow 2-day buffer
+    except Exception as bq_err:
+        print(f"[STALENESS] BigQuery check error: {bq_err}")
 
-        # Check last domination snapshot from ranking_history
-        last_dom_dt = None
-        c.execute('SELECT MAX(snapshot_date) FROM ranking_history')
-        row = c.fetchone()
-        if row and row[0]:
-            staleness['domination_last'] = str(row[0])
-            try:
-                val = row[0]
-                if isinstance(val, datetime):
-                    last_dom_dt = _make_naive(val)
-                elif isinstance(val, str):
-                    last_dom_dt = datetime.fromisoformat(val.replace('Z', '+00:00')).replace(tzinfo=None) if 'T' in val else datetime.strptime(val, '%Y-%m-%d %H:%M:%S')
-                else:
-                    last_dom_dt = datetime.strptime(str(val), '%Y-%m-%d %H:%M:%S')
-            except Exception as parse_err:
-                print(f"[STALENESS] Date parse error (ranking_history): {parse_err}")
+    # Fallback: Supabase ranking_history
+    if staleness['domination_last'] is None:
+        try:
+            conn = get_db()
+            c = conn.cursor()
 
-        # Also check domination_audits as fallback freshness source
-        if not last_dom_dt:
-            try:
-                c.execute('SELECT MAX(created_at) FROM domination_audits')
-                row2 = c.fetchone()
-                if row2 and row2[0]:
-                    val2 = row2[0]
-                    if isinstance(val2, datetime):
-                        last_dom_dt = _make_naive(val2)
-                    elif isinstance(val2, str):
-                        last_dom_dt = datetime.fromisoformat(val2.replace('Z', '+00:00')).replace(tzinfo=None) if 'T' in val2 else datetime.strptime(val2, '%Y-%m-%d %H:%M:%S')
-                    staleness['domination_last'] = str(val2)
-            except Exception:
-                pass
+            last_dom_dt = None
+            c.execute('SELECT MAX(snapshot_date) FROM ranking_history')
+            row = c.fetchone()
+            if row and row[0]:
+                staleness['domination_last'] = str(row[0])
+                try:
+                    val = row[0]
+                    if isinstance(val, datetime):
+                        last_dom_dt = _make_naive(val)
+                    elif isinstance(val, str):
+                        last_dom_dt = datetime.fromisoformat(val.replace('Z', '+00:00')).replace(tzinfo=None) if 'T' in val else datetime.strptime(val, '%Y-%m-%d %H:%M:%S')
+                    else:
+                        last_dom_dt = datetime.strptime(str(val), '%Y-%m-%d %H:%M:%S')
+                except Exception as parse_err:
+                    print(f"[STALENESS] Date parse error (ranking_history): {parse_err}")
 
-        if last_dom_dt:
-            staleness['domination_stale'] = (datetime.now() - last_dom_dt).total_seconds() > 86400  # >24h
-        else:
-            staleness['domination_stale'] = True
+            if not last_dom_dt:
+                try:
+                    c.execute('SELECT MAX(created_at) FROM domination_audits')
+                    row2 = c.fetchone()
+                    if row2 and row2[0]:
+                        val2 = row2[0]
+                        if isinstance(val2, datetime):
+                            last_dom_dt = _make_naive(val2)
+                        elif isinstance(val2, str):
+                            last_dom_dt = datetime.fromisoformat(val2.replace('Z', '+00:00')).replace(tzinfo=None) if 'T' in val2 else datetime.strptime(val2, '%Y-%m-%d %H:%M:%S')
+                        staleness['domination_last'] = str(val2)
+                except Exception:
+                    pass
 
-        # Check last trends collection
-        c.execute("SELECT COUNT(*) FROM keyword_trends WHERE updated_at > NOW() - INTERVAL '7 days'")
-        fresh_trends = c.fetchone()[0]
-        staleness['trends_fresh'] = fresh_trends
-        staleness['trends_stale'] = fresh_trends < len(KEYWORDS) * 0.1  # <10% coverage = stale
+            if last_dom_dt:
+                staleness['domination_stale'] = (datetime.now() - last_dom_dt).total_seconds() > 86400
 
-        conn.close()
-    except Exception as e:
-        print(f"[STALENESS] Error checking staleness: {e}")
+            conn.close()
+        except Exception as e:
+            print(f"[STALENESS] Supabase staleness check error: {e}")
 
-    # Fallback: check local domination_data.json file timestamp
+    # Fallback: check local domination_data.json
     if staleness['domination_last'] is None and os.path.exists(DOMINATION_DATA_PATH):
         try:
             with open(DOMINATION_DATA_PATH, 'r') as f:
@@ -6194,6 +7186,18 @@ def check_data_staleness():
                 staleness['domination_stale'] = (datetime.now() - local_dt).total_seconds() > 86400
         except Exception as file_err:
             print(f"[STALENESS] Error reading local domination file: {file_err}")
+
+    # Check trends staleness (unchanged)
+    try:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM keyword_trends WHERE updated_at > NOW() - INTERVAL '7 days'")
+        fresh_trends = c.fetchone()[0]
+        staleness['trends_fresh'] = fresh_trends
+        staleness['trends_stale'] = fresh_trends < len(KEYWORDS) * 0.1
+        conn.close()
+    except Exception as e:
+        print(f"[STALENESS] Trends staleness check error: {e}")
 
     return staleness
 
@@ -7367,5 +8371,5 @@ def smart_picks():
 
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
+    port = int(os.environ.get('PORT', 5001))
     app.run(host='0.0.0.0', port=port, debug=False)

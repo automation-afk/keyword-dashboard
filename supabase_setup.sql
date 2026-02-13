@@ -159,6 +159,21 @@ CREATE TABLE IF NOT EXISTS keywords_master (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS priority_keywords (
+    id SERIAL PRIMARY KEY,
+    keyword TEXT UNIQUE NOT NULL,
+    tier TEXT DEFAULT 'A',
+    niche TEXT DEFAULT '',
+    priority_score REAL DEFAULT 0,
+    search_volume INTEGER DEFAULT 0,
+    source TEXT DEFAULT 'tracking',
+    is_active BOOLEAN DEFAULT TRUE,
+    added_by TEXT DEFAULT 'system',
+    is_primary BOOLEAN DEFAULT FALSE,
+    parent_keyword TEXT DEFAULT '',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
 -- Disable RLS so the app can read/write without policies
 ALTER TABLE keyword_labels ENABLE ROW LEVEL SECURITY;
 ALTER TABLE keywords_master ENABLE ROW LEVEL SECURITY;
@@ -170,6 +185,7 @@ ALTER TABLE keyword_yt_data ENABLE ROW LEVEL SECURITY;
 ALTER TABLE ranking_history ENABLE ROW LEVEL SECURITY;
 ALTER TABLE researched_keywords ENABLE ROW LEVEL SECURITY;
 ALTER TABLE revenue_data ENABLE ROW LEVEL SECURITY;
+ALTER TABLE priority_keywords ENABLE ROW LEVEL SECURITY;
 
 -- Create policies to allow all operations (the app handles auth via Flask sessions)
 DO $$
@@ -179,7 +195,7 @@ BEGIN
     FOR t IN SELECT unnest(ARRAY[
         'keyword_labels', 'keywords_master', 'keyword_votes', 'keyword_comments',
         'keyword_additions', 'keyword_trends', 'keyword_yt_data', 'ranking_history',
-        'researched_keywords', 'revenue_data'
+        'researched_keywords', 'revenue_data', 'priority_keywords'
     ]) LOOP
         EXECUTE format('DROP POLICY IF EXISTS "allow_all" ON %I', t);
         EXECUTE format('CREATE POLICY "allow_all" ON %I FOR ALL USING (true) WITH CHECK (true)', t);
