@@ -111,6 +111,10 @@ def login():
     else:
         redirect_uri = url_for('auth_callback', _external=True)
 
+    print(f"[AUTH] APP_URL={app_url}")
+    print(f"[AUTH] redirect_uri={redirect_uri}")
+    print(f"[AUTH] request.url={request.url}")
+    print(f"[AUTH] request.host={request.host}")
     return google.authorize_redirect(redirect_uri)
 
 @app.route('/auth/callback')
