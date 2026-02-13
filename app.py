@@ -25,10 +25,13 @@ app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 # ============================================
 # SESSION & SECURITY CONFIG
 # ============================================
-app.secret_key = os.environ.get('FLASK_SECRET_KEY', os.urandom(24).hex())
+_secret = os.environ.get('FLASK_SECRET_KEY', 'wU8LYRC3xWgwRe3xBnmrg8z5kP2mQ7v')
+print(f"[CONFIG] Secret key loaded: {_secret[:6]}... (len={len(_secret)})")
+app.secret_key = _secret
 app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
-app.config['SESSION_COOKIE_SECURE'] = not os.environ.get('FLASK_DEBUG')
+app.config['SESSION_COOKIE_SECURE'] = False
 app.config['SESSION_COOKIE_HTTPONLY'] = True
+app.config['PREFERRED_URL_SCHEME'] = 'https'
 
 # ============================================
 # GOOGLE OAUTH CONFIG
