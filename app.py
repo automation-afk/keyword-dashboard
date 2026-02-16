@@ -7350,6 +7350,21 @@ def get_data_staleness():
 # $3K OPPORTUNITY FINDER
 # ============================================
 
+def _parse_competition(val):
+    """Convert competition value to float 0-1. Handles numeric, string ('Low','Medium','High'), or empty."""
+    if not val:
+        return 0
+    if isinstance(val, (int, float)):
+        return float(val)
+    val_str = str(val).strip().lower()
+    mapping = {'low': 0.15, 'medium': 0.5, 'high': 0.85}
+    if val_str in mapping:
+        return mapping[val_str]
+    try:
+        return float(val_str)
+    except (ValueError, TypeError):
+        return 0
+
 @app.route('/api/opportunity-finder')
 @login_required
 def opportunity_finder():
@@ -7362,34 +7377,43 @@ def opportunity_finder():
     user = get_current_user()
     user_email = user.get('email', 'anonymous') if user else 'anonymous'
 
-    conn = get_db()
-    c = conn.cursor()
-
-    # Get labels (with attribution)
-    c.execute('SELECT keyword, label, is_favorite, notes, label_updated_by, favorite_updated_by, notes_updated_by FROM keyword_labels')
     labels = {}
-    for row in c.fetchall():
-        labels[row[0]] = {
-            'label': row[1], 'favorite': bool(row[2]), 'notes': row[3],
-            'labelBy': row[4] or '', 'favoriteBy': row[5] or '', 'notesBy': row[6] or ''
-        }
+    yt_db = {}
+    trends = {}
+    votes = {}
 
-    # Get YT data
-    c.execute('SELECT keyword, yt_avg_views, yt_view_pattern FROM keyword_yt_data')
-    yt_db = {row[0].lower(): {'avg_views': row[1], 'view_pattern': row[2]} for row in c.fetchall()}
+    try:
+        conn = get_db()
+        c = conn.cursor()
 
-    # Get trends
-    c.execute('SELECT keyword, trend, trend_change_pct, current_interest FROM keyword_trends')
-    trends = {row[0].lower(): {'trend': row[1], 'change': row[2], 'interest': row[3]} for row in c.fetchall()}
+        # Get labels (with attribution)
+        c.execute('SELECT keyword, label, is_favorite, notes, label_updated_by, favorite_updated_by, notes_updated_by FROM keyword_labels')
+        for row in c.fetchall():
+            labels[row[0]] = {
+                'label': row[1], 'favorite': bool(row[2]), 'notes': row[3],
+                'labelBy': row[4] or '', 'favoriteBy': row[5] or '', 'notesBy': row[6] or ''
+            }
 
-    # Get vote scores
-    c.execute('''
-        SELECT keyword,
-               COALESCE(SUM(CASE WHEN vote = 1 THEN 1 ELSE 0 END), 0) -
-               COALESCE(SUM(CASE WHEN vote = -1 THEN 1 ELSE 0 END), 0) as score
-        FROM keyword_votes GROUP BY keyword
-    ''')
-    votes = {row[0]: row[1] for row in c.fetchall()}
+        # Get YT data
+        c.execute('SELECT keyword, yt_avg_views, yt_view_pattern FROM keyword_yt_data')
+        yt_db = {row[0].lower(): {'avg_views': row[1], 'view_pattern': row[2]} for row in c.fetchall()}
+
+        # Get trends
+        c.execute('SELECT keyword, trend, trend_change_pct, current_interest FROM keyword_trends')
+        trends = {row[0].lower(): {'trend': row[1], 'change': row[2], 'interest': row[3]} for row in c.fetchall()}
+
+        # Get vote scores
+        c.execute('''
+            SELECT keyword,
+                   COALESCE(SUM(CASE WHEN vote = 1 THEN 1 ELSE 0 END), 0) -
+                   COALESCE(SUM(CASE WHEN vote = -1 THEN 1 ELSE 0 END), 0) as score
+            FROM keyword_votes GROUP BY keyword
+        ''')
+        votes = {row[0]: row[1] for row in c.fetchall()}
+
+        conn.close()
+    except Exception as e:
+        print(f"[OPPORTUNITY] DB unavailable, using in-memory data only: {e}")
 
     # Get domination data if available
     domination = {}
@@ -7414,8 +7438,6 @@ def opportunity_finder():
                 }
     except Exception as e:
         print(f"[OPPORTUNITY] Error loading domination data: {e}")
-
-    conn.close()
 
     opportunities = []
     for k in KEYWORDS:
@@ -7594,7 +7616,8 @@ def opportunity_finder():
             'favorite': label_data.get('favorite', False),
             'tier': k.get('tier', 'D - Nurture'),
             'levers': levers,
-            'nicheMult': niche_mult
+            'nicheMult': niche_mult,
+            'competition': _parse_competition(k.get('competition', 0))
         })
 
     # Sort by feasibility desc
@@ -8219,31 +8242,39 @@ def smart_picks():
     user = get_current_user()
     user_email = user.get('email', 'anonymous') if user else 'anonymous'
 
-    conn = get_db()
-    c = conn.cursor()
+    labels = {}
+    yt_db = {}
+    trends = {}
+    votes = {}
 
-    # Get labels
-    c.execute('SELECT keyword, label, is_favorite FROM keyword_labels')
-    labels = {row[0]: {'label': row[1], 'favorite': bool(row[2])} for row in c.fetchall()}
+    try:
+        conn = get_db()
+        c = conn.cursor()
 
-    # Get YT data
-    c.execute('SELECT keyword, yt_avg_views, yt_view_pattern FROM keyword_yt_data')
-    yt_db = {row[0].lower(): {'avg_views': row[1], 'view_pattern': row[2]} for row in c.fetchall()}
+        # Get labels
+        c.execute('SELECT keyword, label, is_favorite FROM keyword_labels')
+        labels = {row[0]: {'label': row[1], 'favorite': bool(row[2])} for row in c.fetchall()}
 
-    # Get trends
-    c.execute('SELECT keyword, trend, trend_change_pct, current_interest FROM keyword_trends')
-    trends = {row[0].lower(): {'trend': row[1], 'change': row[2], 'interest': row[3]} for row in c.fetchall()}
+        # Get YT data
+        c.execute('SELECT keyword, yt_avg_views, yt_view_pattern FROM keyword_yt_data')
+        yt_db = {row[0].lower(): {'avg_views': row[1], 'view_pattern': row[2]} for row in c.fetchall()}
 
-    # Get vote scores
-    c.execute('''
-        SELECT keyword,
-               COALESCE(SUM(CASE WHEN vote = 1 THEN 1 ELSE 0 END), 0) -
-               COALESCE(SUM(CASE WHEN vote = -1 THEN 1 ELSE 0 END), 0) as score
-        FROM keyword_votes GROUP BY keyword
-    ''')
-    votes = {row[0]: row[1] for row in c.fetchall()}
+        # Get trends
+        c.execute('SELECT keyword, trend, trend_change_pct, current_interest FROM keyword_trends')
+        trends = {row[0].lower(): {'trend': row[1], 'change': row[2], 'interest': row[3]} for row in c.fetchall()}
 
-    conn.close()
+        # Get vote scores
+        c.execute('''
+            SELECT keyword,
+                   COALESCE(SUM(CASE WHEN vote = 1 THEN 1 ELSE 0 END), 0) -
+                   COALESCE(SUM(CASE WHEN vote = -1 THEN 1 ELSE 0 END), 0) as score
+            FROM keyword_votes GROUP BY keyword
+        ''')
+        votes = {row[0]: row[1] for row in c.fetchall()}
+
+        conn.close()
+    except Exception as e:
+        print(f"[SMART-PICKS] DB unavailable, using in-memory data only: {e}")
 
     picks = []
     for k in KEYWORDS:

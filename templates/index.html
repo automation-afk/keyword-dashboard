@@ -2106,6 +2106,7 @@
                     <button class="opp-filter-btn" data-opp-filter="rising" onclick="filterOpportunities('rising', this)">Rising Trends</button>
                     <button class="opp-filter-btn" data-opp-filter="deal" onclick="filterOpportunities('deal', this)">Deals</button>
                     <button class="opp-filter-btn" data-opp-filter="comparison" onclick="filterOpportunities('comparison', this)">Comparisons</button>
+                    <button class="opp-filter-btn" data-opp-filter="lowcomp" onclick="filterOpportunities('lowcomp', this)" style="background:rgba(74,222,128,0.15);border-color:rgba(74,222,128,0.3);">Low Comp + High Rev</button>
                     <span style="color:#64748b;margin-left:auto;font-size:0.8rem;" id="opp-showing-count"></span>
                 </div>
 
@@ -5972,6 +5973,16 @@
                     break;
                 case 'comparison':
                     filteredOpportunities = opportunityData.filter(o => o.keywordType === 'comparison');
+                    break;
+                case 'lowcomp':
+                    filteredOpportunities = opportunityData.filter(o => {
+                        const comp = parseFloat(o.competition) || 0;
+                        const rev = parseFloat(o.estRevenue) || 0;
+                        const pattern = o.pattern || 'no_data';
+                        const lowComp = comp < 0.3 || pattern === 'distributed';
+                        return lowComp && rev >= 100;
+                    });
+                    filteredOpportunities.sort((a, b) => (b.estRevenue || 0) - (a.estRevenue || 0));
                     break;
             }
 
