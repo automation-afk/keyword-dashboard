@@ -7388,11 +7388,111 @@
 
 <script>
 // ============================================
-// FAQ Knowledge Base
+// FAQ Knowledge Base + Claude AI Fallback
 // ============================================
-// ============================================
-// Chatbot Logic - Powered by Claude AI
-// ============================================
+const FAQ_DATA = [
+    {
+        keywords: ['add keyword', 'add keywords', 'new keyword', 'create keyword'],
+        answer: 'To add keywords, go to the **Keyword Library** tab and click the **"+ Add Keywords"** button in the top-right.\n\nEnter your keywords, select a source and niche/silo, then save.\n\nYou can also add keywords from **Channel Analysis** in the Research tab.'
+    },
+    {
+        keywords: ['smart picks', 'best keywords', 'recommendations', 'suggested keywords'],
+        answer: 'Go to the **Smart Picks** tab (the default tab).\n\n1. Click **"Show Me the Best Keywords"**\n2. Use the niche filter to narrow results\n3. Sort by Best Overall, Highest Revenue, or Easiest to Rank'
+    },
+    {
+        keywords: ['domination', 'domination score', 'serp position', 'my rankings', 'check rankings', 'where do i rank', 'ranking position', 'track rankings'],
+        answer: 'The **Domination Score** tab tracks your YouTube SERP positions.\n\n1. Click **"Load Ranking Data"** to see scores\n2. Use **"Manage Keywords"** to set which keywords to track\n\n**Scoring:** Position 1 = 50%, Pos 2 = 25%, Pos 3 = 15%, Pos 4&5 = 5% each.\n\nClick any keyword row to see its history over time.'
+    },
+    {
+        keywords: ['research', 'seed keyword', 'keyword research', 'find keywords', 'discover keywords'],
+        answer: 'Go to the **Research** tab.\n\n1. Under **"Seed Keyword Research"**, enter a keyword\n2. Select a niche\n3. Click **"Research Keyword"**\n\nThis finds related keywords with volume and competition data.'
+    },
+    {
+        keywords: ['trending', 'trends', 'trending topics', 'google trends', 'discover trends', 'not covering', 'not covered', 'gaps in coverage', 'uncovered', 'topics not covered'],
+        answer: 'Go to the **Research** tab and find **"Trending Topics Not Covered"**.\n\n1. Click **"Discover Trending Gaps"**\n2. Use the silo filter to narrow by niche\n\nThis finds rising Google Trends topics you haven\'t made videos about yet.\n\nAlso check:\n- **Content Gap** tab - keywords competitors rank for that you don\'t\n- **Universe Map** tab - all possible keywords and your coverage %'
+    },
+    {
+        keywords: ['channel analysis', 'analyze channel', 'competitor channel', 'youtube channel'],
+        answer: 'Go to the **Research** tab and scroll to **"Channel Keyword Analysis"**.\n\n1. Enter a YouTube channel name or @handle\n2. Click analyze\n\nIt shows their publishing stats, top keywords, and hot keywords. You can add their keywords to your library.'
+    },
+    {
+        keywords: ['library', 'keyword library', 'browse keywords', 'all keywords', 'manage keywords'],
+        answer: 'The **Keyword Library** tab shows all 20K+ keywords.\n\n**Filters available:**\n- Search box\n- Niche dropdown\n- Tier buttons (A/B/C/D)\n- Label buttons (Interested/Maybe/Not Interested/Favorites)\n- Source dropdown\n\nClick column headers to sort.'
+    },
+    {
+        keywords: ['content planner', 'video plan', 'content plan', 'how many videos', 'videos needed'],
+        answer: 'The **Content Planner** tab creates a strategic video plan.\n\n1. Click **"Load Content Plan"**\n\n**Priority levels:**\n- Critical (<75%) - needs 3 videos\n- High (75-89%) - needs 3 videos\n- Medium (90-99%) - needs 2-3 videos\n- Maintain (100%) - needs 1-2 reserve'
+    },
+    {
+        keywords: ['3k finder', '$3k', '3000', 'high earning', 'money keywords', 'opportunity'],
+        answer: 'The **$3K Finder** tab finds keywords likely to earn $3,000/month each.\n\n1. Click **"Analyze All Keywords"**\n2. Use filters like **"Low Comp + High Rev"** (green button) for easy wins\n\nGoal: 10 keywords x $3K = $30K/month'
+    },
+    {
+        keywords: ['universe', 'universe map', 'coverage', 'keyword gaps', 'missing keywords', 'how many keywords'],
+        answer: 'The **Universe Map** tab shows every possible keyword in your niches.\n\n1. Click **"Map the Universe"**\n2. See your coverage % per niche\n3. Identify missing keywords (gaps) to target'
+    },
+    {
+        keywords: ['content gap', 'competitor', 'competitors', 'compare', 'gap analysis', 'they rank', 'what am i missing', 'ranking that we are not'],
+        answer: 'The **Content Gap** tab compares your coverage against YouTube competitors.\n\n1. Click **"Discover Top Competitors"**\n2. Select competitors from the list\n3. Click **"Analyze Content Gaps"**\n\n**Views:**\n- **Gaps** - they rank, you don\'t\n- **Overlap** - both rank\n- **Winning** - you rank, they don\'t'
+    },
+    {
+        keywords: ['analytics', 'revenue', 'revenue model', 'earnings', 'how much'],
+        answer: 'The **Analytics** tab shows a calibrated revenue model based on actual data.\n\nIt breaks down revenue by keyword type:\n- Comparison\n- Review\n- Deal\n- Best Of\n- Informational'
+    },
+    {
+        keywords: ['favorite', 'star', 'interested', 'label', 'tag keyword', 'mark keyword'],
+        answer: 'In the **Keyword Library**, each keyword row has action buttons:\n\n- Star icon = Favorite\n- Checkmark = Interested\n- X = Not interested\n- ? = Maybe\n\nUse the label filter buttons at the top to view by label.'
+    },
+    {
+        keywords: ['note', 'notes', 'comment', 'comments'],
+        answer: 'In the **Keyword Library**, each keyword row has:\n\n- **Notes icon** - add/edit a personal note\n- **Comments icon** - add or view comments\n\nClick either icon to open the editor.'
+    },
+    {
+        keywords: ['export', 'csv', 'download'],
+        answer: 'In the **Keyword Library** tab, click the **"Export CSV"** button in the top toolbar to download all your keywords as a CSV file.'
+    },
+    {
+        keywords: ['primary', 'secondary', 'parent keyword', 'silo', 'niche'],
+        answer: 'Go to **Domination Score** > **"Manage Keywords"** to set up:\n\n- **Primary keywords** - your main ranking targets\n- **Secondary keywords** - support primary keywords\n- **Silos** - organize keywords by niche\n\nA primary keyword with secondaries can\'t be deactivated.'
+    },
+    {
+        keywords: ['import', 'import json', 'rankings json', 'check rankings'],
+        answer: 'Go to the **Domination Score** tab and click **"Import Results JSON"**.\n\nPaste the JSON output from the check_rankings.py script to update your SERP position data.'
+    },
+    {
+        keywords: ['tier', 'a tier', 'b tier', 'c tier', 'd tier'],
+        answer: 'Keywords are categorized into tiers:\n\n- **A** - Best opportunity\n- **B** - Good\n- **C** - Moderate\n- **D** - Low priority\n\nFilter by tier using the A/B/C/D buttons in the Keyword Library.'
+    },
+    {
+        keywords: ['enrich', 'enrich keywords', 'get volume', 'keyword data', 'cpc'],
+        answer: 'In the **Content Gap** tab, after finding gap keywords:\n\n1. Click **"Enrich Top 20 Gap Keywords"**\n2. Gets: search volume, competition score, CPC, trends, and related keywords'
+    },
+    {
+        keywords: ['tabs', 'features', 'what can', 'overview', 'help', 'how to use', 'what does this do'],
+        answer: 'The app has **9 main tabs:**\n\n1. **Smart Picks** - AI keyword recommendations\n2. **Research** - seed research, trends, channel analysis\n3. **Keyword Library** - browse/manage all keywords\n4. **Domination Score** - SERP tracking\n5. **Content Planner** - video planning\n6. **Analytics** - revenue model\n7. **$3K Finder** - high-earner opportunities\n8. **Universe Map** - coverage gaps\n9. **Content Gap** - competitor comparison\n\nAsk me about any specific tab!'
+    }
+];
+
+function searchFAQ(question) {
+    const q = question.toLowerCase();
+    let bestMatch = null;
+    let bestScore = 0;
+
+    for (const faq of FAQ_DATA) {
+        let score = 0;
+        for (const kw of faq.keywords) {
+            if (q.includes(kw)) {
+                score += kw.split(' ').length;
+            }
+        }
+        if (score > bestScore) {
+            bestScore = score;
+            bestMatch = faq;
+        }
+    }
+    return bestScore >= 1 ? bestMatch : null;
+}
+
 let chatbotOpen = false;
 
 function toggleChatbot() {
@@ -7463,7 +7563,14 @@ async function sendChatMessage() {
     // Hide suggestions after first message
     document.getElementById('chatbot-suggestions').style.display = 'none';
 
-    // Send to Claude AI
+    // Try FAQ first (instant, no API needed)
+    const faqResult = searchFAQ(question);
+    if (faqResult) {
+        addChatMessage(faqResult.answer, 'bot');
+        return;
+    }
+
+    // Fallback to Claude AI for unknown questions
     sendBtn.disabled = true;
     input.disabled = true;
     showTyping();
