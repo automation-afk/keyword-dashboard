@@ -19,3 +19,4 @@ data/*.db-journal
 .streamlit/secrets.toml
 service-account*.json
 credentials*.json
+railway_backup*.env
