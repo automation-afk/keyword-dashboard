@@ -1105,6 +1105,44 @@
             flex-shrink: 0;
         }
 
+        /* Content Gap Analysis */
+        .cg-summary-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+            gap: 12px;
+            margin-bottom: 24px;
+        }
+        .cg-stat {
+            background: rgba(15, 23, 42, 0.6);
+            padding: 20px;
+            border-radius: 12px;
+            border: 1px solid rgba(148, 163, 184, 0.1);
+            text-align: center;
+        }
+        .cg-stat .cg-value { font-size: 1.8rem; font-weight: 700; }
+        .cg-stat .cg-label { font-size: 0.75rem; color: #94a3b8; text-transform: uppercase; margin-top: 4px; }
+        .cg-comp-card {
+            background: rgba(15, 23, 42, 0.6);
+            border: 2px solid rgba(71, 85, 105, 0.3);
+            border-radius: 10px;
+            padding: 12px 16px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        .cg-comp-card:hover { border-color: rgba(139, 92, 246, 0.5); }
+        .cg-comp-card.selected { border-color: #ec4899; background: rgba(236, 72, 153, 0.1); }
+        .cg-rank-badge {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 0.8rem;
+            font-weight: 600;
+        }
+        .cg-rank-badge.top3 { background: rgba(74,222,128,0.15); color: #4ade80; }
+        .cg-rank-badge.top5 { background: rgba(96,165,250,0.15); color: #60a5fa; }
+        .cg-rank-badge.top10 { background: rgba(251,191,36,0.15); color: #fbbf24; }
+        .cg-rank-badge.none { background: rgba(248,113,113,0.1); color: #f87171; }
+
         /* Responsive */
         @media (max-width: 768px) {
             header h1 { font-size: 1.8rem; }
@@ -1145,6 +1183,7 @@
             <button class="tab" data-tab="analytics">📊 Analytics</button>
             <button class="tab" data-tab="opportunity">💰 $3K Finder</button>
             <button class="tab" data-tab="universe">🌐 Universe Map</button>
+            <button class="tab" data-tab="contentgap">🔍 Content Gap</button>
         </div>
 
         <!-- Smart Picks Tab (default) -->
@@ -2155,6 +2194,147 @@
                 </p>
             </div>
         </div>
+    </div>
+
+        <!-- Content Gap Analysis Tab -->
+        <div class="tab-content" id="contentgap-tab">
+            <div class="research-box">
+                <h2 style="margin-bottom:8px;">Content Gap Analysis</h2>
+                <p style="color:#94a3b8;margin-bottom:16px;">
+                    Compare Digidom's YouTube keyword coverage against competitors.
+                    Find keywords they rank for that you're missing.
+                </p>
+                <button class="research-btn" id="cg-load-competitors-btn" onclick="loadGapCompetitors()"
+                        style="background:linear-gradient(135deg, #ec4899, #8b5cf6);">
+                    <span id="cg-comp-btn-text">Discover Top Competitors</span>
+                    <div class="spinner" id="cg-comp-spinner" style="display:none;"></div>
+                </button>
+            </div>
+
+            <!-- Competitor Selection -->
+            <div id="cg-competitor-selection" style="display:none;">
+                <div class="research-box">
+                    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;flex-wrap:wrap;gap:12px;">
+                        <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+                            <div>
+                                <label style="font-size:0.7rem;color:#94a3b8;display:block;margin-bottom:2px;">Filter by Silo</label>
+                                <select id="cg-silo-filter" onchange="onCgSiloChange()" style="background:rgba(15,23,42,0.8);border:1px solid rgba(71,85,105,0.5);color:#e2e8f0;padding:6px 12px;border-radius:8px;font-size:0.85rem;">
+                                    <option value="">All Silos</option>
+                                </select>
+                            </div>
+                            <h3 style="margin:0;">Select Competitors to Compare</h3>
+                        </div>
+                        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+                            <button onclick="selectAllCompetitors()" style="background:rgba(74,222,128,0.15);color:#4ade80;border:1px solid rgba(74,222,128,0.3);padding:6px 14px;border-radius:6px;cursor:pointer;font-size:0.8rem;">Select All</button>
+                            <button onclick="deselectAllCompetitors()" style="background:rgba(248,113,113,0.1);color:#f87171;border:1px solid rgba(248,113,113,0.3);padding:6px 14px;border-radius:6px;cursor:pointer;font-size:0.8rem;">Deselect All</button>
+                        </div>
+                    </div>
+                    <div id="cg-competitor-list" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:8px;margin-bottom:16px;max-height:400px;overflow-y:auto;"></div>
+                    <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap;">
+                        <button class="research-btn" id="cg-analyze-btn" onclick="runGapAnalysis()" disabled
+                                style="background:linear-gradient(135deg, #ec4899, #8b5cf6);">
+                            <span id="cg-analyze-btn-text">Analyze Content Gaps</span>
+                            <div class="spinner" id="cg-analyze-spinner" style="display:none;"></div>
+                        </button>
+                        <span id="cg-selected-count" style="color:#94a3b8;font-size:0.8rem;">0 selected</span>
+                        <span style="color:#64748b;font-size:0.75rem;font-style:italic;">Finds keywords competitors rank for that you don't cover yet</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Results -->
+            <div id="cg-results" style="display:none;">
+                <!-- Summary Stats -->
+                <div class="cg-summary-grid">
+                    <div class="cg-stat"><div class="cg-value" style="color:#f87171;" id="cg-gap-count">-</div><div class="cg-label">Gap Keywords</div></div>
+                    <div class="cg-stat"><div class="cg-value" style="color:#4ade80;" id="cg-winning-count">-</div><div class="cg-label">You Win</div></div>
+                    <div class="cg-stat"><div class="cg-value" style="color:#60a5fa;" id="cg-overlap-count">-</div><div class="cg-label">Both Rank</div></div>
+                    <div class="cg-stat"><div class="cg-value" style="color:#fbbf24;" id="cg-gap-volume">-</div><div class="cg-label">Gap Search Volume</div></div>
+                    <div class="cg-stat"><div class="cg-value" style="color:#a78bfa;" id="cg-gap-revenue">-</div><div class="cg-label">Est. Gap Revenue</div></div>
+                    <div class="cg-stat"><div class="cg-value" style="color:#e2e8f0;" id="cg-total-compared">-</div><div class="cg-label">Total Compared</div></div>
+                </div>
+
+                <!-- Library status callout -->
+                <div class="research-box" style="background:rgba(236,72,153,0.1);border-color:rgba(236,72,153,0.3);padding:16px;margin-bottom:20px;">
+                    <div style="display:flex;align-items:center;gap:12px;">
+                        <span style="font-size:1.5rem;">🎯</span>
+                        <div>
+                            <strong style="color:#ec4899;" id="cg-library-status">-</strong>
+                            <p style="color:#94a3b8;font-size:0.85rem;margin-top:4px;" id="cg-library-detail">-</p>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Sub-views: Gaps / Overlap / Winning -->
+                <div style="display:flex;gap:4px;margin-bottom:16px;">
+                    <button class="opp-filter-btn active" data-cg-view="gaps" onclick="switchGapView('gaps', this)">Gaps (<span id="cg-gaps-badge">0</span>)</button>
+                    <button class="opp-filter-btn" data-cg-view="overlap" onclick="switchGapView('overlap', this)">Overlap (<span id="cg-overlap-badge">0</span>)</button>
+                    <button class="opp-filter-btn" data-cg-view="winning" onclick="switchGapView('winning', this)">Winning (<span id="cg-winning-badge">0</span>)</button>
+                </div>
+
+                <!-- Gap Keywords Table -->
+                <div id="cg-gaps-view">
+                    <div class="research-box" style="overflow-x:auto;">
+                        <table style="width:100%;border-collapse:collapse;" id="cg-gap-table">
+                            <thead id="cg-gap-thead"></thead>
+                            <tbody id="cg-gap-tbody"></tbody>
+                        </table>
+                    </div>
+                    <div id="cg-gap-show-more" style="text-align:center;padding:20px;display:none;">
+                        <button class="research-btn" onclick="showMoreGapKeywords()" style="background:rgba(71,85,105,0.5);padding:10px 30px;">Show More</button>
+                    </div>
+                </div>
+
+                <!-- Overlap Table -->
+                <div id="cg-overlap-view" style="display:none;">
+                    <div class="research-box" style="overflow-x:auto;">
+                        <table style="width:100%;border-collapse:collapse;" id="cg-overlap-table">
+                            <thead id="cg-overlap-thead"></thead>
+                            <tbody id="cg-overlap-tbody"></tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <!-- Winning Table -->
+                <div id="cg-winning-view" style="display:none;">
+                    <div class="research-box" style="overflow-x:auto;">
+                        <table style="width:100%;border-collapse:collapse;" id="cg-winning-table">
+                            <thead>
+                                <tr style="border-bottom:1px solid rgba(71,85,105,0.5);">
+                                    <th style="text-align:left;padding:10px;color:#94a3b8;font-size:0.75rem;">KEYWORD</th>
+                                    <th style="text-align:center;padding:10px;color:#94a3b8;font-size:0.75rem;">VOLUME</th>
+                                    <th style="text-align:center;padding:10px;color:#4ade80;font-size:0.75rem;">DIGIDOM RANK</th>
+                                    <th style="text-align:center;padding:10px;color:#94a3b8;font-size:0.75rem;">SILO</th>
+                                </tr>
+                            </thead>
+                            <tbody id="cg-winning-tbody"></tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <!-- Enrich Section -->
+                <div class="research-box" style="margin-top:20px;">
+                    <h3 style="margin-bottom:12px;">Deep-Dive: Enrich Top Gap Keywords</h3>
+                    <p style="color:#94a3b8;font-size:0.85rem;margin-bottom:12px;">
+                        Get volume, competition, CPC, trends, and related keywords for the top gap keywords using API data.
+                    </p>
+                    <button class="research-btn" id="cg-enrich-btn" onclick="enrichGapKeywords()" style="background:linear-gradient(135deg, #f59e0b, #f97316);">
+                        <span id="cg-enrich-btn-text">Enrich Top 20 Gap Keywords</span>
+                        <div class="spinner" id="cg-enrich-spinner" style="display:none;"></div>
+                    </button>
+                    <div id="cg-enriched-results" style="margin-top:16px;display:none;"></div>
+                </div>
+            </div>
+
+            <!-- Empty state -->
+            <div id="cg-empty-state" class="research-box" style="text-align:center;padding:60px;">
+                <h3 style="color:#94a3b8;margin-bottom:12px;">Click "Discover Top Competitors" to begin</h3>
+                <p style="color:#64748b;font-size:0.85rem;">
+                    Analyzes BigQuery SERP data to find which competitor channels dominate keywords you're not covering.
+                </p>
+            </div>
+        </div>
+
     </div>
 
     <!-- Notes Modal -->
@@ -6381,6 +6561,369 @@
             }).join('');
         }
 
+        // ============================================
+        // CONTENT GAP ANALYSIS
+        // ============================================
+        let cgCompetitors = [];
+        let cgSelectedCompetitors = [];
+        let cgAnalysisData = null;
+        let cgGapDisplayLimit = 30;
+        let cgSiloCounts = {};
+
+        async function loadGapCompetitors(silo) {
+            const btn = document.getElementById('cg-load-competitors-btn');
+            const btnText = document.getElementById('cg-comp-btn-text');
+            const spinner = document.getElementById('cg-comp-spinner');
+
+            btn.disabled = true;
+            btnText.textContent = 'Discovering...';
+            spinner.style.display = 'block';
+
+            const siloParam = silo ? '?silo=' + encodeURIComponent(silo) : '';
+
+            try {
+                const response = await fetch('/api/content-gap/competitors' + siloParam);
+                if (!response.ok) { alert('Error ' + response.status + ': ' + response.statusText); return; }
+                const text = await response.text();
+                let data;
+                try { data = JSON.parse(text); } catch(e) { alert('Server returned invalid response. Check if you are logged in.'); console.error('Response:', text.substring(0, 200)); return; }
+
+                if (data.success) {
+                    cgCompetitors = data.competitors;
+                    cgSelectedCompetitors = [];
+                    renderCompetitorCards(data.competitors);
+                    document.getElementById('cg-competitor-selection').style.display = 'block';
+                    document.getElementById('cg-empty-state').style.display = 'none';
+                    document.getElementById('cg-selected-count').textContent = '0 selected';
+                    document.getElementById('cg-analyze-btn').disabled = true;
+                    if (!silo) {
+                        if (data.silo_counts) cgSiloCounts = data.silo_counts;
+                        populateCgSiloFilter();
+                    }
+                } else {
+                    alert('Error: ' + (data.error || 'Unknown'));
+                }
+            } catch (error) {
+                console.error('Content gap competitors error:', error);
+                alert('Error loading competitors: ' + error.message);
+            } finally {
+                btn.disabled = false;
+                btnText.textContent = 'Discover Top Competitors';
+                spinner.style.display = 'none';
+            }
+        }
+
+        function onCgSiloChange() {
+            const silo = document.getElementById('cg-silo-filter').value;
+            loadGapCompetitors(silo);
+        }
+
+        function renderCompetitorCards(competitors) {
+            const container = document.getElementById('cg-competitor-list');
+            container.innerHTML = competitors.map((c, i) => `
+                <div class="cg-comp-card" onclick="toggleCompetitor(this, '${escapeHtml(c.channel)}')" data-channel="${escapeHtml(c.channel)}">
+                    <div style="display:flex;justify-content:space-between;align-items:center;">
+                        <strong style="color:#e2e8f0;font-size:0.9rem;">${escapeHtml(c.channel)}</strong>
+                        <span style="font-size:0.75rem;color:#a78bfa;">#${i + 1}</span>
+                    </div>
+                    <div style="display:flex;gap:12px;margin-top:8px;font-size:0.8rem;flex-wrap:wrap;">
+                        <span style="color:#f87171;font-weight:600;">${c.gap_count} gaps</span>
+                        <span style="color:#60a5fa;">${c.overlap_count} overlap</span>
+                        <span style="color:#4ade80;">${c.win_count} we win</span>
+                        <span style="color:#94a3b8;">Avg #${c.avg_rank}</span>
+                        <span style="color:#fbbf24;">${(c.total_views / 1000000).toFixed(1)}M views</span>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        function toggleCompetitor(el, channel) {
+            const idx = cgSelectedCompetitors.indexOf(channel);
+            if (idx > -1) {
+                cgSelectedCompetitors.splice(idx, 1);
+                el.classList.remove('selected');
+            } else {
+                cgSelectedCompetitors.push(channel);
+                el.classList.add('selected');
+            }
+            document.getElementById('cg-selected-count').textContent = cgSelectedCompetitors.length + ' selected';
+            document.getElementById('cg-analyze-btn').disabled = cgSelectedCompetitors.length === 0;
+        }
+
+        function selectAllCompetitors() {
+            cgSelectedCompetitors = cgCompetitors.map(c => c.channel);
+            document.querySelectorAll('.cg-comp-card').forEach(el => el.classList.add('selected'));
+            document.getElementById('cg-selected-count').textContent = cgSelectedCompetitors.length + ' selected';
+            document.getElementById('cg-analyze-btn').disabled = false;
+        }
+
+        function deselectAllCompetitors() {
+            cgSelectedCompetitors = [];
+            document.querySelectorAll('.cg-comp-card').forEach(el => el.classList.remove('selected'));
+            document.getElementById('cg-selected-count').textContent = '0 selected';
+            document.getElementById('cg-analyze-btn').disabled = true;
+        }
+
+        function populateCgSiloFilter() {
+            const select = document.getElementById('cg-silo-filter');
+            const totalComps = cgCompetitors.length;
+            select.innerHTML = `<option value="">All Silos (${totalComps})</option>`;
+            // Use BigQuery silo names directly, show gap keyword count
+            // Sort by gap count descending so highest-opportunity silos are first
+            const sorted = Object.entries(cgSiloCounts).sort((a, b) => b[1].gaps - a[1].gaps);
+            sorted.forEach(([s, data]) => {
+                const label = s.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
+                select.innerHTML += `<option value="${s}">${label} — ${data.gaps} gaps, ${data.competitors} comps</option>`;
+            });
+        }
+
+        async function runGapAnalysis() {
+            const btn = document.getElementById('cg-analyze-btn');
+            const btnText = document.getElementById('cg-analyze-btn-text');
+            const spinner = document.getElementById('cg-analyze-spinner');
+
+            btn.disabled = true;
+            btnText.textContent = 'Analyzing...';
+            spinner.style.display = 'block';
+
+            try {
+                const response = await fetch('/api/content-gap/analysis', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        competitors: cgSelectedCompetitors,
+                        silo_filter: document.getElementById('cg-silo-filter').value,
+                    })
+                });
+                if (!response.ok) { alert('Error ' + response.status + ': ' + response.statusText); return; }
+                const text = await response.text();
+                let data;
+                try { data = JSON.parse(text); } catch(e) { alert('Server returned invalid response. Check if you are logged in.'); console.error('Response:', text.substring(0, 200)); return; }
+
+                if (data.success) {
+                    cgAnalysisData = data;
+                    cgGapDisplayLimit = 30;
+                    renderGapSummary(data);
+                    renderGapTable(data);
+                    document.getElementById('cg-results').style.display = 'block';
+                } else {
+                    alert('Error: ' + (data.error || 'Unknown'));
+                }
+            } catch (error) {
+                console.error('Content gap analysis error:', error);
+                alert('Error running analysis: ' + error.message);
+            } finally {
+                btn.disabled = false;
+                btnText.textContent = 'Analyze Content Gaps';
+                spinner.style.display = 'none';
+            }
+        }
+
+        function renderGapSummary(data) {
+            const s = data.summary;
+            document.getElementById('cg-gap-count').textContent = s.gap_count.toLocaleString();
+            document.getElementById('cg-winning-count').textContent = s.winning_count.toLocaleString();
+            document.getElementById('cg-overlap-count').textContent = s.overlap_count.toLocaleString();
+            document.getElementById('cg-gap-volume').textContent = s.total_gap_volume.toLocaleString();
+            document.getElementById('cg-gap-revenue').textContent = '$' + Math.round(s.top_30_gap_revenue).toLocaleString() + '/mo';
+            document.getElementById('cg-total-compared').textContent = s.total_keywords_compared.toLocaleString();
+
+            document.getElementById('cg-library-status').textContent =
+                s.gap_not_in_library + ' gap keywords are NOT in your library';
+            document.getElementById('cg-library-detail').textContent =
+                s.gap_in_library + ' gap keywords already tracked. ' + s.gap_not_in_library + ' are completely new opportunities.';
+
+            document.getElementById('cg-gaps-badge').textContent = s.gap_count;
+            document.getElementById('cg-overlap-badge').textContent = s.overlap_count;
+            document.getElementById('cg-winning-badge').textContent = s.winning_count;
+        }
+
+        function cgRankBadge(rank) {
+            if (!rank) return '<span class="cg-rank-badge none">-</span>';
+            const cls = rank <= 3 ? 'top3' : rank <= 5 ? 'top5' : 'top10';
+            return `<span class="cg-rank-badge ${cls}">#${rank}</span>`;
+        }
+
+        function renderGapTable(data) {
+            const comps = data.competitors;
+            const gaps = data.gap_keywords.slice(0, cgGapDisplayLimit);
+            const typeColors = {comparison:'#a78bfa', review:'#60a5fa', deal:'#fbbf24', best_of:'#f472b6', informational:'#94a3b8', other:'#64748b'};
+            const th = 'style="text-align:center;padding:10px;color:#94a3b8;font-size:0.75rem;"';
+
+            // Build dynamic header
+            let headerHtml = `<tr style="border-bottom:1px solid rgba(71,85,105,0.5);">
+                <th style="text-align:left;padding:10px;color:#94a3b8;font-size:0.75rem;">KEYWORD</th>
+                <th ${th}>VOL</th>
+                <th ${th}>TYPE</th>`;
+            comps.forEach(c => { headerHtml += `<th ${th}>${escapeHtml(c)}</th>`; });
+            headerHtml += `<th ${th}>EST. REV</th><th ${th}>SILO</th><th ${th}>IN LIB</th></tr>`;
+            document.getElementById('cg-gap-thead').innerHTML = headerHtml;
+
+            // Build rows
+            document.getElementById('cg-gap-tbody').innerHTML = gaps.map(g => {
+                const revStr = g.revenue_estimate ? '$' + Math.round(g.revenue_estimate).toLocaleString() : '-';
+                let compCells = '';
+                comps.forEach(c => {
+                    const cd = g.competitors[c];
+                    compCells += `<td style="padding:10px;text-align:center;">${cd ? cgRankBadge(cd.rank) : '-'}</td>`;
+                });
+                return `<tr style="border-bottom:1px solid rgba(71,85,105,0.2);">
+                    <td style="padding:10px;color:#e2e8f0;">${escapeHtml(g.keyword)}</td>
+                    <td style="padding:10px;text-align:center;color:#60a5fa;">${(g.search_volume || 0).toLocaleString()}</td>
+                    <td style="padding:10px;text-align:center;"><span style="color:${typeColors[g.keyword_type] || '#94a3b8'};font-size:0.8rem;">${(g.keyword_type || '').replace(/_/g,' ')}</span></td>
+                    ${compCells}
+                    <td style="padding:10px;text-align:center;color:#4ade80;font-weight:600;">${revStr}</td>
+                    <td style="padding:10px;text-align:center;font-size:0.8rem;color:#94a3b8;">${g.silo || '-'}</td>
+                    <td style="padding:10px;text-align:center;">${g.in_library ? '<span style="color:#4ade80;">Y</span>' : '<span style="color:#f87171;">N</span>'}</td>
+                </tr>`;
+            }).join('');
+
+            document.getElementById('cg-gap-show-more').style.display =
+                data.gap_keywords.length > cgGapDisplayLimit ? 'block' : 'none';
+
+            renderOverlapTable(data);
+            renderWinningTable(data);
+        }
+
+        function renderOverlapTable(data) {
+            const comps = data.competitors;
+            const th = 'style="text-align:center;padding:10px;color:#94a3b8;font-size:0.75rem;"';
+
+            // Dynamic header
+            let headerHtml = `<tr style="border-bottom:1px solid rgba(71,85,105,0.5);">
+                <th style="text-align:left;padding:10px;color:#94a3b8;font-size:0.75rem;">KEYWORD</th>
+                <th ${th}>VOL</th>
+                <th style="text-align:center;padding:10px;color:#f97316;font-size:0.75rem;">DIGIDOM</th>`;
+            comps.forEach(c => { headerHtml += `<th ${th}>${escapeHtml(c)}</th>`; });
+            headerHtml += `<th ${th}>STATUS</th></tr>`;
+            document.getElementById('cg-overlap-thead').innerHTML = headerHtml;
+
+            document.getElementById('cg-overlap-tbody').innerHTML = data.overlap_keywords.slice(0, 50).map(o => {
+                const compRanks = Object.values(o.competitors).map(c => c.rank);
+                const bestCompRank = Math.min(...compRanks);
+                let status = '', statusColor = '#94a3b8';
+                if (o.digidom_rank < bestCompRank) { status = 'Winning'; statusColor = '#4ade80'; }
+                else if (o.digidom_rank > bestCompRank) { status = 'Losing'; statusColor = '#f87171'; }
+                else { status = 'Tied'; statusColor = '#fbbf24'; }
+
+                let compCells = '';
+                comps.forEach(c => {
+                    const cd = o.competitors[c];
+                    compCells += `<td style="padding:10px;text-align:center;">${cd ? cgRankBadge(cd.rank) : '-'}</td>`;
+                });
+
+                return `<tr style="border-bottom:1px solid rgba(71,85,105,0.2);">
+                    <td style="padding:10px;color:#e2e8f0;">${escapeHtml(o.keyword)}</td>
+                    <td style="padding:10px;text-align:center;color:#60a5fa;">${(o.search_volume || 0).toLocaleString()}</td>
+                    <td style="padding:10px;text-align:center;">${cgRankBadge(o.digidom_rank)}</td>
+                    ${compCells}
+                    <td style="padding:10px;text-align:center;color:${statusColor};font-weight:600;">${status}</td>
+                </tr>`;
+            }).join('');
+        }
+
+        function renderWinningTable(data) {
+            const tbody = document.getElementById('cg-winning-tbody');
+            tbody.innerHTML = data.winning_keywords.slice(0, 50).map(w => `
+                <tr style="border-bottom:1px solid rgba(71,85,105,0.2);">
+                    <td style="padding:10px;color:#e2e8f0;">${escapeHtml(w.keyword)}</td>
+                    <td style="padding:10px;text-align:center;color:#60a5fa;">${(w.search_volume || 0).toLocaleString()}</td>
+                    <td style="padding:10px;text-align:center;">${cgRankBadge(w.digidom_rank)}</td>
+                    <td style="padding:10px;text-align:center;font-size:0.8rem;color:#94a3b8;">${w.silo || '-'}</td>
+                </tr>
+            `).join('');
+        }
+
+        function switchGapView(view, btnEl) {
+            document.querySelectorAll('[data-cg-view]').forEach(b => b.classList.remove('active'));
+            btnEl.classList.add('active');
+            document.getElementById('cg-gaps-view').style.display = view === 'gaps' ? 'block' : 'none';
+            document.getElementById('cg-overlap-view').style.display = view === 'overlap' ? 'block' : 'none';
+            document.getElementById('cg-winning-view').style.display = view === 'winning' ? 'block' : 'none';
+        }
+
+        function showMoreGapKeywords() {
+            cgGapDisplayLimit += 30;
+            renderGapTable(cgAnalysisData);
+        }
+
+        async function enrichGapKeywords() {
+            if (!cgAnalysisData || !cgAnalysisData.gap_keywords.length) {
+                alert('Run gap analysis first');
+                return;
+            }
+
+            const btn = document.getElementById('cg-enrich-btn');
+            const btnText = document.getElementById('cg-enrich-btn-text');
+            const spinner = document.getElementById('cg-enrich-spinner');
+
+            btn.disabled = true;
+            btnText.textContent = 'Enriching...';
+            spinner.style.display = 'block';
+
+            const topGapKeywords = cgAnalysisData.gap_keywords.slice(0, 20).map(g => g.keyword);
+
+            try {
+                const response = await fetch('/api/content-gap/enrich', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ keywords: topGapKeywords })
+                });
+                if (!response.ok) { alert('Error ' + response.status); return; }
+                const text = await response.text();
+                let data;
+                try { data = JSON.parse(text); } catch(e) { alert('Server returned invalid response'); return; }
+
+                if (data.success) {
+                    renderEnrichedResults(data, topGapKeywords);
+                    document.getElementById('cg-enriched-results').style.display = 'block';
+                }
+            } catch (error) {
+                console.error('Enrich error:', error);
+                alert('Error enriching keywords: ' + error.message);
+            } finally {
+                btn.disabled = false;
+                btnText.textContent = 'Enrich Top 20 Gap Keywords';
+                spinner.style.display = 'none';
+            }
+        }
+
+        function renderEnrichedResults(data, keywords) {
+            const container = document.getElementById('cg-enriched-results');
+            let html = '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:12px;">';
+
+            keywords.forEach(kw => {
+                const info = data.enriched[kw.toLowerCase()] || {};
+                const trendIcon = info.trend === 'rising' ? '📈' : info.trend === 'declining' ? '📉' : '➡️';
+                const trendColor = info.trend === 'rising' ? '#4ade80' : info.trend === 'declining' ? '#f87171' : '#94a3b8';
+
+                html += `
+                <div style="background:rgba(15,23,42,0.6);border:1px solid rgba(148,163,184,0.1);border-radius:12px;padding:16px;">
+                    <div style="font-weight:600;color:#e2e8f0;margin-bottom:8px;">${escapeHtml(kw)}</div>
+                    <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;font-size:0.8rem;">
+                        <span style="color:#94a3b8;">Volume:</span><span style="color:#60a5fa;">${(info.volume || 0).toLocaleString()}</span>
+                        <span style="color:#94a3b8;">Competition:</span><span style="color:#fbbf24;">${info.competition || '-'}</span>
+                        <span style="color:#94a3b8;">CPC:</span><span style="color:#4ade80;">$${info.cpc || '0'}</span>
+                        <span style="color:#94a3b8;">Trend:</span><span style="color:${trendColor};">${trendIcon} ${info.trend || 'unknown'} (${info.trend_change_pct || 0}%)</span>
+                    </div>`;
+
+                const related = data.related_keywords[kw.toLowerCase()];
+                if (related && related.length > 0) {
+                    html += `<div style="margin-top:8px;"><span style="color:#64748b;font-size:0.7rem;">Related:</span> `;
+                    html += related.slice(0, 5).map(r => {
+                        const rkw = typeof r === 'string' ? r : (r.keyword || r);
+                        return `<span style="display:inline-block;background:rgba(96,165,250,0.1);color:#60a5fa;padding:2px 8px;border-radius:4px;font-size:0.75rem;margin:2px;">${escapeHtml(rkw)}</span>`;
+                    }).join('');
+                    html += '</div>';
+                }
+
+                html += '</div>';
+            });
+
+            html += '</div>';
+            container.innerHTML = html;
+        }
+
         // Auto-load data when switching tabs
         document.querySelectorAll('.tab').forEach(tab => {
             tab.addEventListener('click', function() {
@@ -6397,6 +6940,11 @@
                 if (this.dataset.tab === 'universe') {
                     if (!universeData) {
                         loadUniverse();
+                    }
+                }
+                if (this.dataset.tab === 'contentgap') {
+                    if (!cgCompetitors.length) {
+                        loadGapCompetitors();
                     }
                 }
             });
