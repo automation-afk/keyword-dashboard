@@ -9020,10 +9020,10 @@ def chatbot_ask():
                 'source': 'error'
             })
 
-        client = anthropic.Anthropic(api_key=api_key)
+        client = anthropic.Anthropic(api_key=api_key, timeout=30.0)
         message = client.messages.create(
             model="claude-sonnet-4-5-20250929",
-            max_tokens=500,
+            max_tokens=300,
             system=CHATBOT_SYSTEM_PROMPT,
             messages=[{"role": "user", "content": question}]
         )
