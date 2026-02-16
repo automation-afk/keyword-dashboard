@@ -2,6 +2,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from flask import Flask, render_template, jsonify, request, Response, redirect, url_for, session
+import anthropic
 import csv
 import json
 import os
@@ -16,6 +17,7 @@ from functools import wraps
 from authlib.integrations.flask_client import OAuth
 from werkzeug.middleware.proxy_fix import ProxyFix
 from apscheduler.schedulers.background import BackgroundScheduler
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 app = Flask(__name__)
 
@@ -32,6 +34,15 @@ app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
 app.config['SESSION_COOKIE_SECURE'] = False
 app.config['SESSION_COOKIE_HTTPONLY'] = True
 app.config['PREFERRED_URL_SCHEME'] = 'https'
+app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0  # Disable static file caching
+
+@app.after_request
+def add_no_cache_headers(response):
+    if 'text/html' in response.content_type:
+        response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+        response.headers['Pragma'] = 'no-cache'
+        response.headers['Expires'] = '0'
+    return response
 
 # ============================================
 # GOOGLE OAUTH CONFIG
@@ -7365,6 +7376,90 @@ def _parse_competition(val):
     except (ValueError, TypeError):
         return 0
 
+@app.route('/api/trending-gaps')
+@login_required
+def trending_gaps():
+    """Find trending topics from Google Trends that aren't in the keyword library.
+    Uses silo primary keywords as seeds, fetches rising related queries, filters out existing keywords."""
+    silo_filter = request.args.get('silo', 'all')
+
+    # Load silo seeds from keyword_tracking.json
+    tracking_path = os.path.join(os.path.dirname(__file__), 'data', 'keyword_tracking.json')
+    try:
+        with open(tracking_path, 'r') as f:
+            config = json.load(f)
+    except Exception as e:
+        return jsonify({'success': False, 'error': f'Could not load tracking config: {e}'}), 500
+
+    # Build set of existing keywords for fast lookup
+    existing_kws = set(k.get('keyword', '').lower().strip() for k in KEYWORDS)
+
+    # Collect seed keywords from silos
+    seeds = []
+    for silo in config.get('silos', []):
+        silo_id = silo.get('id', '')
+        if silo_filter != 'all' and silo_id != silo_filter:
+            continue
+        for group in silo.get('groups', []):
+            for kw_entry in group.get('keywords', []):
+                seeds.append({'keyword': kw_entry['keyword'], 'silo': silo_id})
+
+    # Query Google Trends rising queries for each seed
+    all_trending = []
+    seen = set()
+    errors = []
+
+    for seed in seeds:
+        try:
+            result = get_serpapi_related_queries(seed['keyword'])
+            if result.get('success'):
+                for rq in result.get('related', []):
+                    kw = rq.get('keyword', '').strip()
+                    kw_lower = kw.lower()
+                    if not kw or kw_lower in seen:
+                        continue
+                    seen.add(kw_lower)
+                    in_library = kw_lower in existing_kws
+                    all_trending.append({
+                        'keyword': kw,
+                        'trend_type': rq.get('trend_type', 'unknown'),
+                        'trend_value': rq.get('value', 0),
+                        'seed_keyword': seed['keyword'],
+                        'silo': seed['silo'],
+                        'in_library': in_library
+                    })
+            else:
+                errors.append(f"{seed['keyword']}: {result.get('error', 'unknown error')}")
+        except Exception as e:
+            errors.append(f"{seed['keyword']}: {str(e)}")
+
+    # Separate into gaps (not in library) and covered (already in library)
+    gaps = [t for t in all_trending if not t['in_library']]
+    covered = [t for t in all_trending if t['in_library']]
+
+    # Sort gaps: rising first (breakout/high value), then by trend_value descending
+    def sort_key(item):
+        is_rising = 1 if item['trend_type'] == 'rising' else 0
+        val = item.get('trend_value', 0)
+        if isinstance(val, str):
+            val = 99999 if val.lower() == 'breakout' else 0
+        return (is_rising, val)
+
+    gaps.sort(key=sort_key, reverse=True)
+
+    return jsonify({
+        'success': True,
+        'gaps': gaps,
+        'covered': covered,
+        'total_trending': len(all_trending),
+        'gap_count': len(gaps),
+        'covered_count': len(covered),
+        'seeds_queried': len(seeds),
+        'silos': [s['id'] for s in config.get('silos', [])],
+        'errors': errors
+    })
+
+
 @app.route('/api/opportunity-finder')
 @login_required
 def opportunity_finder():
@@ -8839,6 +8934,95 @@ def content_gap_enrich():
         'related_keywords': related,
         'source': vol_data.get('source', 'none') if vol_data else 'none',
     })
+
+
+# ============================================
+# CHATBOT - Claude AI Fallback
+# ============================================
+CHATBOT_SYSTEM_PROMPT = """You are a helpful assistant for the KW Command Center, a YouTube keyword research and ranking tracker tool. Answer questions about how to use the app's features. Be concise and friendly. Use plain text (no markdown).
+
+The app has these tabs and features:
+
+1. **Smart Picks** (default tab) - AI-powered keyword recommendations. Click "Show Me the Best Keywords", filter by niche, sort by Best Overall/Highest Revenue/Easiest to Rank.
+
+2. **Research** tab has 3 sub-features:
+   - Seed Keyword Research: Enter a seed keyword + select niche, click "Research Keyword" to find related keywords
+   - Trending Topics Not Covered: Click "Discover Trending Gaps" to find rising Google Trends topics you haven't covered
+   - Channel Keyword Analysis: Enter a YouTube channel name/handle to analyze their keyword strategy. Can add keywords to your library.
+
+3. **Keyword Library** - Browse/manage all 20K+ keywords. Features:
+   - Filter by niche, tier (A/B/C/D), label (Interested/Maybe/Not Interested/Favorites), source
+   - Search box to find specific keywords
+   - Action buttons on each keyword: Star (favorite), checkmark (interested), X (not interested), ? (maybe), notes, comments, vote up/down
+   - "+ Add Keywords" button to add custom keywords
+   - "Collect Trends" to update Google Trends data
+   - "Export CSV" to download keywords
+
+4. **Domination Score** - Tracks your YouTube SERP positions for priority keywords.
+   - Click "Load Ranking Data" or "Refresh Domination Score"
+   - Import rankings from check_rankings.py script via "Import Results JSON"
+   - "Manage Keywords" opens the keyword manager to activate/deactivate priority keywords, set primary/secondary relationships, assign silos
+   - Domination formula: Position 1 = 50%, Pos 2 = 25%, Pos 3 = 15%, Pos 4&5 = 5% each
+   - Click any keyword row to see history chart
+
+5. **Content Planner** - Strategic video planning based on domination scores.
+   - Click "Load Content Plan" to see how many videos needed per keyword
+   - Priority levels: Critical (<75%), High (75-89%), Medium (90-99%), Maintain (100%)
+
+6. **Analytics** - Revenue model calibrated from actual data. Shows revenue by keyword type.
+
+7. **$3K Finder** - Find keywords most likely to earn $3,000/month each.
+   - Click "Analyze All Keywords"
+   - Filters: Top 10, Top 25, Realistic ($1K+), Rising Trends, Deals, Comparisons, Low Comp + High Rev
+
+8. **Universe Map** - See all possible keywords in your niches and find gaps.
+   - Click "Map the Universe" to see coverage per niche
+
+9. **Content Gap** - Compare your keyword coverage against YouTube competitors.
+   - Click "Discover Top Competitors" first, select competitors, then "Analyze Content Gaps"
+   - Views: Gaps (they rank, you don't), Overlap (both rank), Winning (you rank, they don't)
+
+General tips:
+- Silos/niches include: VPN, Home Security, Identity Theft, Pet Insurance, etc.
+- Primary keywords track your main ranking targets. Secondary keywords support them.
+- The "NEW" badge means a keyword has no audit data yet.
+- Data loads from Supabase on startup (takes about a minute).
+- Use the niche/silo dropdown to filter data across most tabs.
+
+If the question is completely unrelated to the app, politely say you can only help with the KW Command Center."""
+
+@app.route('/api/chatbot', methods=['POST'])
+@login_required
+def chatbot_ask():
+    """Claude AI chatbot fallback when FAQ can't answer."""
+    try:
+        data = request.get_json()
+        question = data.get('question', '').strip()
+        if not question:
+            return jsonify({'success': False, 'error': 'No question provided'}), 400
+
+        api_key = os.environ.get('ANTHROPIC_API_KEY')
+        if not api_key:
+            return jsonify({
+                'success': True,
+                'answer': "I'm sorry, the AI assistant isn't configured yet. Please check the FAQ suggestions or ask your admin to add the ANTHROPIC_API_KEY.",
+                'source': 'error'
+            })
+
+        client = anthropic.Anthropic(api_key=api_key)
+        message = client.messages.create(
+            model="claude-sonnet-4-5-20250929",
+            max_tokens=500,
+            system=CHATBOT_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": question}]
+        )
+
+        answer = message.content[0].text
+        return jsonify({'success': True, 'answer': answer, 'source': 'claude'})
+
+    except Exception as e:
+        print(f"[CHATBOT ERROR] {e}")
+        return jsonify({'success': True, 'answer': "Sorry, I'm having trouble right now. Try again in a moment!", 'source': 'error'})
 
 
 if __name__ == '__main__':

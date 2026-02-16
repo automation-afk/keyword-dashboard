@@ -1276,6 +1276,28 @@
                 </div>
             </div>
 
+            <!-- Trending Gaps Discovery -->
+            <div class="research-box" style="margin-top:20px;">
+                <h2>📈 Trending Topics Not Covered</h2>
+                <p style="color:#94a3b8;margin-bottom:16px;">
+                    Discover rising search topics from Google Trends that aren't in your keyword library yet. Uses your silo primary keywords as seeds.
+                </p>
+                <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;">
+                    <select id="trending-silo-filter" style="padding:8px 12px;background:#1e293b;border:1px solid #334155;border-radius:8px;color:#e2e8f0;font-size:0.9rem;">
+                        <option value="all">All Silos</option>
+                        <option value="id_theft">ID Theft</option>
+                        <option value="dog">Dog/Pet Tech</option>
+                        <option value="data_broker">Data Broker</option>
+                        <option value="parental_control">Parental Control</option>
+                    </select>
+                    <button class="research-btn" id="trending-btn" onclick="discoverTrendingGaps()" style="padding:10px 24px;">
+                        <span id="trending-btn-text">🔥 Discover Trending Gaps</span>
+                        <div class="spinner" id="trending-spinner" style="display:none;"></div>
+                    </button>
+                </div>
+                <div id="trending-results" style="margin-top:20px;"></div>
+            </div>
+
             <!-- Channel Keyword Analysis -->
             <div class="research-box" style="margin-top:20px;">
                 <h2>📺 Channel Keyword Analysis</h2>
@@ -2423,6 +2445,8 @@
                 });
 
                 const data = await response.json();
+                researchResultsRaw = data;
+                researchSortMode = 'score';
                 displayResearchResults(data);
             } catch (error) {
                 console.error('Research error:', error);
@@ -2437,6 +2461,8 @@
 
         // Store research results globally for add-to-library
         let researchResultsData = [];
+        let researchResultsRaw = null; // raw API response for re-rendering
+        let researchSortMode = 'score'; // default sort
 
         function displayResearchResults(data) {
             const container = document.getElementById('research-results');
@@ -2464,9 +2490,15 @@
                 keyword_type: kw.keyword_type || 'other'
             }));
 
-            let html = `<h3 style="margin-bottom:16px;">Found ${data.keywords.length} keywords for "${escapeHtml(data.seed_keyword)}"
+            let html = `<h3 style="margin-bottom:8px;">Found ${data.keywords.length} keywords for "${escapeHtml(data.seed_keyword)}"
                 <button class="add-to-library-btn" onclick="addAllResearchToLibrary()" style="margin-left:12px;padding:6px 14px;font-size:0.8rem;">+ Add All to Library</button>
-            </h3>`;
+            </h3>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px;">
+                <button class="opp-filter-btn research-sort-btn ${researchSortMode === 'score' ? 'active' : ''}" onclick="sortResearchResults('score', this)">Best Score</button>
+                <button class="opp-filter-btn research-sort-btn ${researchSortMode === 'lowcomp' ? 'active' : ''}" onclick="sortResearchResults('lowcomp', this)" style="background:rgba(74,222,128,0.15);border-color:rgba(74,222,128,0.3);">High Vol / Low Comp</button>
+                <button class="opp-filter-btn research-sort-btn ${researchSortMode === 'volume' ? 'active' : ''}" onclick="sortResearchResults('volume', this)">Highest Volume</button>
+                <button class="opp-filter-btn research-sort-btn ${researchSortMode === 'revenue' ? 'active' : ''}" onclick="sortResearchResults('revenue', this)">Highest Revenue</button>
+            </div>`;
 
             if (data.errors && data.errors.length > 0) {
                 html += `<div style="background:rgba(239,68,68,0.1);padding:12px;border-radius:8px;margin-bottom:16px;color:#f87171;">
@@ -2527,10 +2559,160 @@
                                 <div class="metric-value">${kw.priority_score ? kw.priority_score.toFixed(0) : '0'}</div>
                                 <div class="metric-label">Priority Score</div>
                             </div>
+                            <div class="metric">
+                                <div class="metric-value" style="color:${(kw.competition || 0) < 0.3 ? '#4ade80' : (kw.competition || 0) < 0.6 ? '#fbbf24' : '#f87171'};">${kw.competition ? (kw.competition <= 1 ? (kw.competition * 100).toFixed(0) + '%' : kw.competition) : 'N/A'}</div>
+                                <div class="metric-label">Competition</div>
+                            </div>
                         </div>
                     </div>
                 `;
             });
+
+            container.innerHTML = html;
+        }
+
+        function sortResearchResults(mode, btnEl) {
+            if (!researchResultsRaw) return;
+            researchSortMode = mode;
+            document.querySelectorAll('.research-sort-btn').forEach(b => b.classList.remove('active'));
+            if (btnEl) btnEl.classList.add('active');
+
+            const sorted = {...researchResultsRaw};
+            sorted.keywords = [...researchResultsRaw.keywords];
+
+            switch (mode) {
+                case 'lowcomp':
+                    // High volume + low competition combo score
+                    sorted.keywords.sort((a, b) => {
+                        const aComp = parseFloat(a.competition) || 0;
+                        const bComp = parseFloat(b.competition) || 0;
+                        const aVol = parseInt(a.volume) || 0;
+                        const bVol = parseInt(b.volume) || 0;
+                        // Score: volume * (1 - competition). Higher = better
+                        const aScore = aVol * (1 - aComp);
+                        const bScore = bVol * (1 - bComp);
+                        return bScore - aScore;
+                    });
+                    break;
+                case 'volume':
+                    sorted.keywords.sort((a, b) => (parseInt(b.volume) || 0) - (parseInt(a.volume) || 0));
+                    break;
+                case 'revenue':
+                    sorted.keywords.sort((a, b) => (parseFloat(b.revenue_potential) || 0) - (parseFloat(a.revenue_potential) || 0));
+                    break;
+                case 'score':
+                default:
+                    sorted.keywords.sort((a, b) => (parseFloat(b.priority_score) || 0) - (parseFloat(a.priority_score) || 0));
+                    break;
+            }
+            displayResearchResults(sorted);
+        }
+
+        // ============================================
+        // TRENDING GAPS DISCOVERY
+        // ============================================
+        async function discoverTrendingGaps() {
+            const silo = document.getElementById('trending-silo-filter').value;
+            const btn = document.getElementById('trending-btn');
+            const btnText = document.getElementById('trending-btn-text');
+            const spinner = document.getElementById('trending-spinner');
+            const container = document.getElementById('trending-results');
+
+            btn.disabled = true;
+            btnText.textContent = 'Scanning Google Trends...';
+            spinner.style.display = 'inline-block';
+            container.innerHTML = '<div style="text-align:center;padding:30px;color:#94a3b8;">Querying Google Trends for rising topics across your silos... This takes 15-30 seconds.</div>';
+
+            try {
+                const response = await fetch(`/api/trending-gaps?silo=${silo}`);
+                const data = await response.json();
+
+                if (!data.success) {
+                    container.innerHTML = `<div style="color:#f87171;padding:20px;">Error: ${data.error}</div>`;
+                    return;
+                }
+
+                renderTrendingGaps(data);
+            } catch (error) {
+                container.innerHTML = `<div style="color:#f87171;padding:20px;">Error: ${error.message}</div>`;
+            } finally {
+                btn.disabled = false;
+                btnText.textContent = '🔥 Discover Trending Gaps';
+                spinner.style.display = 'none';
+            }
+        }
+
+        function renderTrendingGaps(data) {
+            const container = document.getElementById('trending-results');
+
+            let html = `<div style="display:grid;grid-template-columns:repeat(auto-fit, minmax(140px, 1fr));gap:12px;margin-bottom:20px;">
+                <div style="background:rgba(74,222,128,0.1);padding:12px;border-radius:8px;text-align:center;">
+                    <div style="font-size:1.5rem;font-weight:bold;color:#4ade80;">${data.gap_count}</div>
+                    <div style="font-size:0.8rem;color:#94a3b8;">Not Covered</div>
+                </div>
+                <div style="background:rgba(96,165,250,0.1);padding:12px;border-radius:8px;text-align:center;">
+                    <div style="font-size:1.5rem;font-weight:bold;color:#60a5fa;">${data.covered_count}</div>
+                    <div style="font-size:0.8rem;color:#94a3b8;">Already Covered</div>
+                </div>
+                <div style="background:rgba(251,191,36,0.1);padding:12px;border-radius:8px;text-align:center;">
+                    <div style="font-size:1.5rem;font-weight:bold;color:#fbbf24;">${data.total_trending}</div>
+                    <div style="font-size:0.8rem;color:#94a3b8;">Total Trending</div>
+                </div>
+                <div style="background:rgba(168,85,247,0.1);padding:12px;border-radius:8px;text-align:center;">
+                    <div style="font-size:1.5rem;font-weight:bold;color:#a855f7;">${data.seeds_queried}</div>
+                    <div style="font-size:0.8rem;color:#94a3b8;">Seeds Queried</div>
+                </div>
+            </div>`;
+
+            if (data.errors && data.errors.length > 0) {
+                html += `<div style="background:rgba(239,68,68,0.1);padding:10px;border-radius:8px;margin-bottom:16px;color:#f87171;font-size:0.85rem;">
+                    <strong>Some seeds had issues:</strong> ${data.errors.slice(0, 3).join('; ')}${data.errors.length > 3 ? ` (+${data.errors.length - 3} more)` : ''}
+                </div>`;
+            }
+
+            if (data.gaps.length === 0) {
+                html += '<div style="text-align:center;padding:30px;color:#94a3b8;">No trending gaps found — you\'re covering all the trending topics!</div>';
+                container.innerHTML = html;
+                return;
+            }
+
+            html += `<h3 style="margin-bottom:12px;color:#4ade80;">Trending Topics You're Not Covering</h3>`;
+            html += `<div style="display:grid;grid-template-columns:repeat(auto-fit, minmax(320px, 1fr));gap:12px;">`;
+
+            data.gaps.forEach(gap => {
+                const isBreakout = String(gap.trend_value).toLowerCase() === 'breakout';
+                const isRising = gap.trend_type === 'rising';
+                const trendBadge = isBreakout
+                    ? '<span style="background:#ef4444;color:white;padding:2px 8px;border-radius:4px;font-size:0.7rem;font-weight:bold;">BREAKOUT</span>'
+                    : isRising
+                        ? `<span style="background:rgba(74,222,128,0.2);color:#4ade80;padding:2px 8px;border-radius:4px;font-size:0.7rem;">Rising +${gap.trend_value}%</span>`
+                        : `<span style="background:rgba(96,165,250,0.2);color:#60a5fa;padding:2px 8px;border-radius:4px;font-size:0.7rem;">Top</span>`;
+
+                const siloLabel = gap.silo.replace(/_/g, ' ');
+                html += `
+                    <div style="background:#1e293b;border:1px solid #334155;border-radius:10px;padding:14px;display:flex;flex-direction:column;gap:8px;">
+                        <div style="display:flex;justify-content:space-between;align-items:center;">
+                            <span style="font-weight:600;color:#e2e8f0;font-size:0.95rem;">${escapeHtml(gap.keyword)}</span>
+                            ${trendBadge}
+                        </div>
+                        <div style="display:flex;gap:8px;align-items:center;font-size:0.8rem;color:#94a3b8;">
+                            <span style="background:rgba(168,85,247,0.15);color:#a855f7;padding:2px 8px;border-radius:4px;">${siloLabel}</span>
+                            <span>from: ${escapeHtml(gap.seed_keyword)}</span>
+                        </div>
+                    </div>`;
+            });
+
+            html += '</div>';
+
+            // Show covered keywords (collapsed)
+            if (data.covered.length > 0) {
+                html += `<details style="margin-top:20px;"><summary style="cursor:pointer;color:#60a5fa;font-size:0.9rem;">Already covered (${data.covered.length} keywords)</summary>
+                    <div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:12px;">`;
+                data.covered.forEach(c => {
+                    html += `<span style="background:rgba(96,165,250,0.1);color:#60a5fa;padding:4px 10px;border-radius:6px;font-size:0.8rem;">${escapeHtml(c.keyword)}</span>`;
+                });
+                html += '</div></details>';
+            }
 
             container.innerHTML = html;
         }
@@ -6971,5 +7153,344 @@
         loadDominationData();
         checkDataFreshness();
     </script>
+
+<!-- ============================================ -->
+<!-- CHATBOT WIDGET - FAQ + Claude AI Fallback    -->
+<!-- ============================================ -->
+<style>
+    #chatbot-bubble {
+        position: fixed;
+        bottom: 24px;
+        right: 24px;
+        width: 56px;
+        height: 56px;
+        border-radius: 50%;
+        background: linear-gradient(135deg, #6366f1, #a855f7);
+        color: white;
+        border: none;
+        cursor: pointer;
+        box-shadow: 0 4px 20px rgba(99, 102, 241, 0.4);
+        z-index: 10010;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 24px;
+        transition: transform 0.2s, box-shadow 0.2s;
+    }
+    #chatbot-bubble:hover {
+        transform: scale(1.1);
+        box-shadow: 0 6px 28px rgba(99, 102, 241, 0.6);
+    }
+    #chatbot-panel {
+        position: fixed;
+        bottom: 92px;
+        right: 24px;
+        width: 380px;
+        max-height: 520px;
+        background: #1e1b4b;
+        border: 1px solid rgba(99, 102, 241, 0.3);
+        border-radius: 16px;
+        box-shadow: 0 8px 40px rgba(0,0,0,0.5);
+        z-index: 10010;
+        display: none;
+        flex-direction: column;
+        overflow: hidden;
+        font-family: 'Inter', sans-serif;
+    }
+    #chatbot-panel.open { display: flex; }
+
+    #chatbot-header {
+        background: linear-gradient(135deg, #6366f1, #7c3aed);
+        padding: 16px 18px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        flex-shrink: 0;
+    }
+    #chatbot-header h3 {
+        margin: 0;
+        font-size: 15px;
+        font-weight: 600;
+        color: #fff;
+    }
+    #chatbot-header span {
+        font-size: 12px;
+        color: rgba(255,255,255,0.7);
+    }
+    #chatbot-close {
+        background: none;
+        border: none;
+        color: rgba(255,255,255,0.7);
+        font-size: 20px;
+        cursor: pointer;
+        padding: 0 4px;
+    }
+    #chatbot-close:hover { color: #fff; }
+
+    #chatbot-messages {
+        flex: 1;
+        overflow-y: auto;
+        padding: 16px;
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+        min-height: 200px;
+        max-height: 320px;
+    }
+    .chat-msg {
+        max-width: 88%;
+        padding: 10px 14px;
+        border-radius: 12px;
+        font-size: 13px;
+        line-height: 1.6;
+        word-wrap: break-word;
+    }
+    .chat-msg p {
+        margin: 0 0 8px 0;
+    }
+    .chat-msg p:last-child {
+        margin-bottom: 0;
+    }
+    .chat-msg strong {
+        color: #c7d2fe;
+        font-weight: 600;
+    }
+    .chat-msg.user strong {
+        color: #fff;
+    }
+    .chat-list-num {
+        color: #a78bfa;
+        font-weight: 700;
+        margin-right: 2px;
+    }
+    .chat-bullet {
+        color: #a78bfa;
+        margin-right: 4px;
+    }
+    .chat-msg.bot {
+        background: rgba(99, 102, 241, 0.15);
+        color: #e0e7ff;
+        align-self: flex-start;
+        border-bottom-left-radius: 4px;
+    }
+    .chat-msg.user {
+        background: linear-gradient(135deg, #6366f1, #7c3aed);
+        color: #fff;
+        align-self: flex-end;
+        border-bottom-right-radius: 4px;
+    }
+
+    .chat-suggestions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+        padding: 0 16px 12px;
+        flex-shrink: 0;
+    }
+    .chat-suggestion-btn {
+        background: rgba(99, 102, 241, 0.12);
+        border: 1px solid rgba(99, 102, 241, 0.25);
+        color: #a5b4fc;
+        padding: 6px 12px;
+        border-radius: 20px;
+        font-size: 12px;
+        cursor: pointer;
+        transition: all 0.2s;
+    }
+    .chat-suggestion-btn:hover {
+        background: rgba(99, 102, 241, 0.25);
+        color: #c7d2fe;
+    }
+
+    #chatbot-input-area {
+        display: flex;
+        padding: 12px;
+        border-top: 1px solid rgba(99, 102, 241, 0.15);
+        gap: 8px;
+        flex-shrink: 0;
+    }
+    #chatbot-input {
+        flex: 1;
+        background: rgba(15, 23, 42, 0.6);
+        border: 1px solid rgba(99, 102, 241, 0.2);
+        border-radius: 10px;
+        padding: 10px 14px;
+        color: #e0e7ff;
+        font-size: 13px;
+        outline: none;
+        font-family: 'Inter', sans-serif;
+    }
+    #chatbot-input::placeholder { color: rgba(148, 163, 184, 0.5); }
+    #chatbot-input:focus { border-color: rgba(99, 102, 241, 0.5); }
+    #chatbot-send {
+        background: linear-gradient(135deg, #6366f1, #7c3aed);
+        border: none;
+        color: white;
+        width: 40px;
+        height: 40px;
+        border-radius: 10px;
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 16px;
+        flex-shrink: 0;
+        transition: opacity 0.2s;
+    }
+    #chatbot-send:hover { opacity: 0.85; }
+    #chatbot-send:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    .chat-typing {
+        display: flex;
+        gap: 4px;
+        padding: 10px 14px;
+        align-self: flex-start;
+    }
+    .chat-typing span {
+        width: 8px;
+        height: 8px;
+        background: rgba(99, 102, 241, 0.5);
+        border-radius: 50%;
+        animation: chatTyping 1.2s ease-in-out infinite;
+    }
+    .chat-typing span:nth-child(2) { animation-delay: 0.2s; }
+    .chat-typing span:nth-child(3) { animation-delay: 0.4s; }
+    @keyframes chatTyping {
+        0%, 60%, 100% { transform: translateY(0); opacity: 0.4; }
+        30% { transform: translateY(-6px); opacity: 1; }
+    }
+</style>
+
+<button id="chatbot-bubble" onclick="toggleChatbot()" title="Need help?">?</button>
+
+<div id="chatbot-panel">
+    <div id="chatbot-header">
+        <div>
+            <h3>AI Help Assistant</h3>
+            <span>Powered by Claude AI</span>
+        </div>
+        <button id="chatbot-close" onclick="toggleChatbot()">&times;</button>
+    </div>
+    <div id="chatbot-messages">
+        <div class="chat-msg bot">Hi! I can help you find things and use features in the KW Command Center. Ask me anything or pick a topic below!</div>
+    </div>
+    <div class="chat-suggestions" id="chatbot-suggestions">
+        <button class="chat-suggestion-btn" onclick="askSuggestion(this)">How do I add keywords?</button>
+        <button class="chat-suggestion-btn" onclick="askSuggestion(this)">What is Domination Score?</button>
+        <button class="chat-suggestion-btn" onclick="askSuggestion(this)">How to find trending topics?</button>
+        <button class="chat-suggestion-btn" onclick="askSuggestion(this)">How to analyze competitors?</button>
+    </div>
+    <div id="chatbot-input-area">
+        <input type="text" id="chatbot-input" placeholder="Type your question..." onkeydown="if(event.key==='Enter')sendChatMessage()">
+        <button id="chatbot-send" onclick="sendChatMessage()">&#10148;</button>
+    </div>
+</div>
+
+<script>
+// ============================================
+// FAQ Knowledge Base
+// ============================================
+// ============================================
+// Chatbot Logic - Powered by Claude AI
+// ============================================
+let chatbotOpen = false;
+
+function toggleChatbot() {
+    chatbotOpen = !chatbotOpen;
+    document.getElementById('chatbot-panel').classList.toggle('open', chatbotOpen);
+    if (chatbotOpen) {
+        document.getElementById('chatbot-input').focus();
+    }
+}
+
+function askSuggestion(btn) {
+    const text = btn.textContent;
+    document.getElementById('chatbot-input').value = text;
+    sendChatMessage();
+}
+
+function formatBotMessage(text) {
+    // Escape HTML first
+    let html = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    // Bold text: **text** or *text*
+    html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+    html = html.replace(/\*(.+?)\*/g, '<strong>$1</strong>');
+    // Numbered lists: lines starting with 1. 2. etc
+    html = html.replace(/^(\d+)\.\s+/gm, '<span class="chat-list-num">$1.</span> ');
+    // Bullet points: lines starting with - or •
+    html = html.replace(/^[-•]\s+/gm, '<span class="chat-bullet">&#8226;</span> ');
+    // Double newlines = paragraph break, single newline = line break
+    html = html.replace(/\n\n/g, '</p><p>');
+    html = html.replace(/\n/g, '<br>');
+    html = '<p>' + html + '</p>';
+    return html;
+}
+
+function addChatMessage(text, type) {
+    const messages = document.getElementById('chatbot-messages');
+    const div = document.createElement('div');
+    div.className = `chat-msg ${type}`;
+    div.innerHTML = type === 'bot' ? formatBotMessage(text) : text;
+    messages.appendChild(div);
+    messages.scrollTop = messages.scrollHeight;
+}
+
+function showTyping() {
+    const messages = document.getElementById('chatbot-messages');
+    const div = document.createElement('div');
+    div.className = 'chat-typing';
+    div.id = 'chatbot-typing';
+    div.innerHTML = '<span></span><span></span><span></span>';
+    messages.appendChild(div);
+    messages.scrollTop = messages.scrollHeight;
+}
+
+function hideTyping() {
+    const el = document.getElementById('chatbot-typing');
+    if (el) el.remove();
+}
+
+async function sendChatMessage() {
+    const input = document.getElementById('chatbot-input');
+    const sendBtn = document.getElementById('chatbot-send');
+    const question = input.value.trim();
+    if (!question) return;
+
+    // Show user message
+    addChatMessage(question, 'user');
+    input.value = '';
+
+    // Hide suggestions after first message
+    document.getElementById('chatbot-suggestions').style.display = 'none';
+
+    // Send to Claude AI
+    sendBtn.disabled = true;
+    input.disabled = true;
+    showTyping();
+
+    try {
+        const resp = await fetch('/api/chatbot', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({question})
+        });
+        const data = await resp.json();
+        hideTyping();
+
+        if (data.success) {
+            addChatMessage(data.answer, 'bot');
+        } else {
+            addChatMessage("Sorry, something went wrong. Please try again.", 'bot');
+        }
+    } catch (err) {
+        hideTyping();
+        addChatMessage("Sorry, I couldn't reach the server. Please try again.", 'bot');
+    } finally {
+        sendBtn.disabled = false;
+        input.disabled = false;
+        input.focus();
+    }
+}
+</script>
 </body>
 </html>
