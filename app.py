@@ -2,7 +2,11 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from flask import Flask, render_template, jsonify, request, Response, redirect, url_for, session
-import anthropic
+try:
+    import anthropic
+except ImportError:
+    anthropic = None
+    print("[WARN] anthropic package not installed - chatbot AI will be unavailable")
 import csv
 import json
 import os
@@ -9000,6 +9004,13 @@ def chatbot_ask():
         question = data.get('question', '').strip()
         if not question:
             return jsonify({'success': False, 'error': 'No question provided'}), 400
+
+        if not anthropic:
+            return jsonify({
+                'success': True,
+                'answer': "The AI assistant package isn't installed. Please contact your admin.",
+                'source': 'error'
+            })
 
         api_key = os.environ.get('ANTHROPIC_API_KEY')
         if not api_key:
