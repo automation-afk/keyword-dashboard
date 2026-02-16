@@ -389,7 +389,7 @@ def supabase_rest_insert(table, rows, upsert=False):
 
 def get_db():
     """Get a Postgres database connection.
-    Tries: parsed direct URL → raw direct URL → pooler URL."""
+    Tries: pooler URL first (works on Railway/serverless) → direct URL fallback."""
     global _last_db_error, _db_unreachable_since
     from urllib.parse import urlparse, unquote
 
@@ -399,7 +399,26 @@ def get_db():
 
     errors = []
 
-    # Attempt 1: Parse and connect to direct URL
+    # Attempt 1: Connection pooler URL (most reliable on Railway/serverless)
+    if DATABASE_POOLER_URL:
+        try:
+            parsed = urlparse(DATABASE_POOLER_URL)
+            conn = psycopg2.connect(
+                host=parsed.hostname,
+                port=parsed.port or 5432,
+                dbname=parsed.path.lstrip('/') or 'postgres',
+                user=unquote(parsed.username or 'postgres'),
+                password=unquote(parsed.password or ''),
+                connect_timeout=5
+            )
+            conn.autocommit = False
+            _last_db_error = None
+            _db_unreachable_since = None
+            return conn
+        except Exception as e1:
+            errors.append(f"pooler: {e1}")
+
+    # Attempt 2: Parse and connect to direct URL
     try:
         parsed = urlparse(DATABASE_URL)
         conn = psycopg2.connect(
@@ -414,37 +433,18 @@ def get_db():
         _last_db_error = None
         _db_unreachable_since = None
         return conn
-    except Exception as e1:
-        errors.append(f"direct(parsed): {e1}")
+    except Exception as e2:
+        errors.append(f"direct(parsed): {e2}")
 
-    # Attempt 2: Raw direct URL
+    # Attempt 3: Raw direct URL
     try:
         conn = psycopg2.connect(DATABASE_URL, connect_timeout=5)
         conn.autocommit = False
         _last_db_error = None
         _db_unreachable_since = None
         return conn
-    except Exception as e2:
-        errors.append(f"direct(raw): {e2}")
-
-    # Attempt 3: Connection pooler URL (pgBouncer port 6543)
-    if DATABASE_POOLER_URL:
-        try:
-            parsed = urlparse(DATABASE_POOLER_URL)
-            conn = psycopg2.connect(
-                host=parsed.hostname,
-                port=parsed.port or 6543,
-                dbname=parsed.path.lstrip('/') or 'postgres',
-                user=unquote(parsed.username or 'postgres'),
-                password=unquote(parsed.password or ''),
-                connect_timeout=5
-            )
-            conn.autocommit = False
-            _last_db_error = None
-            _db_unreachable_since = None
-            return conn
-        except Exception as e3:
-            errors.append(f"pooler: {e3}")
+    except Exception as e3:
+        errors.append(f"direct(raw): {e3}")
 
     # All attempts failed
     _last_db_error = '; '.join(errors)
