@@ -6860,10 +6860,9 @@
         function populateCgSiloFilter() {
             const select = document.getElementById('cg-silo-filter');
             const totalComps = cgCompetitors.length;
-            select.innerHTML = `<option value="">All Silos (${totalComps})</option>`;
-            // Use BigQuery silo names directly, show gap keyword count
-            // Sort by gap count descending so highest-opportunity silos are first
             const sorted = Object.entries(cgSiloCounts).sort((a, b) => b[1].gaps - a[1].gaps);
+            const totalGaps = sorted.reduce((sum, [, d]) => sum + d.gaps, 0);
+            select.innerHTML = `<option value="">All Silos — ${totalGaps} gaps, ${totalComps} comps</option>`;
             sorted.forEach(([s, data]) => {
                 const label = s.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
                 select.innerHTML += `<option value="${s}">${label} — ${data.gaps} gaps, ${data.competitors} comps</option>`;
