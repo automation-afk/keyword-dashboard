@@ -8670,10 +8670,9 @@ def content_gap_competitors():
             SELECT
                 cr.Silo,
                 COUNT(DISTINCT cr.Channel_title) as competitor_count,
-                COUNT(DISTINCT cr.kw) as gap_keyword_count
+                COUNT(DISTINCT CASE WHEN dk.kw IS NULL THEN cr.kw END) as gap_keyword_count
             FROM competitor_rows cr
             LEFT JOIN digidom_keywords dk ON cr.kw = dk.kw
-            WHERE dk.kw IS NULL
             GROUP BY cr.Silo
             ORDER BY gap_keyword_count DESC
             """
