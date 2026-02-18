@@ -1493,6 +1493,89 @@
                 </div>
             </div>
 
+            <!-- Advanced Filter Bar -->
+            <div id="advanced-filter-bar" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:8px 16px;background:rgba(15,23,42,0.5);border:1px solid #1e293b;border-radius:8px;margin-bottom:12px;min-height:36px;">
+                <span id="filter-pills" style="display:flex;gap:6px;flex-wrap:wrap;"></span>
+                <span id="no-filters-text" style="color:#475569;font-size:0.75rem;">No advanced filters</span>
+                <button id="add-filter-btn" onclick="openFilterDropdown()" style="margin-left:auto;background:#3b82f6;color:white;border:none;padding:5px 12px;border-radius:6px;cursor:pointer;font-size:0.75rem;font-weight:600;white-space:nowrap;">+ Add Filter</button>
+            </div>
+
+            <!-- Filter Dropdown Panel -->
+            <div id="filter-dropdown" style="display:none;position:relative;z-index:100;">
+                <div style="background:#1e293b;border:1px solid #334155;border-radius:10px;padding:16px;margin-bottom:12px;box-shadow:0 8px 24px rgba(0,0,0,0.4);">
+                    <div style="display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap;">
+                        <!-- Include/Exclude -->
+                        <div style="display:flex;flex-direction:column;gap:4px;">
+                            <label style="color:#94a3b8;font-size:0.65rem;text-transform:uppercase;letter-spacing:0.5px;">Mode</label>
+                            <select id="filter-mode" style="background:#0f172a;color:#f1f5f9;border:1px solid #334155;border-radius:6px;padding:6px 8px;font-size:0.8rem;min-width:90px;">
+                                <option value="include">Include</option>
+                                <option value="exclude">Exclude</option>
+                            </select>
+                        </div>
+                        <!-- Category -->
+                        <div style="display:flex;flex-direction:column;gap:4px;">
+                            <label style="color:#94a3b8;font-size:0.65rem;text-transform:uppercase;letter-spacing:0.5px;">Category</label>
+                            <select id="filter-category" onchange="onFilterCategoryChange()" style="background:#0f172a;color:#f1f5f9;border:1px solid #334155;border-radius:6px;padding:6px 8px;font-size:0.8rem;min-width:140px;">
+                                <option value="">Select...</option>
+                                <optgroup label="Trend &amp; Season">
+                                    <option value="trend">Trend</option>
+                                    <option value="season">Season</option>
+                                    <option value="seasonalityScore">Seasonality Score</option>
+                                </optgroup>
+                                <optgroup label="Performance">
+                                    <option value="volume">Volume</option>
+                                    <option value="revenue">Revenue</option>
+                                    <option value="priority">Priority Score</option>
+                                    <option value="buyingIntent">Buying Intent</option>
+                                </optgroup>
+                                <optgroup label="Classification">
+                                    <option value="niche">Niche</option>
+                                    <option value="tier">Tier</option>
+                                    <option value="conversionLikelihood">Conversion</option>
+                                    <option value="competition">Competition</option>
+                                    <option value="contentAngle">Content Angle</option>
+                                </optgroup>
+                                <optgroup label="YouTube">
+                                    <option value="ytViews">YT Views</option>
+                                    <option value="ytPattern">YT Pattern</option>
+                                </optgroup>
+                                <optgroup label="Status">
+                                    <option value="label">Label</option>
+                                    <option value="source">Source</option>
+                                    <option value="voteScore">Votes</option>
+                                </optgroup>
+                            </select>
+                        </div>
+                        <!-- Operator -->
+                        <div style="display:flex;flex-direction:column;gap:4px;">
+                            <label style="color:#94a3b8;font-size:0.65rem;text-transform:uppercase;letter-spacing:0.5px;">Operator</label>
+                            <select id="filter-operator" style="background:#0f172a;color:#f1f5f9;border:1px solid #334155;border-radius:6px;padding:6px 8px;font-size:0.8rem;min-width:120px;">
+                                <option value="equals">Equals</option>
+                            </select>
+                        </div>
+                        <!-- Value -->
+                        <div style="display:flex;flex-direction:column;gap:4px;">
+                            <label style="color:#94a3b8;font-size:0.65rem;text-transform:uppercase;letter-spacing:0.5px;">Value</label>
+                            <div id="filter-value-container">
+                                <input type="text" id="filter-value-text" placeholder="Value..." style="background:#0f172a;color:#f1f5f9;border:1px solid #334155;border-radius:6px;padding:6px 8px;font-size:0.8rem;min-width:120px;">
+                                <select id="filter-value-select" style="display:none;background:#0f172a;color:#f1f5f9;border:1px solid #334155;border-radius:6px;padding:6px 8px;font-size:0.8rem;min-width:120px;"></select>
+                                <input type="number" id="filter-value-number" placeholder="0" style="display:none;background:#0f172a;color:#f1f5f9;border:1px solid #334155;border-radius:6px;padding:6px 8px;font-size:0.8rem;width:80px;">
+                                <div id="filter-value-between" style="display:none;gap:6px;align-items:center;">
+                                    <input type="number" id="filter-value-min" placeholder="Min" style="background:#0f172a;color:#f1f5f9;border:1px solid #334155;border-radius:6px;padding:6px 8px;font-size:0.8rem;width:70px;">
+                                    <span style="color:#64748b;">—</span>
+                                    <input type="number" id="filter-value-max" placeholder="Max" style="background:#0f172a;color:#f1f5f9;border:1px solid #334155;border-radius:6px;padding:6px 8px;font-size:0.8rem;width:70px;">
+                                </div>
+                            </div>
+                        </div>
+                        <!-- Buttons -->
+                        <div style="display:flex;gap:6px;align-items:flex-end;">
+                            <button onclick="applyAdvancedFilter()" style="background:#10b981;color:white;border:none;padding:6px 14px;border-radius:6px;cursor:pointer;font-size:0.8rem;font-weight:600;">Apply</button>
+                            <button onclick="closeFilterDropdown()" style="background:#334155;color:#94a3b8;border:none;padding:6px 14px;border-radius:6px;cursor:pointer;font-size:0.8rem;">Cancel</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
             <div class="table-container">
                 <div class="table-header" style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
                     <h2 style="margin:0;">Keyword Library</h2>
@@ -2413,6 +2496,224 @@
         let sortColumn = 'priority';
         let sortDirection = 'desc';
         let currentNotesKeyword = '';
+        let advancedFilters = []; // [{id, mode, category, operator, value, label}]
+        let filterIdCounter = 0;
+
+        // ============================================
+        // ADVANCED FILTER CATEGORIES
+        // ============================================
+        const FILTER_CATEGORIES = {
+            trend:               { label: 'Trend',             type: 'enum',   field: 'trend',               values: ['rising','stable','declining','unknown'] },
+            season:              { label: 'Season',            type: 'enum',   field: '_season',             values: ['Publish NOW','Peak NOW','Evergreen','Pending'] },
+            seasonalityScore:    { label: 'Seasonality Score', type: 'number', field: 'seasonalityScore' },
+            volume:              { label: 'Volume',            type: 'number', field: 'volume' },
+            revenue:             { label: 'Revenue',           type: 'number', field: 'revenue' },
+            priority:            { label: 'Priority Score',    type: 'number', field: 'priority' },
+            buyingIntent:        { label: 'Buying Intent',     type: 'number', field: 'buyingIntent' },
+            niche:               { label: 'Niche',             type: 'enum',   field: 'niche',               values: 'dynamic' },
+            tier:                { label: 'Tier',              type: 'enum',   field: 'tier',                values: 'dynamic' },
+            conversionLikelihood:{ label: 'Conversion',        type: 'enum',   field: 'conversionLikelihood', values: 'dynamic' },
+            competition:         { label: 'Competition',       type: 'enum',   field: 'competition',         values: 'dynamic' },
+            contentAngle:        { label: 'Content Angle',     type: 'enum',   field: 'contentAngle',        values: 'dynamic' },
+            ytViews:             { label: 'YT Views',          type: 'number', field: 'ytViews' },
+            ytPattern:           { label: 'YT Pattern',        type: 'enum',   field: 'ytPattern',           values: 'dynamic' },
+            label:               { label: 'Label',             type: 'enum',   field: 'label',               values: ['none','interested','maybe','not_interested','researching'] },
+            source:              { label: 'Source',             type: 'enum',   field: 'source',              values: 'dynamic' },
+            voteScore:           { label: 'Votes',             type: 'number', field: 'voteScore' },
+        };
+
+        function getSeasonStatus(d) {
+            const score = d.seasonalityScore || 0;
+            const peakMonths = d.peakMonths || '';
+            const publishWindow = d.publishWindow || '';
+            const trend = d.trend || 'unknown';
+            if (trend === 'unknown' && !peakMonths && score === 0) return 'Pending';
+            if (!peakMonths && score === 0) return 'Evergreen';
+            if (score <= 30) return 'Evergreen';
+            const monthNames = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+            const currentMonth = monthNames[new Date().getMonth()];
+            const windowMonths = publishWindow ? publishWindow.split('-') : [];
+            const peakList = peakMonths ? peakMonths.split(',') : [];
+            if (windowMonths.includes(currentMonth)) return 'Publish NOW';
+            if (peakList.includes(currentMonth)) return 'Peak NOW';
+            return 'Seasonal';
+        }
+
+        function getDynamicValues(field) {
+            const vals = new Set();
+            allData.forEach(d => {
+                let v;
+                if (field === '_season') v = getSeasonStatus(d);
+                else v = d[field];
+                if (v !== undefined && v !== null && v !== '') vals.add(String(v));
+            });
+            return [...vals].sort();
+        }
+
+        function openFilterDropdown() {
+            document.getElementById('filter-dropdown').style.display = 'block';
+            document.getElementById('filter-category').value = '';
+            document.getElementById('filter-mode').value = 'include';
+            onFilterCategoryChange();
+        }
+
+        function closeFilterDropdown() {
+            document.getElementById('filter-dropdown').style.display = 'none';
+        }
+
+        function onFilterCategoryChange() {
+            const catKey = document.getElementById('filter-category').value;
+            const opSelect = document.getElementById('filter-operator');
+            const valText = document.getElementById('filter-value-text');
+            const valSelect = document.getElementById('filter-value-select');
+            const valNumber = document.getElementById('filter-value-number');
+            const valBetween = document.getElementById('filter-value-between');
+
+            // Hide all value inputs
+            valText.style.display = 'none';
+            valSelect.style.display = 'none';
+            valNumber.style.display = 'none';
+            valBetween.style.display = 'none';
+
+            if (!catKey) {
+                opSelect.innerHTML = '<option value="equals">Equals</option>';
+                valText.style.display = '';
+                return;
+            }
+
+            const cat = FILTER_CATEGORIES[catKey];
+            if (cat.type === 'enum') {
+                opSelect.innerHTML = '<option value="equals">Equals</option><option value="not_equals">Not Equals</option><option value="contains">Contains</option>';
+                valSelect.style.display = '';
+                valSelect.innerHTML = '';
+                let values = cat.values === 'dynamic' ? getDynamicValues(cat.field) : cat.values;
+                values.forEach(v => {
+                    const opt = document.createElement('option');
+                    opt.value = v;
+                    opt.textContent = v;
+                    valSelect.appendChild(opt);
+                });
+            } else if (cat.type === 'number') {
+                opSelect.innerHTML = '<option value="equals">Equals</option><option value="gt">Greater Than</option><option value="lt">Less Than</option><option value="gte">Greater or Equal</option><option value="lte">Less or Equal</option><option value="between">Between</option>';
+                valNumber.style.display = '';
+                opSelect.onchange = function() {
+                    if (this.value === 'between') {
+                        valNumber.style.display = 'none';
+                        valBetween.style.display = 'flex';
+                    } else {
+                        valNumber.style.display = '';
+                        valBetween.style.display = 'none';
+                    }
+                };
+            } else {
+                opSelect.innerHTML = '<option value="equals">Equals</option><option value="not_equals">Not Equals</option><option value="contains">Contains</option>';
+                valText.style.display = '';
+            }
+        }
+
+        function applyAdvancedFilter() {
+            const catKey = document.getElementById('filter-category').value;
+            if (!catKey) return;
+            const cat = FILTER_CATEGORIES[catKey];
+            const mode = document.getElementById('filter-mode').value;
+            const operator = document.getElementById('filter-operator').value;
+
+            let value;
+            if (cat.type === 'enum') {
+                value = document.getElementById('filter-value-select').value;
+            } else if (cat.type === 'number') {
+                if (operator === 'between') {
+                    const min = document.getElementById('filter-value-min').value;
+                    const max = document.getElementById('filter-value-max').value;
+                    value = { min: parseFloat(min) || 0, max: parseFloat(max) || 0 };
+                } else {
+                    value = parseFloat(document.getElementById('filter-value-number').value) || 0;
+                }
+            } else {
+                value = document.getElementById('filter-value-text').value;
+            }
+
+            const opLabels = { equals: '=', not_equals: '≠', contains: '~', gt: '>', lt: '<', gte: '≥', lte: '≤', between: '↔' };
+            const valueLabel = operator === 'between' ? `${value.min}–${value.max}` : value;
+
+            advancedFilters.push({
+                id: ++filterIdCounter,
+                mode,
+                category: catKey,
+                operator,
+                value,
+                label: `${mode === 'exclude' ? '✗ ' : ''}${cat.label} ${opLabels[operator] || '='} ${valueLabel}`
+            });
+
+            closeFilterDropdown();
+            renderFilterPills();
+            applyFilters();
+        }
+
+        function removeAdvancedFilter(id) {
+            advancedFilters = advancedFilters.filter(f => f.id !== id);
+            renderFilterPills();
+            applyFilters();
+        }
+
+        function clearAllAdvancedFilters() {
+            advancedFilters = [];
+            renderFilterPills();
+            applyFilters();
+        }
+
+        function renderFilterPills() {
+            const container = document.getElementById('filter-pills');
+            const noText = document.getElementById('no-filters-text');
+
+            if (advancedFilters.length === 0) {
+                container.innerHTML = '';
+                noText.style.display = '';
+                return;
+            }
+
+            noText.style.display = 'none';
+            container.innerHTML = advancedFilters.map(f => {
+                const bg = f.mode === 'exclude' ? 'rgba(239,68,68,0.15)' : 'rgba(59,130,246,0.15)';
+                const border = f.mode === 'exclude' ? 'rgba(239,68,68,0.3)' : 'rgba(59,130,246,0.3)';
+                const color = f.mode === 'exclude' ? '#fca5a5' : '#93c5fd';
+                return `<span style="display:inline-flex;align-items:center;gap:4px;padding:3px 8px;border-radius:4px;font-size:0.7rem;background:${bg};border:1px solid ${border};color:${color};">${escapeHtml(f.label)}<span onclick="removeAdvancedFilter(${f.id})" style="cursor:pointer;opacity:0.7;font-size:0.8rem;margin-left:2px;" title="Remove filter">&times;</span></span>`;
+            }).join('') + (advancedFilters.length > 1 ? `<span onclick="clearAllAdvancedFilters()" style="cursor:pointer;color:#64748b;font-size:0.65rem;padding:3px 6px;text-decoration:underline;">Clear all</span>` : '');
+        }
+
+        function matchAdvancedFilter(item, filter) {
+            const cat = FILTER_CATEGORIES[filter.category];
+            let itemValue;
+            if (cat.field === '_season') {
+                itemValue = getSeasonStatus(item);
+            } else {
+                itemValue = item[cat.field];
+            }
+
+            let matches = false;
+            if (cat.type === 'number') {
+                const num = parseFloat(itemValue) || 0;
+                const val = filter.value;
+                switch (filter.operator) {
+                    case 'equals': matches = num === val; break;
+                    case 'gt': matches = num > val; break;
+                    case 'lt': matches = num < val; break;
+                    case 'gte': matches = num >= val; break;
+                    case 'lte': matches = num <= val; break;
+                    case 'between': matches = num >= val.min && num <= val.max; break;
+                }
+            } else {
+                const str = String(itemValue || '').toLowerCase();
+                const val = String(filter.value || '').toLowerCase();
+                switch (filter.operator) {
+                    case 'equals': matches = str === val; break;
+                    case 'not_equals': matches = str !== val; break;
+                    case 'contains': matches = str.includes(val); break;
+                }
+            }
+
+            return filter.mode === 'exclude' ? !matches : matches;
+        }
 
         // ============================================
         // TABS
@@ -3483,6 +3784,10 @@
                 if (label === 'favorite' && !d.favorite) return false;
                 if (label && label !== 'favorite' && d.label !== label) return false;
                 if (source && (d.source || 'csv') !== source) return false;
+                // Advanced filters (AND logic)
+                for (const f of advancedFilters) {
+                    if (!matchAdvancedFilter(d, f)) return false;
+                }
                 return true;
             });
 
@@ -4003,11 +4308,11 @@
             const interest = d.trendInterest || 0;
 
             if (trend === 'unknown') {
-                return '<span style="font-size:0.6rem;padding:2px 5px;border-radius:3px;background:rgba(100,116,139,0.15);color:#64748b;cursor:help;" title="Trend data not yet collected. Processing automatically in background.">Pending</span>';
+                return '<span style="font-size:0.6rem;padding:2px 5px;border-radius:3px;background:rgba(100,116,139,0.15);color:#64748b;" title="Trend data not yet collected. Processing automatically in background.">Pending</span>';
             }
 
             const arrows = { rising: '↑', stable: '→', declining: '↓' };
-            const arrow = arrows[trend] || '?';
+            const arrow = arrows[trend] || '';
             const changeText = change !== 0 ? ` ${change > 0 ? '+' : ''}${Math.round(change)}%` : '';
 
             const titles = {
@@ -4016,7 +4321,7 @@
                 declining: `Declining — search interest is falling. Current: ${interest}/100 | Year-over-year: ${Math.round(change)}%. Consider timing risk before investing in content.`
             };
 
-            return `<span class="trend-badge trend-${trend}" style="cursor:help;" title="${titles[trend] || ''}">${arrow} ${trend}${changeText}</span>`;
+            return `<span class="trend-badge trend-${trend}" title="${titles[trend] || ''}">${arrow} ${trend}${changeText}</span>`;
         }
 
         function formatSeasonBadge(d) {
@@ -4027,12 +4332,12 @@
 
             // Not yet collected — trend data hasn't been fetched
             if (trend === 'unknown' && !peakMonths && score === 0) {
-                return '<span style="font-size:0.6rem;padding:2px 5px;border-radius:3px;background:rgba(100,116,139,0.15);color:#64748b;cursor:help;" title="Trend data not yet collected for this keyword. It will be processed automatically in the background, or click Fetch in the Trend column.">Pending</span>';
+                return '<span style="font-size:0.6rem;padding:2px 5px;border-radius:3px;background:rgba(100,116,139,0.15);color:#64748b;" title="Trend data not yet collected for this keyword. It will be processed automatically in the background.">Pending</span>';
             }
 
             // Collected but no seasonal pattern detected (flat interest)
             if (!peakMonths && score === 0) {
-                return '<span style="font-size:0.6rem;padding:2px 5px;border-radius:3px;background:rgba(134,239,172,0.1);color:#86efac;cursor:help;" title="Evergreen keyword — search interest is consistent year-round with no seasonal peaks. Publish anytime.">Evergreen</span>';
+                return '<span style="font-size:0.6rem;padding:2px 5px;border-radius:3px;background:rgba(134,239,172,0.1);color:#86efac;" title="Evergreen keyword — search interest is consistent year-round with no seasonal peaks. Publish anytime.">Evergreen</span>';
             }
 
             const monthNames = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
@@ -4046,20 +4351,20 @@
             const inPeakSeason = peakList.includes(currentMonth);
 
             if (score <= 30) {
-                return `<span class="season-badge season-evergreen" style="cursor:help;" title="Evergreen keyword — seasonality score: ${score}/100 (low). Interest is steady all year. Publish anytime.">Evergreen</span>`;
+                return `<span class="season-badge season-evergreen" title="Evergreen keyword — seasonality score: ${score}/100 (low). Interest is steady all year. Publish anytime.">Evergreen</span>`;
             }
 
             if (inPublishWindow) {
-                return `<span class="season-badge season-publish-now" style="cursor:help;" title="Publish NOW! Peak months (${peakMonths}) are approaching. Publish window: ${publishWindow}. Seasonality: ${score}/100. Get content live now so it ranks before peak traffic arrives.">Publish NOW</span>`;
+                return `<span class="season-badge season-publish-now" title="Publish NOW! Peak months (${peakMonths}) are approaching. Publish window: ${publishWindow}. Seasonality: ${score}/100. Get content live now so it ranks before peak traffic arrives.">Publish NOW</span>`;
             }
 
             if (inPeakSeason) {
-                return `<span class="season-badge season-peak-now" style="cursor:help;" title="Peak season NOW — this keyword is at its highest search interest right now. Peak months: ${peakMonths}. Seasonality: ${score}/100. Content should already be live and ranking.">Peak NOW</span>`;
+                return `<span class="season-badge season-peak-now" title="Peak season NOW — this keyword is at its highest search interest right now. Peak months: ${peakMonths}. Seasonality: ${score}/100. Content should already be live and ranking.">Peak NOW</span>`;
             }
 
             // Show peak months
             const shortPeaks = peakList.slice(0, 3).join(',');
-            return `<span class="season-badge season-seasonal" style="cursor:help;" title="Seasonal keyword — peaks in ${peakMonths}. Best time to publish: ${publishWindow} (1-2 months before peak). Seasonality: ${score}/100.">Peak: ${shortPeaks}</span>`;
+            return `<span class="season-badge season-seasonal" title="Seasonal keyword — peaks in ${peakMonths}. Best time to publish: ${publishWindow} (1-2 months before peak). Seasonality: ${score}/100.">Peak: ${shortPeaks}</span>`;
         }
 
         async function fetchSingleTrend(keyword, btnEl) {
