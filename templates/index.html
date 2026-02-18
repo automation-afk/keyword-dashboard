@@ -4125,7 +4125,11 @@
                 const response = await fetch('/api/cron/collect-trends?batch=25');
                 const data = await response.json();
 
-                if (data.success) {
+                // If already running or just started, poll for progress either way
+                if (data.success || (data.error && data.error.includes('already in progress'))) {
+                    statusEl.textContent = data.success ? 'Collection started...' : 'Collection already running — showing progress...';
+                    statusEl.style.color = '#4ade80';
+
                     // Poll for status updates every 5 seconds
                     const pollInterval = setInterval(async () => {
                         try {
