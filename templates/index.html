@@ -1453,12 +1453,6 @@
                     <input type="text" id="search" placeholder="Type to search...">
                 </div>
                 <div class="filter-group">
-                    <label>Niche</label>
-                    <select id="niche-filter">
-                        <option value="">All Niches</option>
-                    </select>
-                </div>
-                <div class="filter-group">
                     <label>Tier</label>
                     <div class="tier-buttons">
                         <button class="tier-btn active" data-tier="">All</button>
@@ -1477,12 +1471,6 @@
                         <button class="label-btn" data-label="not_interested">✗ Not Int.</button>
                         <button class="label-btn" data-label="favorite">⭐ Favorites</button>
                     </div>
-                </div>
-                <div class="filter-group">
-                    <label>Source</label>
-                    <select id="source-filter" onchange="applyFilters()">
-                        <option value="">All Sources</option>
-                    </select>
                 </div>
                 <div class="filter-group" style="margin-left: auto;">
                     <label>&nbsp;</label>
@@ -3750,39 +3738,19 @@
         }
 
         function populateFilters() {
-            const niches = [...new Set(allData.map(d => d.niche))].filter(n => n).sort();
-            const nicheSelect = document.getElementById('niche-filter');
-            niches.forEach(niche => {
-                const option = document.createElement('option');
-                option.value = niche;
-                option.textContent = niche.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
-                nicheSelect.appendChild(option);
-            });
-
-            const sources = [...new Set(allData.map(d => d.source || 'csv'))].sort();
-            const sourceSelect = document.getElementById('source-filter');
-            sources.forEach(src => {
-                const option = document.createElement('option');
-                option.value = src;
-                option.textContent = src.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
-                sourceSelect.appendChild(option);
-            });
+            // Niche and Source filters moved to Advanced Filters
         }
 
         function applyFilters() {
             const search = document.getElementById('search').value.toLowerCase();
-            const niche = document.getElementById('niche-filter').value;
             const tier = document.querySelector('.tier-btn.active').dataset.tier;
             const label = document.querySelector('.label-btn.active').dataset.label;
-            const source = document.getElementById('source-filter').value;
 
             filteredData = allData.filter(d => {
                 if (search && !d.keyword.toLowerCase().includes(search)) return false;
-                if (niche && d.niche !== niche) return false;
                 if (tier && d.tier !== tier) return false;
                 if (label === 'favorite' && !d.favorite) return false;
                 if (label && label !== 'favorite' && d.label !== label) return false;
-                if (source && (d.source || 'csv') !== source) return false;
                 // Advanced filters (AND logic)
                 for (const f of advancedFilters) {
                     if (!matchAdvancedFilter(d, f)) return false;
@@ -4417,10 +4385,8 @@
         function exportFiltered() {
             const params = new URLSearchParams();
             const search = document.getElementById('search').value;
-            const niche = document.getElementById('niche-filter').value;
             const tier = document.querySelector('.tier-btn.active').dataset.tier;
             if (search) params.append('search', search);
-            if (niche) params.append('niche', niche);
             if (tier) params.append('tier', tier);
             window.location.href = '/api/export?' + params.toString();
         }
@@ -4435,7 +4401,6 @@
         // EVENT LISTENERS
         // ============================================
         document.getElementById('search').addEventListener('input', debounce(applyFilters, 300));
-        document.getElementById('niche-filter').addEventListener('change', applyFilters);
 
         document.querySelectorAll('.tier-btn').forEach(btn => {
             btn.addEventListener('click', function() {
