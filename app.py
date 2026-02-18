@@ -2512,13 +2512,14 @@ def get_keywords():
         kw['commentCount'] = comment_counts.get(k['keyword'], 0)
 
         # Add Google Trends data (including seasonal patterns)
-        kw_trend = trends_data.get(keyword_lower, {'trend': 'unknown', 'trendChange': 0, 'trendInterest': 0, 'peakMonths': None, 'seasonalityScore': 0, 'publishWindow': None})
+        kw_trend = trends_data.get(keyword_lower, {'trend': 'unknown', 'trendChange': 0, 'trendInterest': 0, 'peakMonths': None, 'seasonalityScore': 0, 'publishWindow': None, 'trendUpdated': None})
         kw['trend'] = kw_trend['trend']
         kw['trendChange'] = kw_trend['trendChange']
         kw['trendInterest'] = kw_trend['trendInterest']
         kw['peakMonths'] = kw_trend.get('peakMonths')
         kw['seasonalityScore'] = kw_trend.get('seasonalityScore', 0)
         kw['publishWindow'] = kw_trend.get('publishWindow')
+        kw['trendUpdated'] = kw_trend.get('trendUpdated')
 
         # Add who added this keyword
         kw['addedBy'] = additions.get(k['keyword'], [])
@@ -6836,14 +6837,15 @@ def load_trends_cache():
     try:
         conn = get_db()
         c = conn.cursor()
-        c.execute('SELECT keyword, trend, trend_change_pct, current_interest, peak_months, seasonality_score, publish_window FROM keyword_trends')
+        c.execute('SELECT keyword, trend, trend_change_pct, current_interest, peak_months, seasonality_score, publish_window, updated_at FROM keyword_trends')
         TRENDS_CACHE = {row[0].lower(): {
             'trend': row[1],
             'trendChange': row[2],
             'trendInterest': row[3],
             'peakMonths': row[4],
             'seasonalityScore': row[5] or 0,
-            'publishWindow': row[6]
+            'publishWindow': row[6],
+            'trendUpdated': row[7].strftime('%Y-%m-%d') if row[7] else None
         } for row in c.fetchall()}
         conn.close()
         TRENDS_CACHE_LOADED = True
@@ -6853,13 +6855,15 @@ def load_trends_cache():
 
 def update_trends_cache(keyword, trend_data):
     """Update a single keyword in the in-memory trends cache."""
+    from datetime import date
     TRENDS_CACHE[keyword.lower()] = {
         'trend': trend_data.get('trend', 'unknown'),
         'trendChange': trend_data.get('trend_change_pct', 0),
         'trendInterest': trend_data.get('current_interest', 0),
         'peakMonths': trend_data.get('peak_months'),
         'seasonalityScore': trend_data.get('seasonality_score', 0),
-        'publishWindow': trend_data.get('publish_window')
+        'publishWindow': trend_data.get('publish_window'),
+        'trendUpdated': date.today().strftime('%Y-%m-%d')
     }
 
 # Load trends cache at startup
