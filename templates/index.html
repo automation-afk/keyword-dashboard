@@ -4373,7 +4373,7 @@
         async function fetchSingleTrend(keyword, btnEl) {
             btnEl.disabled = true;
             const origText = btnEl.textContent;
-            btnEl.textContent = '...';
+            btnEl.textContent = 'Fetching...';
             if (btnEl.tagName === 'SPAN') btnEl.style.opacity = '0.5';
 
             try {
