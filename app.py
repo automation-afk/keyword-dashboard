@@ -7500,25 +7500,14 @@ def run_startup_collection():
         print("[STARTUP] Domination data is stale, triggering audit...")
         run_domination_audit_job()
 
-    if staleness['trends_stale']:
-        print("[STARTUP] Trends data is stale, triggering collection...")
-        if not trends_collection_status['running']:
-            import threading
-            thread = threading.Thread(target=collect_trends_data_background, args=(25,))
-            thread.daemon = True
-            thread.start()
+    # Trends collection is now manual (Fetch button per keyword) — no auto-collection
+    print(f"[STARTUP] Trends: {staleness.get('trends_fresh', 0)} keywords have data (manual fetch only)")
 
 
 def run_daily_collection_job():
-    """Combined daily job: domination audit + trends collection."""
-    print("[DAILY] Running combined daily collection...")
+    """Daily job: domination audit only. Trends are manual (Fetch button)."""
+    print("[DAILY] Running domination audit...")
     run_domination_audit_job()
-
-    # Wait a bit then start trends collection
-    import time as _time
-    _time.sleep(60)
-    if not trends_collection_status['running']:
-        collect_trends_data_background(batch_size=50)
 
 
 # Start scheduler - run every 6 hours to survive Railway restarts

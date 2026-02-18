@@ -4308,7 +4308,8 @@
             const interest = d.trendInterest || 0;
 
             if (trend === 'unknown') {
-                return '<span style="font-size:0.6rem;padding:2px 5px;border-radius:3px;background:rgba(100,116,139,0.15);color:#64748b;" title="Trend data not yet collected. Processing automatically in background.">Pending</span>';
+                const escapedKw = escapeHtml(d.keyword).replace(/'/g, "\\'");
+                return `<button onclick="fetchSingleTrend('${escapedKw}', this)" style="font-size:0.6rem;padding:2px 8px;border-radius:3px;background:rgba(59,130,246,0.15);color:#93c5fd;border:1px solid rgba(59,130,246,0.3);cursor:pointer;" title="Click to fetch trend & seasonal data from Google Trends">Fetch</button>`;
             }
 
             const arrows = { rising: '↑', stable: '→', declining: '↓' };
@@ -4330,9 +4331,9 @@
             const publishWindow = d.publishWindow || '';
             const trend = d.trend || 'unknown';
 
-            // Not yet collected — trend data hasn't been fetched
+            // Not yet collected — show dash (fetch button is on Trend column)
             if (trend === 'unknown' && !peakMonths && score === 0) {
-                return '<span style="font-size:0.6rem;padding:2px 5px;border-radius:3px;background:rgba(100,116,139,0.15);color:#64748b;" title="Trend data not yet collected for this keyword. It will be processed automatically in the background.">Pending</span>';
+                return '<span style="color:#334155;">—</span>';
             }
 
             // Collected but no seasonal pattern detected (flat interest)
