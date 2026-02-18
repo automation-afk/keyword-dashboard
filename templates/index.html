@@ -1490,6 +1490,9 @@
                         <button class="export-btn" onclick="collectTrendsData()" id="collect-trends-btn" style="background:linear-gradient(135deg, #10b981, #059669);font-size:0.8rem;padding:8px 14px;">
                             📈 Collect Trends
                         </button>
+                        <button class="export-btn" onclick="stopTrendsCollection()" id="stop-trends-btn" style="background:linear-gradient(135deg, #ef4444, #dc2626);font-size:0.8rem;padding:8px 14px;display:none;">
+                            ⏹ Stop
+                        </button>
                         <button class="export-btn" onclick="exportFiltered()">↓ Export CSV</button>
                     </div>
                 </div>
@@ -4109,37 +4112,42 @@
         // ============================================
         async function collectTrendsData() {
             const btn = document.getElementById('collect-trends-btn');
+            const stopBtn = document.getElementById('stop-trends-btn');
             const statusEl = document.getElementById('trends-status');
             btn.disabled = true;
-            btn.textContent = '📈 Collecting...';
+            btn.style.display = 'none';
+            stopBtn.style.display = '';
             statusEl.style.display = 'block';
-            statusEl.textContent = 'Starting trends collection in background...';
+            statusEl.textContent = 'Starting trends collection...';
+            statusEl.style.color = '#4ade80';
 
             try {
                 const response = await fetch('/api/cron/collect-trends?batch=25');
                 const data = await response.json();
 
                 if (data.success) {
-                    statusEl.textContent = data.message + ' Refreshing data periodically...';
-                    statusEl.style.color = '#4ade80';
-
-                    // Poll for status updates
+                    // Poll for status updates every 5 seconds
                     const pollInterval = setInterval(async () => {
                         try {
                             const statusResp = await fetch('/api/cron/trends-status');
                             const statusData = await statusResp.json();
 
                             if (statusData.success) {
-                                statusEl.textContent = `Trends: ${statusData.trends_fresh_7d}/${statusData.total_keywords} collected | ${statusData.still_needed} remaining` +
-                                    (statusData.job_running ? ' | Running...' : ' | Done');
+                                const r = statusData.last_results || {};
+                                const pct = statusData.total_keywords > 0 ? Math.round((statusData.trends_fresh_7d / statusData.total_keywords) * 100) : 0;
+                                statusEl.innerHTML = `<strong>${statusData.trends_fresh_7d.toLocaleString()}</strong>/${statusData.total_keywords.toLocaleString()} collected (${pct}%)` +
+                                    (r.success ? ` | <span style="color:#4ade80;">${r.success} ok</span>` : '') +
+                                    (r.failed ? ` | <span style="color:#f87171;">${r.failed} failed</span>` : '') +
+                                    (statusData.job_running ? ' | <span style="color:#fbbf24;">Running...</span>' : ' | <span style="color:#4ade80;">Done!</span>');
 
                                 if (!statusData.job_running) {
                                     clearInterval(pollInterval);
                                     btn.disabled = false;
+                                    btn.style.display = '';
+                                    stopBtn.style.display = 'none';
                                     btn.textContent = '📈 Collect Trends';
-                                    // Refresh data to show new trends
                                     await loadData();
-                                    setTimeout(() => { statusEl.style.display = 'none'; }, 5000);
+                                    setTimeout(() => { statusEl.style.display = 'none'; }, 10000);
                                 }
                             }
                         } catch (e) {
@@ -4147,9 +4155,11 @@
                         }
                     }, 5000);
                 } else {
-                    statusEl.textContent = 'Error: ' + (data.error || 'Failed to start collection');
+                    statusEl.textContent = 'Error: ' + (data.error || 'Failed to start');
                     statusEl.style.color = '#f87171';
                     btn.disabled = false;
+                    btn.style.display = '';
+                    stopBtn.style.display = 'none';
                     btn.textContent = '📈 Collect Trends';
                 }
             } catch (error) {
@@ -4157,7 +4167,20 @@
                 statusEl.textContent = 'Error: ' + error.message;
                 statusEl.style.color = '#f87171';
                 btn.disabled = false;
+                btn.style.display = '';
+                stopBtn.style.display = 'none';
                 btn.textContent = '📈 Collect Trends';
+            }
+        }
+
+        async function stopTrendsCollection() {
+            const stopBtn = document.getElementById('stop-trends-btn');
+            stopBtn.disabled = true;
+            stopBtn.textContent = '⏹ Stopping...';
+            try {
+                await fetch('/api/cron/stop-trends');
+            } catch (e) {
+                console.error('Error stopping trends:', e);
             }
         }
 

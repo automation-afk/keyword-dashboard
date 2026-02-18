@@ -6924,12 +6924,16 @@ def get_keyword_trend():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 def collect_trends_data_background(batch_size=25):
-    """Background task to collect Google Trends data for keywords"""
+    """Background task to collect Google Trends data for ALL keywords continuously.
+    Processes all remaining keywords in batches, with rate limiting between requests.
+    Updates trends_collection_status in real-time for progress tracking."""
     import time as _time
+    import json as _json
     global trends_collection_status
 
     trends_collection_status['running'] = True
-    results = {'processed': 0, 'success': 0, 'failed': 0, 'remaining': 0}
+    trends_collection_status['stop_requested'] = False
+    results = {'processed': 0, 'success': 0, 'failed': 0, 'remaining': 0, 'total': 0}
 
     try:
         conn = get_db()
@@ -6940,11 +6944,13 @@ def collect_trends_data_background(batch_size=25):
         existing = set(row[0].lower() for row in c.fetchall())
 
         # Find keywords needing trends data (prioritize A-tier and interested)
-        c.execute("SELECT keyword, label FROM keyword_labels WHERE label IN ('interested', 'researching')")
-        priority_keywords = set(row[0] for row in c.fetchall())
+        try:
+            c.execute("SELECT keyword, label FROM keyword_labels WHERE label IN ('interested', 'researching')")
+            priority_keywords = set(row[0] for row in c.fetchall())
+        except Exception:
+            priority_keywords = set()
 
         keywords_needing_data = []
-        # Add priority keywords first
         for kw in KEYWORDS:
             if kw['keyword'].lower() not in existing:
                 if kw['keyword'] in priority_keywords or 'A -' in kw.get('tier', ''):
@@ -6952,18 +6958,22 @@ def collect_trends_data_background(batch_size=25):
                 else:
                     keywords_needing_data.append(kw['keyword'])
 
-        print(f"[TRENDS] Found {len(keywords_needing_data)} keywords needing trends data")
+        results['total'] = len(keywords_needing_data)
+        results['remaining'] = len(keywords_needing_data)
+        trends_collection_status['last_results'] = results
+        print(f"[TRENDS] Processing ALL {len(keywords_needing_data)} keywords needing trends data")
 
-        keywords_to_process = keywords_needing_data[:batch_size]
-        results['remaining'] = len(keywords_needing_data) - len(keywords_to_process)
+        consecutive_failures = 0
+        for i, keyword in enumerate(keywords_needing_data):
+            # Check if stop was requested
+            if trends_collection_status.get('stop_requested'):
+                print(f"[TRENDS] Stop requested after {results['processed']} keywords")
+                break
 
-        for keyword in keywords_to_process:
             try:
-                print(f"[TRENDS] Fetching trend for: {keyword}")
                 trend_data = get_serpapi_google_trends(keyword)
 
                 if trend_data.get('success'):
-                    import json as _json
                     c.execute('''
                         INSERT INTO keyword_trends (keyword, trend, trend_change_pct, current_interest, data_points,
                             peak_months, low_months, seasonality_score, publish_window, monthly_averages, updated_at)
@@ -6993,19 +7003,56 @@ def collect_trends_data_background(batch_size=25):
                     ))
                     conn.commit()
                     results['success'] += 1
+                    consecutive_failures = 0
                 else:
-                    print(f"[TRENDS] Failed for {keyword}: {trend_data.get('error')}")
+                    error_msg = trend_data.get('error', '')
                     results['failed'] += 1
+                    consecutive_failures += 1
+                    # If rate limited or API error, back off
+                    if '429' in str(error_msg) or 'rate' in str(error_msg).lower():
+                        print(f"[TRENDS] Rate limited, backing off 30s...")
+                        _time.sleep(30)
+                        consecutive_failures = 0  # Reset after backoff
 
                 results['processed'] += 1
-                _time.sleep(1)  # Rate limit: 1 request per second for Trends
+                results['remaining'] = results['total'] - results['processed']
+
+                # Update status for real-time tracking
+                if results['processed'] % 10 == 0:
+                    trends_collection_status['last_results'] = results.copy()
+                    print(f"[TRENDS] Progress: {results['processed']}/{results['total']} ({results['success']} ok, {results['failed']} failed, {results['remaining']} left)")
+
+                # Stop if too many consecutive failures (API key exhausted, etc.)
+                if consecutive_failures >= 10:
+                    print(f"[TRENDS] Stopping: {consecutive_failures} consecutive failures")
+                    results['stopped_reason'] = f'{consecutive_failures} consecutive API failures'
+                    break
+
+                # Rate limit: 1 second between requests, 3 second pause every batch
+                _time.sleep(1)
+                if (i + 1) % batch_size == 0:
+                    _time.sleep(3)
 
             except Exception as e:
                 print(f"[TRENDS] Error processing {keyword}: {e}")
                 results['failed'] += 1
                 results['processed'] += 1
+                results['remaining'] = results['total'] - results['processed']
+                consecutive_failures += 1
+                # Reconnect DB if connection lost
+                if 'connection' in str(e).lower() or 'closed' in str(e).lower():
+                    try:
+                        conn = get_db()
+                        c = conn.cursor()
+                        print("[TRENDS] DB reconnected")
+                    except Exception:
+                        print("[TRENDS] DB reconnect failed, stopping")
+                        break
 
-        conn.close()
+        try:
+            conn.close()
+        except Exception:
+            pass
         print(f"[TRENDS] Complete: {results}")
 
     except Exception as e:
@@ -7014,6 +7061,7 @@ def collect_trends_data_background(batch_size=25):
 
     finally:
         trends_collection_status['running'] = False
+        trends_collection_status['stop_requested'] = False
         trends_collection_status['last_run'] = datetime.now().isoformat()
         trends_collection_status['last_results'] = results
 
@@ -7050,9 +7098,18 @@ def cron_collect_trends():
 
     return jsonify({
         'success': True,
-        'message': f'Trends data collection started in background (batch size: {batch_size})',
+        'message': f'Trends collection started — processing ALL remaining keywords continuously',
         'check_status': '/api/cron/trends-status'
     })
+
+@app.route('/api/cron/stop-trends')
+@login_required
+def stop_trends_collection():
+    """Stop the running trends collection gracefully"""
+    if trends_collection_status['running']:
+        trends_collection_status['stop_requested'] = True
+        return jsonify({'success': True, 'message': 'Stop requested — collection will finish current keyword and stop'})
+    return jsonify({'success': False, 'message': 'No collection running'})
 
 @app.route('/api/cron/trends-status')
 def cron_trends_status():
