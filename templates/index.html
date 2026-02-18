@@ -4001,18 +4001,22 @@
             const trend = d.trend || 'unknown';
             const change = d.trendChange || 0;
             const interest = d.trendInterest || 0;
-            const escapedKw = escapeHtml(d.keyword).replace(/'/g, "\\'");
 
             if (trend === 'unknown') {
-                return `<button class="fetch-trend-btn" onclick="fetchSingleTrend('${escapedKw}', this)" title="Fetch trend data">📈 Fetch</button>`;
+                return '<span style="font-size:0.6rem;padding:2px 5px;border-radius:3px;background:rgba(100,116,139,0.15);color:#64748b;cursor:help;" title="Trend data not yet collected. Processing automatically in background.">Pending</span>';
             }
 
             const arrows = { rising: '↑', stable: '→', declining: '↓' };
             const arrow = arrows[trend] || '?';
             const changeText = change !== 0 ? ` ${change > 0 ? '+' : ''}${Math.round(change)}%` : '';
-            const title = `Interest: ${interest}/100 | Change: ${change > 0 ? '+' : ''}${Math.round(change)}%`;
 
-            return `<span class="trend-badge trend-${trend}" title="${title}">${arrow} ${trend}${changeText}</span>`;
+            const titles = {
+                rising: `Rising — search interest is growing. Current: ${interest}/100 | Year-over-year: +${Math.round(change)}%. Good time to create content for this keyword.`,
+                stable: `Stable — search interest is consistent. Current: ${interest}/100 | Year-over-year: ${change > 0 ? '+' : ''}${Math.round(change)}%. Reliable keyword with steady demand.`,
+                declining: `Declining — search interest is falling. Current: ${interest}/100 | Year-over-year: ${Math.round(change)}%. Consider timing risk before investing in content.`
+            };
+
+            return `<span class="trend-badge trend-${trend}" style="cursor:help;" title="${titles[trend] || ''}">${arrow} ${trend}${changeText}</span>`;
         }
 
         function formatSeasonBadge(d) {

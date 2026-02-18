@@ -2458,16 +2458,8 @@ def get_keywords():
                 additions[row[0]] = []
             additions[row[0]].append({'name': row[1] or row[2], 'source': row[3]})
 
-        # Get cached Google Trends data (including seasonal patterns)
-        c.execute('SELECT keyword, trend, trend_change_pct, current_interest, peak_months, seasonality_score, publish_window FROM keyword_trends')
-        trends_data = {row[0].lower(): {
-            'trend': row[1],
-            'trendChange': row[2],
-            'trendInterest': row[3],
-            'peakMonths': row[4],
-            'seasonalityScore': row[5] or 0,
-            'publishWindow': row[6]
-        } for row in c.fetchall()}
+        # Use in-memory trends cache (no DB query needed)
+        trends_data = TRENDS_CACHE
 
         conn.close()
         db_available = True
@@ -6833,6 +6825,46 @@ trends_collection_status = {
     'last_results': None
 }
 
+# In-memory trends cache — loaded once at startup, updated as trends are collected
+# Avoids querying keyword_trends table on every /api/keywords request
+TRENDS_CACHE = {}  # {keyword_lower: {trend, trendChange, trendInterest, peakMonths, seasonalityScore, publishWindow}}
+TRENDS_CACHE_LOADED = False
+
+def load_trends_cache():
+    """Load all trend data from keyword_trends into memory."""
+    global TRENDS_CACHE, TRENDS_CACHE_LOADED
+    try:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute('SELECT keyword, trend, trend_change_pct, current_interest, peak_months, seasonality_score, publish_window FROM keyword_trends')
+        TRENDS_CACHE = {row[0].lower(): {
+            'trend': row[1],
+            'trendChange': row[2],
+            'trendInterest': row[3],
+            'peakMonths': row[4],
+            'seasonalityScore': row[5] or 0,
+            'publishWindow': row[6]
+        } for row in c.fetchall()}
+        conn.close()
+        TRENDS_CACHE_LOADED = True
+        print(f"[TRENDS-CACHE] Loaded {len(TRENDS_CACHE)} cached trends into memory")
+    except Exception as e:
+        print(f"[TRENDS-CACHE] Failed to load: {e}")
+
+def update_trends_cache(keyword, trend_data):
+    """Update a single keyword in the in-memory trends cache."""
+    TRENDS_CACHE[keyword.lower()] = {
+        'trend': trend_data.get('trend', 'unknown'),
+        'trendChange': trend_data.get('trend_change_pct', 0),
+        'trendInterest': trend_data.get('current_interest', 0),
+        'peakMonths': trend_data.get('peak_months'),
+        'seasonalityScore': trend_data.get('seasonality_score', 0),
+        'publishWindow': trend_data.get('publish_window')
+    }
+
+# Load trends cache at startup
+load_trends_cache()
+
 @app.route('/api/keyword/trend', methods=['POST'])
 @login_required
 def get_keyword_trend():
@@ -6904,6 +6936,8 @@ def get_keyword_trend():
                 _json.dumps(trend_data.get('monthly_averages')) if trend_data.get('monthly_averages') else None
             ))
             conn.commit()
+            # Update in-memory cache
+            update_trends_cache(keyword, trend_data)
 
         conn.close()
 
@@ -7002,6 +7036,8 @@ def collect_trends_data_background(batch_size=25):
                         _json.dumps(trend_data.get('monthly_averages')) if trend_data.get('monthly_averages') else None
                     ))
                     conn.commit()
+                    # Update in-memory cache
+                    update_trends_cache(keyword, trend_data)
                     results['success'] += 1
                     consecutive_failures = 0
                 else:
