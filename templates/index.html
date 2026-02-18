@@ -4025,9 +4025,16 @@
             const score = d.seasonalityScore || 0;
             const peakMonths = d.peakMonths || '';
             const publishWindow = d.publishWindow || '';
+            const trend = d.trend || 'unknown';
 
+            // Not yet collected — trend data hasn't been fetched
+            if (trend === 'unknown' && !peakMonths && score === 0) {
+                return '<span style="font-size:0.6rem;padding:2px 5px;border-radius:3px;background:rgba(100,116,139,0.15);color:#64748b;">Pending</span>';
+            }
+
+            // Collected but no seasonal pattern detected (flat interest)
             if (!peakMonths && score === 0) {
-                return '<span style="color:#475569;font-size:0.65rem;">—</span>';
+                return '<span style="font-size:0.6rem;padding:2px 5px;border-radius:3px;background:rgba(134,239,172,0.1);color:#86efac;">Evergreen</span>';
             }
 
             const monthNames = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
