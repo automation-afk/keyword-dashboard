@@ -1,8 +1,65 @@
-# Seasonal Patterns — Best Time to Publish
+# Google Trends Intelligence — Trend Prediction & Seasonal Patterns
 
 ## Overview
 
-The app analyzes 5 years of Google Trends data to detect which months each keyword peaks in search interest. This tells you **when** to publish content for maximum impact.
+The app uses Google Trends data (via SerpAPI) to provide two layers of keyword intelligence:
+
+1. **Trend Prediction** — Is the keyword trending up or down right now?
+2. **Seasonal Patterns** — What months does the keyword peak, and when should you publish?
+
+Both use the same 5-year Google Trends dataset — no extra API calls needed.
+
+---
+
+## Trend Prediction
+
+Shows whether a keyword's search interest is **rising**, **stable**, or **declining** compared to the same period last year.
+
+### How It Works
+
+1. Fetches 5 years of weekly interest data from Google Trends
+2. Compares the last ~3 months of data against the same period one year ago
+3. Calculates the percentage change between the two periods
+4. Classifies the trend:
+
+| Change | Direction | Meaning |
+|---|---|---|
+| > +20% | **Rising** | Growing search interest — opportunity is expanding |
+| -20% to +20% | **Stable** | Consistent interest — reliable keyword |
+| < -20% | **Declining** | Falling interest — consider timing risk |
+
+### Where It Appears
+
+| Location | What you see |
+|---|---|
+| **Keyword Library** | "Trend" column — green `Rising`, blue `Stable`, red `Declining` badges with % change |
+| **$3K Finder** | "Google Trend" metric on each opportunity card |
+| **Smart Picks** | Trend badge next to keyword type and niche |
+| **Content Planner** | (via seasonal data — see below) |
+
+### Scoring Impact
+
+| Trend | $3K Finder | Smart Picks |
+|---|---|---|
+| Rising | +10 pts | +10 pts |
+| Stable | +5 pts | +5 pts |
+| Unknown | +3 pts | +3 pts |
+| Declining | +0 pts | +0 pts |
+
+Declining keywords also get a "timing risk" warning in the $3K Finder levers.
+
+### Fetching Trend Data
+
+- **Individual** — Click "Fetch" button in the Trend column for any keyword
+- **Bulk** — Click "Collect Trends" in the admin section (batches of 25)
+- **Automatic** — App triggers collection on startup if data is stale
+- **Trending Gaps** — The Content Gap tab has "Discover Trending Gaps" to find rising topics you're not covering
+
+---
+
+## Seasonal Patterns — Best Time to Publish
+
+Analyzes the same 5-year data to detect which months each keyword peaks in search interest. This tells you **when** to publish content for maximum impact.
 
 ## Key Concepts
 
@@ -74,14 +131,24 @@ Data is cached for 7 days before re-fetching.
 
 ## Database Schema
 
-Seasonal data is stored in the `keyword_trends` table:
+All data is stored in the `keyword_trends` table:
 
 ```
+-- Trend Prediction fields
+trend             TEXT    — "rising", "stable", "declining", or "unknown"
+trend_change_pct  FLOAT   — Year-over-year percentage change (e.g., +34.2 or -15.8)
+current_interest  INTEGER — Current interest score (0-100)
+data_points       INTEGER — Number of data points from Google Trends
+
+-- Seasonal Pattern fields
 peak_months       TEXT    — Comma-separated peak months (e.g., "Oct,Nov,Dec")
 low_months        TEXT    — Comma-separated low months (e.g., "Mar,Apr")
 seasonality_score INTEGER — 0-100, higher = more seasonal
 publish_window    TEXT    — Best months to publish (e.g., "Aug-Sep")
 monthly_averages  JSONB   — Average interest per month {"Jan": 45.2, "Feb": 38.1, ...}
+
+-- Metadata
+updated_at        TIMESTAMP — Last refresh (data re-fetched after 7 days)
 ```
 
 ## Example
