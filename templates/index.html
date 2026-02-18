@@ -4299,16 +4299,18 @@
             const peakMonths = d.peakMonths || '';
             const publishWindow = d.publishWindow || '';
             const trend = d.trend || 'unknown';
+            const updated = d.trendUpdated || '';
+            const escapedKw = escapeHtml(d.keyword).replace(/'/g, "\\'");
+            const updatedText = updated ? `\nLast updated: ${updated}. Click to refresh.` : '\nClick to refresh.';
 
             // Not yet collected — show Fetch button
             if (trend === 'unknown' && !peakMonths && score === 0) {
-                const escapedKw = escapeHtml(d.keyword).replace(/'/g, "\\'");
                 return `<button onclick="fetchSingleTrend('${escapedKw}', this)" style="font-size:0.6rem;padding:2px 8px;border-radius:3px;background:rgba(59,130,246,0.15);color:#93c5fd;border:1px solid rgba(59,130,246,0.3);cursor:pointer;" title="Click to fetch trend & seasonal data">Fetch</button>`;
             }
 
             // Collected but no seasonal pattern detected (flat interest)
             if (!peakMonths && score === 0) {
-                return '<span style="font-size:0.6rem;padding:2px 5px;border-radius:3px;background:rgba(134,239,172,0.1);color:#86efac;" title="Evergreen keyword — search interest is consistent year-round with no seasonal peaks. Publish anytime.">Evergreen</span>';
+                return `<span style="font-size:0.6rem;padding:2px 5px;border-radius:3px;background:rgba(134,239,172,0.1);color:#86efac;cursor:pointer;" onclick="fetchSingleTrend('${escapedKw}', this)" title="Evergreen keyword — search interest is consistent year-round with no seasonal peaks. Publish anytime.${updatedText}">Evergreen</span>`;
             }
 
             const monthNames = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
@@ -4322,20 +4324,20 @@
             const inPeakSeason = peakList.includes(currentMonth);
 
             if (score <= 30) {
-                return `<span class="season-badge season-evergreen" title="Evergreen keyword — seasonality score: ${score}/100 (low). Interest is steady all year. Publish anytime.">Evergreen</span>`;
+                return `<span class="season-badge season-evergreen" style="cursor:pointer;" onclick="fetchSingleTrend('${escapedKw}', this)" title="Evergreen keyword — seasonality score: ${score}/100 (low). Interest is steady all year. Publish anytime.${updatedText}">Evergreen</span>`;
             }
 
             if (inPublishWindow) {
-                return `<span class="season-badge season-publish-now" title="Publish NOW! Peak months (${peakMonths}) are approaching. Publish window: ${publishWindow}. Seasonality: ${score}/100. Get content live now so it ranks before peak traffic arrives.">Publish NOW</span>`;
+                return `<span class="season-badge season-publish-now" style="cursor:pointer;" onclick="fetchSingleTrend('${escapedKw}', this)" title="Publish NOW! Peak months (${peakMonths}) are approaching. Publish window: ${publishWindow}. Seasonality: ${score}/100.${updatedText}">Publish NOW</span>`;
             }
 
             if (inPeakSeason) {
-                return `<span class="season-badge season-peak-now" title="Peak season NOW — this keyword is at its highest search interest right now. Peak months: ${peakMonths}. Seasonality: ${score}/100. Content should already be live and ranking.">Peak NOW</span>`;
+                return `<span class="season-badge season-peak-now" style="cursor:pointer;" onclick="fetchSingleTrend('${escapedKw}', this)" title="Peak season NOW — this keyword is at its highest search interest right now. Peak months: ${peakMonths}. Seasonality: ${score}/100.${updatedText}">Peak NOW</span>`;
             }
 
             // Show peak months
             const shortPeaks = peakList.slice(0, 3).join(',');
-            return `<span class="season-badge season-seasonal" title="Seasonal keyword — peaks in ${peakMonths}. Best time to publish: ${publishWindow} (1-2 months before peak). Seasonality: ${score}/100.">Peak: ${shortPeaks}</span>`;
+            return `<span class="season-badge season-seasonal" style="cursor:pointer;" onclick="fetchSingleTrend('${escapedKw}', this)" title="Seasonal keyword — peaks in ${peakMonths}. Best time to publish: ${publishWindow} (1-2 months before peak). Seasonality: ${score}/100.${updatedText}">Peak: ${shortPeaks}</span>`;
         }
 
         async function fetchSingleTrend(keyword, btnEl) {
