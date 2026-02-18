@@ -1487,7 +1487,6 @@
                 <div class="filter-group" style="margin-left: auto;">
                     <label>&nbsp;</label>
                     <div style="display:flex;gap:8px;align-items:center;">
-                        <div id="trends-progress" style="font-size:0.75rem;color:#94a3b8;"></div>
                         <button class="export-btn" onclick="exportFiltered()">↓ Export CSV</button>
                     </div>
                 </div>
@@ -4333,9 +4332,10 @@
             const publishWindow = d.publishWindow || '';
             const trend = d.trend || 'unknown';
 
-            // Not yet collected — show dash (fetch button is on Trend column)
+            // Not yet collected — show Fetch button
             if (trend === 'unknown' && !peakMonths && score === 0) {
-                return '<span style="color:#334155;">—</span>';
+                const escapedKw = escapeHtml(d.keyword).replace(/'/g, "\\'");
+                return `<button onclick="fetchSingleTrend('${escapedKw}', this)" style="font-size:0.6rem;padding:2px 8px;border-radius:3px;background:rgba(59,130,246,0.15);color:#93c5fd;border:1px solid rgba(59,130,246,0.3);cursor:pointer;" title="Click to fetch trend & seasonal data">Fetch</button>`;
             }
 
             // Collected but no seasonal pattern detected (flat interest)
@@ -4428,40 +4428,8 @@
         // ============================================
         // TRENDS PROGRESS (auto-polling, no button needed)
         // ============================================
-        let trendsProgressInterval = null;
-        function startTrendsProgressPolling() {
-            const el = document.getElementById('trends-progress');
-            if (!el || trendsProgressInterval) return;
-
-            async function poll() {
-                try {
-                    const resp = await fetch('/api/cron/trends-status');
-                    const d = await resp.json();
-                    if (!d.success) return;
-
-                    const pct = d.total_keywords > 0 ? Math.round((d.trends_fresh_7d / d.total_keywords) * 100) : 0;
-                    const r = d.last_results || {};
-
-                    if (d.job_running) {
-                        el.innerHTML = `<span style="color:#fbbf24;">Collecting trends:</span> <strong>${d.trends_fresh_7d.toLocaleString()}</strong>/${d.total_keywords.toLocaleString()} (${pct}%)` +
-                            (r.success ? ` <span style="color:#4ade80;">${r.success} ok</span>` : '') +
-                            (r.failed ? ` <span style="color:#f87171;">${r.failed} err</span>` : '');
-                    } else if (pct < 100 && d.still_needed > 0) {
-                        el.innerHTML = `<span style="color:#94a3b8;">Trends:</span> <strong>${d.trends_fresh_7d.toLocaleString()}</strong>/${d.total_keywords.toLocaleString()} (${pct}%) <span style="color:#64748b;">${d.still_needed.toLocaleString()} pending</span>`;
-                    } else {
-                        el.innerHTML = `<span style="color:#4ade80;">Trends: ${d.trends_fresh_7d.toLocaleString()}/${d.total_keywords.toLocaleString()} (${pct}%)</span>`;
-                        // All done — slow down polling
-                        if (trendsProgressInterval) {
-                            clearInterval(trendsProgressInterval);
-                            trendsProgressInterval = setInterval(poll, 60000);
-                        }
-                    }
-                } catch (e) { /* silent */ }
-            }
-
-            poll(); // Run immediately
-            trendsProgressInterval = setInterval(poll, 10000); // Then every 10 seconds
-        }
+        // Trends progress polling removed — collection is manual
+        // Trends collection is now manual (Fetch button per keyword)
 
         // ============================================
         // EVENT LISTENERS
@@ -7572,7 +7540,6 @@
 
         // Initialize
         loadData();
-        startTrendsProgressPolling();
 
         // Auto-load Smart Picks on page load (it's the default tab)
         loadSmartPicks();
