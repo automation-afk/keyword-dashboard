@@ -125,6 +125,11 @@ CREATE TABLE IF NOT EXISTS keyword_trends (
     trend_change_pct DOUBLE PRECISION DEFAULT 0,
     current_interest INTEGER DEFAULT 0,
     data_points INTEGER DEFAULT 0,
+    peak_months TEXT DEFAULT NULL,
+    low_months TEXT DEFAULT NULL,
+    seasonality_score INTEGER DEFAULT 0,
+    publish_window TEXT DEFAULT NULL,
+    monthly_averages JSONB DEFAULT NULL,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 

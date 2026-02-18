@@ -616,9 +616,27 @@ def init_db():
             trend_change_pct DOUBLE PRECISION DEFAULT 0,
             current_interest INTEGER DEFAULT 0,
             data_points INTEGER DEFAULT 0,
+            peak_months TEXT DEFAULT NULL,
+            low_months TEXT DEFAULT NULL,
+            seasonality_score INTEGER DEFAULT 0,
+            publish_window TEXT DEFAULT NULL,
+            monthly_averages JSONB DEFAULT NULL,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
+
+    # Add seasonal columns to existing keyword_trends tables
+    for col, col_type in [
+        ('peak_months', 'TEXT DEFAULT NULL'),
+        ('low_months', 'TEXT DEFAULT NULL'),
+        ('seasonality_score', 'INTEGER DEFAULT 0'),
+        ('publish_window', 'TEXT DEFAULT NULL'),
+        ('monthly_averages', 'JSONB DEFAULT NULL'),
+    ]:
+        try:
+            c.execute(f'ALTER TABLE keyword_trends ADD COLUMN IF NOT EXISTS {col} {col_type}')
+        except Exception:
+            pass
 
     c.execute('''
         CREATE TABLE IF NOT EXISTS keywords_master (
@@ -1674,10 +1692,77 @@ def get_serpapi_autocomplete(keyword):
     except Exception as e:
         return {'success': False, 'error': str(e), 'source': 'serpapi'}
 
+def _analyze_seasonal_patterns(timeline_data):
+    """Analyze timeline data to detect seasonal patterns.
+    Groups data points by month across years, finds peaks/lows, and recommends publish windows."""
+    month_names = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+    month_buckets = {i: [] for i in range(12)}  # 0=Jan, 11=Dec
+
+    for point in timeline_data:
+        date_str = point.get('date', '')
+        values = point.get('values', [{}])
+        interest = values[0].get('extracted_value', 0) if values else 0
+
+        # Parse month from date string (e.g. "Jan 1 – 7, 2024" or "Jan 2024")
+        for i, name in enumerate(month_names):
+            if name in date_str:
+                month_buckets[i].append(interest)
+                break
+
+    # Calculate monthly averages
+    monthly_averages = {}
+    for i in range(12):
+        if month_buckets[i]:
+            monthly_averages[month_names[i]] = round(sum(month_buckets[i]) / len(month_buckets[i]), 1)
+        else:
+            monthly_averages[month_names[i]] = 0
+
+    avg_values = [v for v in monthly_averages.values() if v > 0]
+    if not avg_values:
+        return {'peak_months': None, 'low_months': None, 'seasonality_score': 0,
+                'publish_window': None, 'monthly_averages': monthly_averages}
+
+    overall_avg = sum(avg_values) / len(avg_values)
+
+    # Seasonality score: coefficient of variation (0-100)
+    if overall_avg > 0:
+        variance = sum((v - overall_avg) ** 2 for v in avg_values) / len(avg_values)
+        std_dev = variance ** 0.5
+        cv = (std_dev / overall_avg) * 100
+        seasonality_score = min(100, round(cv * 2.5))  # Scale: CV of 40% = score 100
+    else:
+        seasonality_score = 0
+
+    # Find peak months (>= 115% of average) and low months (<= 85% of average)
+    peak_threshold = overall_avg * 1.15
+    low_threshold = overall_avg * 0.85
+
+    peak_months = [month_names[i] for i in range(12) if monthly_averages[month_names[i]] >= peak_threshold]
+    low_months = [month_names[i] for i in range(12) if 0 < monthly_averages[month_names[i]] <= low_threshold]
+
+    # Determine publish window: 1-2 months before earliest peak
+    publish_window = None
+    if peak_months:
+        peak_indices = [month_names.index(m) for m in peak_months]
+        # Find the start of the biggest peak cluster
+        earliest_peak = min(peak_indices)
+        publish_month_idx = (earliest_peak - 2) % 12  # 2 months before peak
+        publish_end_idx = (earliest_peak - 1) % 12    # 1 month before peak
+        publish_window = f"{month_names[publish_month_idx]}-{month_names[publish_end_idx]}"
+
+    return {
+        'peak_months': ','.join(peak_months) if peak_months else None,
+        'low_months': ','.join(low_months) if low_months else None,
+        'seasonality_score': seasonality_score,
+        'publish_window': publish_window,
+        'monthly_averages': monthly_averages
+    }
+
 def get_serpapi_google_trends(keyword):
     """
     Get Google Trends data via SerpAPI.
-    Returns interest over time and whether keyword is rising/declining.
+    Returns interest over time, trend direction, and seasonal patterns.
+    Uses 5-year timeframe for seasonal analysis.
     """
     try:
         if not SERPAPI_API_KEY:
@@ -1689,7 +1774,8 @@ def get_serpapi_google_trends(keyword):
             "q": keyword,
             "api_key": SERPAPI_API_KEY,
             "geo": "US",
-            "data_type": "TIMESERIES"  # Interest over time
+            "data_type": "TIMESERIES",
+            "date": "today 5-y"  # 5 years for seasonal pattern detection
         }
 
         response = requests.get(url, params=params, timeout=30)
@@ -1701,16 +1787,19 @@ def get_serpapi_google_trends(keyword):
             interest_over_time = data.get('interest_over_time', {})
             timeline_data = interest_over_time.get('timeline_data', [])
 
-            # Calculate trend direction
+            # Calculate trend direction (compare recent 3 months vs same period last year)
             trend = 'stable'
             trend_change = 0
-            if len(timeline_data) >= 4:
-                # Compare recent vs older data
-                recent = timeline_data[-4:]  # Last 4 data points
-                older = timeline_data[:4]    # First 4 data points
+            if len(timeline_data) >= 8:
+                # With 5-year weekly data, last ~13 points ≈ 3 months, 52 points back ≈ 1 year ago
+                recent = timeline_data[-13:]  # Last ~3 months
+                # Same period last year (roughly)
+                year_ago_start = max(0, len(timeline_data) - 65)
+                year_ago_end = max(0, len(timeline_data) - 52)
+                older = timeline_data[year_ago_start:year_ago_end] if year_ago_end > year_ago_start else timeline_data[:13]
 
                 recent_avg = sum(d.get('values', [{}])[0].get('extracted_value', 0) for d in recent) / len(recent)
-                older_avg = sum(d.get('values', [{}])[0].get('extracted_value', 0) for d in older) / len(older)
+                older_avg = sum(d.get('values', [{}])[0].get('extracted_value', 0) for d in older) / len(older) if older else 0
 
                 if older_avg > 0:
                     trend_change = ((recent_avg - older_avg) / older_avg) * 100
@@ -1730,12 +1819,20 @@ def get_serpapi_google_trends(keyword):
                 if values:
                     current_interest = values[0].get('extracted_value', 0)
 
+            # Analyze seasonal patterns from 5-year data
+            seasonal = _analyze_seasonal_patterns(timeline_data)
+
             return {
                 'success': True,
                 'trend': trend,
                 'trend_change_pct': round(trend_change, 1),
                 'current_interest': current_interest,
                 'data_points': len(timeline_data),
+                'peak_months': seasonal['peak_months'],
+                'low_months': seasonal['low_months'],
+                'seasonality_score': seasonal['seasonality_score'],
+                'publish_window': seasonal['publish_window'],
+                'monthly_averages': seasonal['monthly_averages'],
                 'source': 'google_trends'
             }
         else:
@@ -2361,12 +2458,15 @@ def get_keywords():
                 additions[row[0]] = []
             additions[row[0]].append({'name': row[1] or row[2], 'source': row[3]})
 
-        # Get cached Google Trends data
-        c.execute('SELECT keyword, trend, trend_change_pct, current_interest FROM keyword_trends')
+        # Get cached Google Trends data (including seasonal patterns)
+        c.execute('SELECT keyword, trend, trend_change_pct, current_interest, peak_months, seasonality_score, publish_window FROM keyword_trends')
         trends_data = {row[0].lower(): {
             'trend': row[1],
             'trendChange': row[2],
-            'trendInterest': row[3]
+            'trendInterest': row[3],
+            'peakMonths': row[4],
+            'seasonalityScore': row[5] or 0,
+            'publishWindow': row[6]
         } for row in c.fetchall()}
 
         conn.close()
@@ -2419,11 +2519,14 @@ def get_keywords():
         # Add comment count
         kw['commentCount'] = comment_counts.get(k['keyword'], 0)
 
-        # Add Google Trends data
-        kw_trend = trends_data.get(keyword_lower, {'trend': 'unknown', 'trendChange': 0, 'trendInterest': 0})
+        # Add Google Trends data (including seasonal patterns)
+        kw_trend = trends_data.get(keyword_lower, {'trend': 'unknown', 'trendChange': 0, 'trendInterest': 0, 'peakMonths': None, 'seasonalityScore': 0, 'publishWindow': None})
         kw['trend'] = kw_trend['trend']
         kw['trendChange'] = kw_trend['trendChange']
         kw['trendInterest'] = kw_trend['trendInterest']
+        kw['peakMonths'] = kw_trend.get('peakMonths')
+        kw['seasonalityScore'] = kw_trend.get('seasonalityScore', 0)
+        kw['publishWindow'] = kw_trend.get('publishWindow')
 
         # Add who added this keyword
         kw['addedBy'] = additions.get(k['keyword'], [])
@@ -6745,7 +6848,8 @@ def get_keyword_trend():
         conn = get_db()
         c = conn.cursor()
         c.execute('''
-            SELECT trend, trend_change_pct, current_interest, data_points, updated_at
+            SELECT trend, trend_change_pct, current_interest, data_points, updated_at,
+                   peak_months, seasonality_score, publish_window
             FROM keyword_trends WHERE keyword = %s
             AND updated_at > NOW() - INTERVAL '7 days'
         ''', (keyword,))
@@ -6761,28 +6865,43 @@ def get_keyword_trend():
                 'current_interest': cached[2],
                 'data_points': cached[3],
                 'cached': True,
-                'updated_at': cached[4]
+                'updated_at': cached[4],
+                'peak_months': cached[5],
+                'seasonality_score': cached[6] or 0,
+                'publish_window': cached[7]
             })
 
         # Fetch from SerpAPI
         trend_data = get_serpapi_google_trends(keyword)
 
         if trend_data.get('success'):
+            import json as _json
             c.execute('''
-                INSERT INTO keyword_trends (keyword, trend, trend_change_pct, current_interest, data_points, updated_at)
-                VALUES (%s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+                INSERT INTO keyword_trends (keyword, trend, trend_change_pct, current_interest, data_points,
+                    peak_months, low_months, seasonality_score, publish_window, monthly_averages, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
                 ON CONFLICT(keyword) DO UPDATE SET
                     trend = EXCLUDED.trend,
                     trend_change_pct = EXCLUDED.trend_change_pct,
                     current_interest = EXCLUDED.current_interest,
                     data_points = EXCLUDED.data_points,
+                    peak_months = EXCLUDED.peak_months,
+                    low_months = EXCLUDED.low_months,
+                    seasonality_score = EXCLUDED.seasonality_score,
+                    publish_window = EXCLUDED.publish_window,
+                    monthly_averages = EXCLUDED.monthly_averages,
                     updated_at = CURRENT_TIMESTAMP
             ''', (
                 keyword,
                 trend_data.get('trend', 'unknown'),
                 trend_data.get('trend_change_pct', 0),
                 trend_data.get('current_interest', 0),
-                trend_data.get('data_points', 0)
+                trend_data.get('data_points', 0),
+                trend_data.get('peak_months'),
+                trend_data.get('low_months'),
+                trend_data.get('seasonality_score', 0),
+                trend_data.get('publish_window'),
+                _json.dumps(trend_data.get('monthly_averages')) if trend_data.get('monthly_averages') else None
             ))
             conn.commit()
 
@@ -6795,6 +6914,9 @@ def get_keyword_trend():
             'trend_change_pct': trend_data.get('trend_change_pct', 0),
             'current_interest': trend_data.get('current_interest', 0),
             'data_points': trend_data.get('data_points', 0),
+            'peak_months': trend_data.get('peak_months'),
+            'seasonality_score': trend_data.get('seasonality_score', 0),
+            'publish_window': trend_data.get('publish_window'),
             'cached': False,
             'error': trend_data.get('error')
         })
@@ -6841,21 +6963,33 @@ def collect_trends_data_background(batch_size=25):
                 trend_data = get_serpapi_google_trends(keyword)
 
                 if trend_data.get('success'):
+                    import json as _json
                     c.execute('''
-                        INSERT INTO keyword_trends (keyword, trend, trend_change_pct, current_interest, data_points, updated_at)
-                        VALUES (%s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+                        INSERT INTO keyword_trends (keyword, trend, trend_change_pct, current_interest, data_points,
+                            peak_months, low_months, seasonality_score, publish_window, monthly_averages, updated_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
                         ON CONFLICT(keyword) DO UPDATE SET
                             trend = EXCLUDED.trend,
                             trend_change_pct = EXCLUDED.trend_change_pct,
                             current_interest = EXCLUDED.current_interest,
                             data_points = EXCLUDED.data_points,
+                            peak_months = EXCLUDED.peak_months,
+                            low_months = EXCLUDED.low_months,
+                            seasonality_score = EXCLUDED.seasonality_score,
+                            publish_window = EXCLUDED.publish_window,
+                            monthly_averages = EXCLUDED.monthly_averages,
                             updated_at = CURRENT_TIMESTAMP
                     ''', (
                         keyword,
                         trend_data.get('trend', 'unknown'),
                         trend_data.get('trend_change_pct', 0),
                         trend_data.get('current_interest', 0),
-                        trend_data.get('data_points', 0)
+                        trend_data.get('data_points', 0),
+                        trend_data.get('peak_months'),
+                        trend_data.get('low_months'),
+                        trend_data.get('seasonality_score', 0),
+                        trend_data.get('publish_window'),
+                        _json.dumps(trend_data.get('monthly_averages')) if trend_data.get('monthly_averages') else None
                     ))
                     conn.commit()
                     results['success'] += 1
@@ -7498,8 +7632,8 @@ def opportunity_finder():
         yt_db = {row[0].lower(): {'avg_views': row[1], 'view_pattern': row[2]} for row in c.fetchall()}
 
         # Get trends
-        c.execute('SELECT keyword, trend, trend_change_pct, current_interest FROM keyword_trends')
-        trends = {row[0].lower(): {'trend': row[1], 'change': row[2], 'interest': row[3]} for row in c.fetchall()}
+        c.execute('SELECT keyword, trend, trend_change_pct, current_interest, peak_months, seasonality_score, publish_window FROM keyword_trends')
+        trends = {row[0].lower(): {'trend': row[1], 'change': row[2], 'interest': row[3], 'peakMonths': row[4], 'seasonalityScore': row[5] or 0, 'publishWindow': row[6]} for row in c.fetchall()}
 
         # Get vote scores
         c.execute('''
@@ -7665,6 +7799,20 @@ def opportunity_finder():
         else:
             feasibility += 3  # Unknown, slight credit
 
+        # 5b. Seasonal timing bonus (0-5 points) — boost keywords approaching their peak season
+        publish_window = trend_data.get('publishWindow')
+        if publish_window:
+            month_names = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+            current_month = month_names[datetime.now().month - 1]
+            peak_months_str = trend_data.get('peakMonths', '')
+            window_months = publish_window.split('-') if publish_window else []
+            if current_month in window_months:
+                feasibility += 5  # Publish NOW — approaching peak
+                levers.append(f"Publish now! Peak season ({peak_months_str}) approaching")
+            elif peak_months_str and current_month in peak_months_str.split(','):
+                feasibility += 3  # Currently in peak season
+                levers.append(f"Currently in peak season ({peak_months_str})")
+
         # 6. Keyword type bonus (0-5 points)
         type_bonus = {'deal': 5, 'comparison': 4, 'review': 3, 'best_of': 2, 'informational': 0, 'other': 1}
         feasibility += type_bonus.get(keyword_type, 1)
@@ -7708,6 +7856,9 @@ def opportunity_finder():
             'feasibility': feasibility,
             'trend': trend_direction,
             'trendChange': trend_change,
+            'peakMonths': trend_data.get('peakMonths'),
+            'seasonalityScore': trend_data.get('seasonalityScore', 0),
+            'publishWindow': trend_data.get('publishWindow'),
             'domScore': dom_score,
             'domRevenue': dom_actual_revenue,
             'voteScore': votes.get(keyword, 0),
@@ -8359,8 +8510,8 @@ def smart_picks():
         yt_db = {row[0].lower(): {'avg_views': row[1], 'view_pattern': row[2]} for row in c.fetchall()}
 
         # Get trends
-        c.execute('SELECT keyword, trend, trend_change_pct, current_interest FROM keyword_trends')
-        trends = {row[0].lower(): {'trend': row[1], 'change': row[2], 'interest': row[3]} for row in c.fetchall()}
+        c.execute('SELECT keyword, trend, trend_change_pct, current_interest, peak_months, seasonality_score, publish_window FROM keyword_trends')
+        trends = {row[0].lower(): {'trend': row[1], 'change': row[2], 'interest': row[3], 'peakMonths': row[4], 'seasonalityScore': row[5] or 0, 'publishWindow': row[6]} for row in c.fetchall()}
 
         # Get vote scores
         c.execute('''
@@ -8443,6 +8594,17 @@ def smart_picks():
         elif trend_dir == 'stable': smart_score += 5
         elif trend_dir == 'unknown': smart_score += 3
 
+        # Seasonal timing bonus (0-5 pts)
+        publish_window = trend_data.get('publishWindow')
+        if publish_window:
+            month_names = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+            current_month = month_names[datetime.now().month - 1]
+            window_months = publish_window.split('-') if publish_window else []
+            if current_month in window_months:
+                smart_score += 5  # Approaching peak season
+            elif trend_data.get('peakMonths') and current_month in trend_data.get('peakMonths', '').split(','):
+                smart_score += 3  # Currently in peak
+
         # Keyword type bonus (0-10 pts) — deals/comparisons convert best
         type_scores = {'deal': 10, 'comparison': 8, 'review': 6, 'best_of': 4, 'informational': 1, 'other': 2}
         smart_score += type_scores.get(keyword_type, 2)
@@ -8503,6 +8665,9 @@ def smart_picks():
             'willingness': round(willingness, 2),
             'trend': trend_dir,
             'trendChange': trend_data.get('change', 0),
+            'peakMonths': trend_data.get('peakMonths'),
+            'seasonalityScore': trend_data.get('seasonalityScore', 0),
+            'publishWindow': trend_data.get('publishWindow'),
             'reasons': reasons,
             'videoTitles': video_titles,
             'contentAngle': k.get('contentAngle', ''),
