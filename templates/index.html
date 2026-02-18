@@ -1486,17 +1486,11 @@
                 </div>
                 <div class="filter-group" style="margin-left: auto;">
                     <label>&nbsp;</label>
-                    <div style="display:flex;gap:8px;">
-                        <button class="export-btn" onclick="collectTrendsData()" id="collect-trends-btn" style="background:linear-gradient(135deg, #10b981, #059669);font-size:0.8rem;padding:8px 14px;">
-                            📈 Collect Trends
-                        </button>
-                        <button class="export-btn" onclick="stopTrendsCollection()" id="stop-trends-btn" style="background:linear-gradient(135deg, #ef4444, #dc2626);font-size:0.8rem;padding:8px 14px;display:none;">
-                            ⏹ Stop
-                        </button>
+                    <div style="display:flex;gap:8px;align-items:center;">
+                        <div id="trends-progress" style="font-size:0.75rem;color:#94a3b8;"></div>
                         <button class="export-btn" onclick="exportFiltered()">↓ Export CSV</button>
                     </div>
                 </div>
-                <div id="trends-status" style="display:none;padding:4px 0;font-size:0.75rem;color:#94a3b8;width:100%;text-align:right;"></div>
             </div>
 
             <div class="table-container">
@@ -4115,84 +4109,41 @@
         }
 
         // ============================================
-        // TRENDS COLLECTION
+        // TRENDS PROGRESS (auto-polling, no button needed)
         // ============================================
-        async function collectTrendsData() {
-            const btn = document.getElementById('collect-trends-btn');
-            const stopBtn = document.getElementById('stop-trends-btn');
-            const statusEl = document.getElementById('trends-status');
-            btn.disabled = true;
-            btn.style.display = 'none';
-            stopBtn.style.display = '';
-            statusEl.style.display = 'block';
-            statusEl.textContent = 'Starting trends collection...';
-            statusEl.style.color = '#4ade80';
+        let trendsProgressInterval = null;
+        function startTrendsProgressPolling() {
+            const el = document.getElementById('trends-progress');
+            if (!el || trendsProgressInterval) return;
 
-            try {
-                const response = await fetch('/api/cron/collect-trends?batch=25');
-                const data = await response.json();
+            async function poll() {
+                try {
+                    const resp = await fetch('/api/cron/trends-status');
+                    const d = await resp.json();
+                    if (!d.success) return;
 
-                // If already running or just started, poll for progress either way
-                if (data.success || (data.error && data.error.includes('already in progress'))) {
-                    statusEl.textContent = data.success ? 'Collection started...' : 'Collection already running — showing progress...';
-                    statusEl.style.color = '#4ade80';
+                    const pct = d.total_keywords > 0 ? Math.round((d.trends_fresh_7d / d.total_keywords) * 100) : 0;
+                    const r = d.last_results || {};
 
-                    // Poll for status updates every 5 seconds
-                    const pollInterval = setInterval(async () => {
-                        try {
-                            const statusResp = await fetch('/api/cron/trends-status');
-                            const statusData = await statusResp.json();
-
-                            if (statusData.success) {
-                                const r = statusData.last_results || {};
-                                const pct = statusData.total_keywords > 0 ? Math.round((statusData.trends_fresh_7d / statusData.total_keywords) * 100) : 0;
-                                statusEl.innerHTML = `<strong>${statusData.trends_fresh_7d.toLocaleString()}</strong>/${statusData.total_keywords.toLocaleString()} collected (${pct}%)` +
-                                    (r.success ? ` | <span style="color:#4ade80;">${r.success} ok</span>` : '') +
-                                    (r.failed ? ` | <span style="color:#f87171;">${r.failed} failed</span>` : '') +
-                                    (statusData.job_running ? ' | <span style="color:#fbbf24;">Running...</span>' : ' | <span style="color:#4ade80;">Done!</span>');
-
-                                if (!statusData.job_running) {
-                                    clearInterval(pollInterval);
-                                    btn.disabled = false;
-                                    btn.style.display = '';
-                                    stopBtn.style.display = 'none';
-                                    btn.textContent = '📈 Collect Trends';
-                                    await loadData();
-                                    setTimeout(() => { statusEl.style.display = 'none'; }, 10000);
-                                }
-                            }
-                        } catch (e) {
-                            console.error('Error polling trends status:', e);
+                    if (d.job_running) {
+                        el.innerHTML = `<span style="color:#fbbf24;">Collecting trends:</span> <strong>${d.trends_fresh_7d.toLocaleString()}</strong>/${d.total_keywords.toLocaleString()} (${pct}%)` +
+                            (r.success ? ` <span style="color:#4ade80;">${r.success} ok</span>` : '') +
+                            (r.failed ? ` <span style="color:#f87171;">${r.failed} err</span>` : '');
+                    } else if (pct < 100 && d.still_needed > 0) {
+                        el.innerHTML = `<span style="color:#94a3b8;">Trends:</span> <strong>${d.trends_fresh_7d.toLocaleString()}</strong>/${d.total_keywords.toLocaleString()} (${pct}%) <span style="color:#64748b;">${d.still_needed.toLocaleString()} pending</span>`;
+                    } else {
+                        el.innerHTML = `<span style="color:#4ade80;">Trends: ${d.trends_fresh_7d.toLocaleString()}/${d.total_keywords.toLocaleString()} (${pct}%)</span>`;
+                        // All done — slow down polling
+                        if (trendsProgressInterval) {
+                            clearInterval(trendsProgressInterval);
+                            trendsProgressInterval = setInterval(poll, 60000);
                         }
-                    }, 5000);
-                } else {
-                    statusEl.textContent = 'Error: ' + (data.error || 'Failed to start');
-                    statusEl.style.color = '#f87171';
-                    btn.disabled = false;
-                    btn.style.display = '';
-                    stopBtn.style.display = 'none';
-                    btn.textContent = '📈 Collect Trends';
-                }
-            } catch (error) {
-                console.error('Error starting trends collection:', error);
-                statusEl.textContent = 'Error: ' + error.message;
-                statusEl.style.color = '#f87171';
-                btn.disabled = false;
-                btn.style.display = '';
-                stopBtn.style.display = 'none';
-                btn.textContent = '📈 Collect Trends';
+                    }
+                } catch (e) { /* silent */ }
             }
-        }
 
-        async function stopTrendsCollection() {
-            const stopBtn = document.getElementById('stop-trends-btn');
-            stopBtn.disabled = true;
-            stopBtn.textContent = '⏹ Stopping...';
-            try {
-                await fetch('/api/cron/stop-trends');
-            } catch (e) {
-                console.error('Error stopping trends:', e);
-            }
+            poll(); // Run immediately
+            trendsProgressInterval = setInterval(poll, 10000); // Then every 10 seconds
         }
 
         // ============================================
@@ -7304,6 +7255,7 @@
 
         // Initialize
         loadData();
+        startTrendsProgressPolling();
 
         // Auto-load Smart Picks on page load (it's the default tab)
         loadSmartPicks();
