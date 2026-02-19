@@ -2308,17 +2308,18 @@
             <div class="research-box">
                 <h2 style="margin-bottom:8px;">Content Gap Analysis</h2>
                 <p style="color:#94a3b8;margin-bottom:16px;">
-                    Compare Digidom's YouTube keyword coverage against competitors.
-                    Find keywords they rank for that you're missing.
+                    Weekly scan of competitor YouTube channels. Discovers keywords they target that you're missing.
                 </p>
                 <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
                     <button class="research-btn" id="cg-load-competitors-btn" onclick="loadGapCompetitors()"
                             style="background:linear-gradient(135deg, #ec4899, #8b5cf6);">
-                        <span id="cg-comp-btn-text">Discover Top Competitors</span>
+                        <span id="cg-comp-btn-text">Load Competitors</span>
                         <div class="spinner" id="cg-comp-spinner" style="display:none;"></div>
                     </button>
-                    <button id="cg-refresh-btn" onclick="loadGapCompetitors(null, true)" style="display:none;background:#334155;color:#94a3b8;border:none;padding:8px 14px;border-radius:8px;cursor:pointer;font-size:0.8rem;">Refresh from BigQuery</button>
-                    <span id="cg-cache-info" style="display:none;color:#64748b;font-size:0.7rem;"></span>
+                    <span id="cg-scan-status" style="color:#64748b;font-size:0.75rem;"></span>
+                </div>
+                <div id="cg-scan-progress" style="display:none;margin-top:12px;padding:10px;background:rgba(251,191,36,0.1);border:1px solid rgba(251,191,36,0.2);border-radius:8px;">
+                    <span style="color:#fbbf24;font-size:0.85rem;" id="cg-scan-progress-text">Scanning...</span>
                 </div>
             </div>
 
@@ -2451,9 +2452,10 @@
 
             <!-- Empty state -->
             <div id="cg-empty-state" class="research-box" style="text-align:center;padding:60px;">
-                <h3 style="color:#94a3b8;margin-bottom:12px;">Click "Discover Top Competitors" to begin</h3>
+                <h3 style="color:#94a3b8;margin-bottom:12px;">No scan data yet</h3>
                 <p style="color:#64748b;font-size:0.85rem;">
-                    Analyzes BigQuery SERP data to find which competitor channels dominate keywords you're not covering.
+                    Competitor channels are scanned automatically every Monday.<br>
+                    The scan discovers the top 30 competitors from BigQuery SERP data, scrapes their YouTube channels, and extracts target keywords from video titles.
                 </p>
             </div>
         </div>
@@ -7145,24 +7147,22 @@
         let cgAnalysisData = null;
         let cgGapDisplayLimit = 30;
         let cgSiloCounts = {};
+        let cgScanPollInterval = null;
 
-        async function loadGapCompetitors(silo, refresh) {
+        async function loadGapCompetitors(silo) {
             const btn = document.getElementById('cg-load-competitors-btn');
             const btnText = document.getElementById('cg-comp-btn-text');
             const spinner = document.getElementById('cg-comp-spinner');
-            const refreshBtn = document.getElementById('cg-refresh-btn');
-            const cacheInfo = document.getElementById('cg-cache-info');
 
             btn.disabled = true;
-            if (refreshBtn) refreshBtn.disabled = true;
-            btnText.textContent = refresh ? 'Refreshing from BigQuery...' : 'Discovering...';
+            btnText.textContent = 'Loading...';
             spinner.style.display = 'block';
 
+            // Also load scan status
+            loadScanStatus();
+
             let url = '/api/content-gap/competitors';
-            const params = [];
-            if (silo) params.push('silo=' + encodeURIComponent(silo));
-            if (refresh) params.push('refresh=true');
-            if (params.length) url += '?' + params.join('&');
+            if (silo) url += '?silo=' + encodeURIComponent(silo);
 
             try {
                 const response = await fetch(url);
@@ -7172,6 +7172,11 @@
                 try { data = JSON.parse(text); } catch(e) { alert('Server returned invalid response. Check if you are logged in.'); console.error('Response:', text.substring(0, 200)); return; }
 
                 if (data.success) {
+                    if (data.no_scan_data) {
+                        document.getElementById('cg-empty-state').style.display = 'block';
+                        document.getElementById('cg-competitor-selection').style.display = 'none';
+                        return;
+                    }
                     cgCompetitors = data.competitors;
                     cgSelectedCompetitors = [];
                     renderCompetitorCards(data.competitors);
@@ -7183,15 +7188,6 @@
                         if (data.silo_counts) cgSiloCounts = data.silo_counts;
                         populateCgSiloFilter();
                     }
-                    // Show cache info and refresh button
-                    if (refreshBtn) refreshBtn.style.display = '';
-                    if (cacheInfo && data.cache_updated) {
-                        cacheInfo.style.display = '';
-                        cacheInfo.textContent = 'Data from: ' + data.cache_updated + (data.stale ? ' (stale)' : '');
-                    } else if (cacheInfo) {
-                        cacheInfo.style.display = '';
-                        cacheInfo.textContent = 'Fresh data loaded just now';
-                    }
                 } else {
                     alert('Error: ' + (data.error || 'Unknown'));
                 }
@@ -7200,9 +7196,45 @@
                 alert('Error loading competitors: ' + error.message);
             } finally {
                 btn.disabled = false;
-                if (refreshBtn) refreshBtn.disabled = false;
-                btnText.textContent = 'Discover Top Competitors';
+                btnText.textContent = 'Load Competitors';
                 spinner.style.display = 'none';
+            }
+        }
+
+        async function loadScanStatus() {
+            try {
+                const resp = await fetch('/api/content-gap/scan-status');
+                const data = await resp.json();
+                const statusEl = document.getElementById('cg-scan-status');
+                const progressEl = document.getElementById('cg-scan-progress');
+                const progressText = document.getElementById('cg-scan-progress-text');
+
+                if (data.running) {
+                    progressEl.style.display = 'block';
+                    const p = data.progress || {};
+                    progressText.textContent = `Scanning: ${p.channel || '...'} (${p.done || 0}/${p.total || '?'} channels)`;
+                    // Start polling if not already
+                    if (!cgScanPollInterval) {
+                        cgScanPollInterval = setInterval(loadScanStatus, 5000);
+                    }
+                } else {
+                    progressEl.style.display = 'none';
+                    if (cgScanPollInterval) {
+                        clearInterval(cgScanPollInterval);
+                        cgScanPollInterval = null;
+                        // Reload competitors after scan completes
+                        loadGapCompetitors();
+                    }
+                }
+
+                if (data.last_scan) {
+                    const ls = data.last_scan;
+                    statusEl.textContent = `Last scan: ${ls.date} | ${ls.channels_done}/${ls.channels_attempted} channels | ${(ls.total_keywords || 0).toLocaleString()} keywords`;
+                } else if (!data.running) {
+                    statusEl.textContent = 'No scans yet';
+                }
+            } catch (e) {
+                console.error('Scan status error:', e);
             }
         }
 
@@ -7223,9 +7255,7 @@
                         <span style="color:#f87171;font-weight:600;">${c.gap_count} gaps</span>
                         <span style="color:#fb923c;">${c.not_ranking_count || 0} not ranking</span>
                         <span style="color:#60a5fa;">${c.overlap_count} overlap</span>
-                        <span style="color:#4ade80;">${c.win_count} we win</span>
-                        <span style="color:#94a3b8;">Avg #${c.avg_rank}</span>
-                        <span style="color:#fbbf24;">${(c.total_views / 1000000).toFixed(1)}M views</span>
+                        <span style="color:#94a3b8;">${c.keyword_count} total kws</span>
                     </div>
                 </div>
             `).join('');
@@ -7367,7 +7397,15 @@
                 let compCells = '';
                 comps.forEach(c => {
                     const cd = g.competitors[c];
-                    compCells += `<td style="padding:10px;text-align:center;">${cd ? cgRankBadge(cd.rank) : '-'}</td>`;
+                    if (cd) {
+                        if (cd.rank) {
+                            compCells += `<td style="padding:10px;text-align:center;">${cgRankBadge(cd.rank)}</td>`;
+                        } else {
+                            compCells += `<td style="padding:10px;text-align:center;"><span style="color:#a78bfa;font-size:0.7rem;" title="${escapeHtml(cd.video_title || '')}">video</span></td>`;
+                        }
+                    } else {
+                        compCells += `<td style="padding:10px;text-align:center;">-</td>`;
+                    }
                 });
                 return `<tr style="border-bottom:1px solid rgba(71,85,105,0.2);">
                     <td style="padding:10px;color:#e2e8f0;">${escapeHtml(g.keyword)}</td>
@@ -7406,7 +7444,11 @@
                 let compCells = '';
                 comps.forEach(c => {
                     const cd = g.competitors[c];
-                    compCells += `<td style="padding:10px;text-align:center;">${cd ? cgRankBadge(cd.rank) : '-'}</td>`;
+                    if (cd) {
+                        compCells += `<td style="padding:10px;text-align:center;">${cd.rank ? cgRankBadge(cd.rank) : '<span style="color:#a78bfa;font-size:0.7rem;" title="' + escapeHtml(cd.video_title || '') + '">video</span>'}</td>`;
+                    } else {
+                        compCells += `<td style="padding:10px;text-align:center;">-</td>`;
+                    }
                 });
                 return `<tr style="border-bottom:1px solid rgba(71,85,105,0.2);">
                     <td style="padding:10px;color:#e2e8f0;">${escapeHtml(g.keyword)}</td>
@@ -7432,17 +7474,22 @@
             document.getElementById('cg-overlap-thead').innerHTML = headerHtml;
 
             document.getElementById('cg-overlap-tbody').innerHTML = data.overlap_keywords.slice(0, 50).map(o => {
-                const compRanks = Object.values(o.competitors).map(c => c.rank);
-                const bestCompRank = Math.min(...compRanks);
+                const compRanks = Object.values(o.competitors).map(c => c.rank).filter(r => r != null);
+                const bestCompRank = compRanks.length ? Math.min(...compRanks) : null;
                 let status = '', statusColor = '#94a3b8';
-                if (o.digidom_rank < bestCompRank) { status = 'Winning'; statusColor = '#4ade80'; }
+                if (!bestCompRank) { status = 'We rank'; statusColor = '#4ade80'; }
+                else if (o.digidom_rank < bestCompRank) { status = 'Winning'; statusColor = '#4ade80'; }
                 else if (o.digidom_rank > bestCompRank) { status = 'Losing'; statusColor = '#f87171'; }
                 else { status = 'Tied'; statusColor = '#fbbf24'; }
 
                 let compCells = '';
                 comps.forEach(c => {
                     const cd = o.competitors[c];
-                    compCells += `<td style="padding:10px;text-align:center;">${cd ? cgRankBadge(cd.rank) : '-'}</td>`;
+                    if (cd) {
+                        compCells += `<td style="padding:10px;text-align:center;">${cd.rank ? cgRankBadge(cd.rank) : '<span style="color:#a78bfa;font-size:0.7rem;">video</span>'}</td>`;
+                    } else {
+                        compCells += `<td style="padding:10px;text-align:center;">-</td>`;
+                    }
                 });
 
                 return `<tr style="border-bottom:1px solid rgba(71,85,105,0.2);">
@@ -7577,6 +7624,7 @@
                     }
                 }
                 if (this.dataset.tab === 'contentgap') {
+                    loadScanStatus();
                     if (!cgCompetitors.length) {
                         loadGapCompetitors();
                     }
@@ -7874,7 +7922,7 @@ const FAQ_DATA = [
     },
     {
         keywords: ['content gap', 'competitor', 'competitors', 'compare', 'gap analysis', 'they rank', 'what am i missing', 'ranking that we are not', 'side by side', 'competitor channels', 'competitor comparison'],
-        answer: 'The **Content Gap** tab does side-by-side comparison with competitor channels.\n\n**How to use it:**\n1. Click **"Discover Top Competitors"** to find top YouTube channels in your niches\n2. Select 2-3 competitors from the list\n3. Use the **Silo filter** to focus on a specific niche\n4. Click **"Analyze Content Gaps"**\n\n**3 views available:**\n- **Gaps** - keywords they rank for that you don\'t (your biggest opportunities!)\n- **Overlap** - keywords you both rank for\n- **Winning** - keywords you rank for that they don\'t\n\n**Bonus:** Click **"Enrich Top 20 Gap Keywords"** to get volume, competition, CPC, and trends for the best gap keywords.'
+        answer: 'The **Content Gap** tab scans competitor YouTube channels weekly to find keywords they target.\n\n**How it works:**\n1. Every Monday, the app scrapes top 30 competitor channels and extracts keywords from their video titles\n2. Click **"Load Competitors"** to see scanned channels\n3. Select competitors and click **"Analyze Content Gaps"**\n4. Or click **"Run Scan Now"** for a manual scan (takes 5-15 min)\n\n**4 views available:**\n- **Gaps** - keywords they target that you don\'t have at all\n- **Not Ranking** - in your library but you\'re not ranking\n- **Overlap** - keywords you both rank for\n- **Winning** - keywords you rank for that they don\'t target\n\n**Bonus:** Click **"Enrich Top 20 Gap Keywords"** for volume, CPC, and trends.'
     },
     {
         keywords: ['not covering', 'not covered', 'keywords we don\'t have', 'what keywords are ranking', 'identify keywords', 'keywords ranking that we are not', 'keywords we are missing'],

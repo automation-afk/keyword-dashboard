@@ -179,6 +179,35 @@ CREATE TABLE IF NOT EXISTS priority_keywords (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS competitor_channel_keywords (
+    id SERIAL PRIMARY KEY,
+    channel_name TEXT NOT NULL,
+    keyword TEXT NOT NULL,
+    keyword_normalized TEXT NOT NULL,
+    keyword_type TEXT,
+    source_video_title TEXT,
+    source_video_views TEXT,
+    source_video_link TEXT,
+    silo TEXT,
+    scanned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(channel_name, keyword_normalized)
+);
+CREATE INDEX IF NOT EXISTS idx_cck_keyword ON competitor_channel_keywords(keyword_normalized);
+CREATE INDEX IF NOT EXISTS idx_cck_channel ON competitor_channel_keywords(channel_name);
+
+CREATE TABLE IF NOT EXISTS competitor_scan_log (
+    id SERIAL PRIMARY KEY,
+    scan_date DATE NOT NULL,
+    channel_name TEXT NOT NULL,
+    videos_found INTEGER DEFAULT 0,
+    keywords_extracted INTEGER DEFAULT 0,
+    status TEXT DEFAULT 'pending',
+    error TEXT,
+    started_at TIMESTAMP,
+    completed_at TIMESTAMP,
+    UNIQUE(scan_date, channel_name)
+);
+
 -- Disable RLS so the app can read/write without policies
 ALTER TABLE keyword_labels ENABLE ROW LEVEL SECURITY;
 ALTER TABLE keywords_master ENABLE ROW LEVEL SECURITY;
