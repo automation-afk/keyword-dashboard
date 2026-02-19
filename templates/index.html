@@ -7172,11 +7172,6 @@
                 try { data = JSON.parse(text); } catch(e) { alert('Server returned invalid response. Check if you are logged in.'); console.error('Response:', text.substring(0, 200)); return; }
 
                 if (data.success) {
-                    if (data.no_scan_data) {
-                        document.getElementById('cg-empty-state').style.display = 'block';
-                        document.getElementById('cg-competitor-selection').style.display = 'none';
-                        return;
-                    }
                     cgCompetitors = data.competitors;
                     cgSelectedCompetitors = [];
                     renderCompetitorCards(data.competitors);
