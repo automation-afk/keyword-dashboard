@@ -7310,9 +7310,9 @@
             document.getElementById('cg-total-compared').textContent = s.total_keywords_compared.toLocaleString();
 
             document.getElementById('cg-library-status').textContent =
-                s.gap_not_in_library + ' gap keywords are NOT in your library';
+                s.gap_count + ' new keyword opportunities found';
             document.getElementById('cg-library-detail').textContent =
-                s.gap_in_library + ' gap keywords already tracked. ' + s.gap_not_in_library + ' are completely new opportunities.';
+                s.gap_in_library + ' keywords already in your library were excluded from gaps.';
 
             document.getElementById('cg-gaps-badge').textContent = s.gap_count;
             document.getElementById('cg-overlap-badge').textContent = s.overlap_count;

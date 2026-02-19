@@ -9268,6 +9268,10 @@ def content_gap_analysis():
 
         gap_keywords.sort(key=lambda x: x['search_volume'], reverse=True)
 
+        # Filter out keywords already in library - they're not real gaps
+        gap_in_library_count = sum(1 for g in gap_keywords if g['in_library'])
+        gap_keywords = [g for g in gap_keywords if not g['in_library']]
+
         # Enrich top 30 gap keywords with revenue estimates
         for gk in gap_keywords[:30]:
             yt_data = {'view_pattern': 'distributed', 'avg_views': 0, 'video_count': 0}
@@ -9304,8 +9308,8 @@ def content_gap_analysis():
                 'overlap_count': len(overlap_keywords),
                 'total_gap_volume': total_gap_volume,
                 'top_30_gap_revenue': round(total_gap_revenue, 0),
-                'gap_in_library': sum(1 for g in gap_keywords if g['in_library']),
-                'gap_not_in_library': sum(1 for g in gap_keywords if not g['in_library']),
+                'gap_in_library': gap_in_library_count,
+                'gap_not_in_library': len(gap_keywords),
             },
         }
         set_bq_cache(cache_key, result)
