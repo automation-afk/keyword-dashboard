@@ -402,22 +402,76 @@ def supabase_rest_insert(table, rows, upsert=False):
         print(f"[SUPABASE-REST] INSERT {table} error: {e}")
         return False
 
-def get_db():
-    """Get a Postgres database connection.
-    Tries: pooler URL first (works on Railway/serverless) → direct URL fallback."""
-    global _last_db_error, _db_unreachable_since
+_db_pool = None
+
+def _init_db_pool():
+    """Initialize a persistent connection pool to Supabase."""
+    global _db_pool
+    from psycopg2 import pool as pg_pool
     from urllib.parse import urlparse, unquote
 
-    # Skip retries if DB was unreachable in the last 60 seconds (fast startup)
+    dsn = DATABASE_POOLER_URL or DATABASE_URL
+    if not dsn:
+        print("[DB-POOL] No DATABASE_URL configured")
+        return
+
+    try:
+        parsed = urlparse(dsn)
+        _db_pool = pg_pool.ThreadedConnectionPool(
+            minconn=2,
+            maxconn=10,
+            host=parsed.hostname,
+            port=parsed.port or 5432,
+            dbname=parsed.path.lstrip('/') or 'postgres',
+            user=unquote(parsed.username or 'postgres'),
+            password=unquote(parsed.password or ''),
+            connect_timeout=10
+        )
+        print(f"[DB-POOL] Connection pool initialized (2-10 connections)")
+    except Exception as e:
+        print(f"[DB-POOL] Failed to create pool: {e}")
+        _db_pool = None
+
+# Initialize pool at import time
+_init_db_pool()
+
+
+def get_db():
+    """Get a Postgres database connection from the pool.
+    Falls back to direct connection if pool unavailable."""
+    global _db_pool, _last_db_error, _db_unreachable_since
+    from urllib.parse import urlparse, unquote
+
+    # Try pool first (instant — no new TCP connection)
+    if _db_pool:
+        try:
+            conn = _db_pool.getconn()
+            conn.autocommit = False
+            # Test if connection is alive
+            try:
+                conn.cursor().execute('SELECT 1')
+            except Exception:
+                # Connection died, get a fresh one
+                _db_pool.putconn(conn, close=True)
+                conn = _db_pool.getconn()
+                conn.autocommit = False
+            _last_db_error = None
+            _db_unreachable_since = None
+            return conn
+        except Exception as e:
+            print(f"[DB-POOL] Pool getconn failed: {e}")
+
+    # Skip retries if DB was unreachable in the last 60 seconds
     if _db_unreachable_since and (datetime.now() - _db_unreachable_since).total_seconds() < 60:
         raise ConnectionError(f"[DB] Skipping (unreachable since {_db_unreachable_since.strftime('%H:%M:%S')}): {_last_db_error}")
 
     errors = []
 
-    # Attempt 1: Connection pooler URL (most reliable on Railway/serverless)
-    if DATABASE_POOLER_URL:
+    # Fallback: direct connection
+    dsn = DATABASE_POOLER_URL or DATABASE_URL
+    if dsn:
         try:
-            parsed = urlparse(DATABASE_POOLER_URL)
+            parsed = urlparse(dsn)
             conn = psycopg2.connect(
                 host=parsed.hostname,
                 port=parsed.port or 5432,
@@ -430,41 +484,30 @@ def get_db():
             _last_db_error = None
             _db_unreachable_since = None
             return conn
-        except Exception as e1:
-            errors.append(f"pooler: {e1}")
+        except Exception as e:
+            errors.append(f"direct: {e}")
 
-    # Attempt 2: Parse and connect to direct URL
-    try:
-        parsed = urlparse(DATABASE_URL)
-        conn = psycopg2.connect(
-            host=parsed.hostname,
-            port=parsed.port or 5432,
-            dbname=parsed.path.lstrip('/') or 'postgres',
-            user=unquote(parsed.username or 'postgres'),
-            password=unquote(parsed.password or ''),
-            connect_timeout=5
-        )
-        conn.autocommit = False
-        _last_db_error = None
-        _db_unreachable_since = None
-        return conn
-    except Exception as e2:
-        errors.append(f"direct(parsed): {e2}")
-
-    # Attempt 3: Raw direct URL
-    try:
-        conn = psycopg2.connect(DATABASE_URL, connect_timeout=5)
-        conn.autocommit = False
-        _last_db_error = None
-        _db_unreachable_since = None
-        return conn
-    except Exception as e3:
-        errors.append(f"direct(raw): {e3}")
-
-    # All attempts failed
     _last_db_error = '; '.join(errors)
     _db_unreachable_since = datetime.now()
     raise ConnectionError(f"[DB] All connection attempts failed: {_last_db_error}")
+
+
+def release_db(conn):
+    """Return a connection to the pool (or close it if not pooled)."""
+    global _db_pool
+    if _db_pool and conn:
+        try:
+            _db_pool.putconn(conn)
+        except Exception:
+            try:
+                release_db(conn)
+            except Exception:
+                pass
+    elif conn:
+        try:
+            release_db(conn)
+        except Exception:
+            pass
 
 def init_db():
     """Initialize Postgres database tables"""
@@ -695,7 +738,7 @@ def init_db():
     ''')
 
     conn.commit()
-    conn.close()
+    release_db(conn)
 
 try:
     init_db()
@@ -714,9 +757,9 @@ def seed_priority_keywords():
         count = c.fetchone()[0]
         if count > 0:
             print(f"[SEED] priority_keywords already has {count} rows, skipping seed")
-            conn.close()
+            release_db(conn)
             return
-        conn.close()
+        release_db(conn)
 
         # Re-open with autocommit to avoid Supabase statement_timeout
         conn = get_db()
@@ -775,7 +818,7 @@ def seed_priority_keywords():
                     csv_count += 1
             print(f"[SEED] Inserted {csv_count} keywords from keywords.csv (inactive)")
 
-        conn.close()
+        release_db(conn)
         print(f"[SEED] Priority keywords seeded successfully")
     except Exception as e:
         print(f"[SEED] Error seeding priority_keywords: {e}")
@@ -817,7 +860,7 @@ try:
                         _fixed += _c.rowcount
         if _fixed > 0:
             print(f"[SEED-FIX] Updated {_fixed} keyword relationships from tracking JSON")
-    _conn.close()
+    _release_db(conn)
 except Exception as e:
     print(f"[SEED-FIX] Warning: {e}")
 
@@ -836,13 +879,13 @@ def migrate_csv_to_db():
     c.execute('SELECT COUNT(*) FROM keywords_master')
     if c.fetchone()[0] > 0:
         print("[MIGRATION] keywords_master already populated, skipping CSV import")
-        conn.close()
+        release_db(conn)
         return
 
     csv_path = os.path.join(os.path.dirname(__file__), 'data', 'keywords.csv')
     if not os.path.exists(csv_path):
         print("[MIGRATION] CSV file not found, skipping")
-        conn.close()
+        release_db(conn)
         return
 
     imported = 0
@@ -893,7 +936,7 @@ def migrate_csv_to_db():
                 print(f"[MIGRATION] Error importing '{keyword}': {e}")
 
     conn.commit()
-    conn.close()
+    release_db(conn)
     print(f"[MIGRATION] Imported {imported} keywords from CSV into keywords_master")
 
 migrate_csv_to_db()
@@ -1043,7 +1086,7 @@ def load_keywords():
         ''')
         for row in c.fetchall():
             keywords.append(_row_to_keyword(row))
-        conn.close()
+        release_db(conn)
         if keywords:
             print(f"[KEYWORDS] Loaded {len(keywords)} keywords from Postgres")
             return keywords
@@ -1122,7 +1165,7 @@ def ensure_tracking_keywords_in_master():
                             pass
 
         conn.commit()
-        conn.close()
+        release_db(conn)
         if inserted > 0:
             print(f"[TRACKING-IMPORT] Inserted {inserted} new keywords from tracking config into keywords_master")
             # Reload global KEYWORDS list to include newly added keywords
@@ -2469,7 +2512,7 @@ def get_keywords():
         # Use in-memory trends cache (no DB query needed)
         trends_data = TRENDS_CACHE
 
-        conn.close()
+        release_db(conn)
         db_available = True
     except Exception as db_err:
         print(f"[API/keywords] DB unavailable, serving {len(KEYWORDS)} keywords from memory: {db_err}")
@@ -2783,7 +2826,7 @@ def set_label():
                      ON CONFLICT(keyword) DO UPDATE SET label=%s, label_updated_by=%s, updated_at=CURRENT_TIMESTAMP''',
                   (keyword, label, user_email, label, user_email))
         conn.commit()
-        conn.close()
+        release_db(conn)
         return jsonify({'success': True, 'keyword': keyword, 'label': label, 'updatedBy': user_email})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -2812,7 +2855,7 @@ def toggle_favorite():
                       (keyword, True, user_email))
 
         conn.commit()
-        conn.close()
+        release_db(conn)
         return jsonify({'success': True, 'keyword': keyword, 'favorite': new_status, 'updatedBy': user_email})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -2842,7 +2885,7 @@ def save_notes():
             ON CONFLICT(keyword) DO UPDATE SET notes=%s, notes_updated_by=%s, updated_at=CURRENT_TIMESTAMP
         ''', (keyword, notes, user_email, notes, user_email))
         conn.commit()
-        conn.close()
+        release_db(conn)
         return jsonify({'success': True, 'keyword': keyword, 'updatedBy': user_email})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -2893,7 +2936,7 @@ def vote_keyword():
         user_vote = user_vote_row[0] if user_vote_row else 0
 
         conn.commit()
-        conn.close()
+        release_db(conn)
         return jsonify({
             'success': True,
             'keyword': keyword,
@@ -2939,7 +2982,7 @@ def get_all_votes():
                 voters[row[0]] = []
             voters[row[0]].append({'name': row[1] or row[0], 'vote': row[2]})
 
-        conn.close()
+        release_db(conn)
         return jsonify({
             'success': True,
             'vote_counts': vote_counts,
@@ -2985,7 +3028,7 @@ def get_comments():
                 'updated_at': row[6]
             })
 
-        conn.close()
+        release_db(conn)
         return jsonify({'success': True, 'comments': comments})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -3016,7 +3059,7 @@ def add_comment():
         comment_id = c.lastrowid
 
         conn.commit()
-        conn.close()
+        release_db(conn)
         return jsonify({
             'success': True,
             'comment': {
@@ -3046,15 +3089,15 @@ def delete_comment(comment_id):
         c.execute('SELECT user_email FROM keyword_comments WHERE id = %s', (comment_id,))
         row = c.fetchone()
         if not row:
-            conn.close()
+            release_db(conn)
             return jsonify({'success': False, 'error': 'Comment not found'}), 404
         if row[0] != user_email:
-            conn.close()
+            release_db(conn)
             return jsonify({'success': False, 'error': 'Not authorized to delete this comment'}), 403
 
         c.execute('DELETE FROM keyword_comments WHERE id = %s', (comment_id,))
         conn.commit()
-        conn.close()
+        release_db(conn)
         return jsonify({'success': True})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -3168,7 +3211,7 @@ def add_to_library():
         ''', (keyword, user_email, f'[Added by {user_name or user_email} from {source}]', user_email))
 
         conn.commit()
-        conn.close()
+        release_db(conn)
         return jsonify({
             'success': True,
             'keyword': keyword,
@@ -3248,7 +3291,7 @@ def add_keyword_manual():
             added.append(keyword)
 
         conn.commit()
-        conn.close()
+        release_db(conn)
 
         return jsonify({
             'success': True,
@@ -3282,7 +3325,7 @@ def get_keyword_additions():
                 'source_detail': row[4],
                 'created_at': row[5]
             })
-        conn.close()
+        release_db(conn)
         return jsonify({'success': True, 'additions': additions})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -3413,7 +3456,7 @@ def add_channel_keywords_to_library():
             added.append(keyword)
 
         conn.commit()
-        conn.close()
+        release_db(conn)
 
         return jsonify({
             'success': True,
@@ -3433,7 +3476,7 @@ def analyze_revenue():
         c = conn.cursor()
         c.execute('SELECT r.keyword, r.video_views, r.affiliate_clicks, r.conversions, r.revenue, k.search_volume, k.yt_avg_views, k.yt_view_pattern FROM revenue_data r LEFT JOIN researched_keywords k ON r.keyword = k.keyword')
         rows = c.fetchall()
-        conn.close()
+        release_db(conn)
 
         if not rows:
             return jsonify({'success': True, 'message': 'No revenue data yet. Add revenue data to enable pattern analysis.', 'patterns': []})
@@ -5823,7 +5866,7 @@ def get_available_keywords():
         c = conn.cursor()
         c.execute('SELECT keyword, tier, niche, priority_score, search_volume, source, is_active, added_by, is_primary, parent_keyword FROM priority_keywords ORDER BY priority_score DESC, keyword')
         db_rows = c.fetchall()
-        conn.close()
+        release_db(conn)
 
         db_keywords = {}
         for row in db_rows:
@@ -5933,7 +5976,7 @@ def get_priority_keywords():
         c = conn.cursor()
         c.execute('SELECT keyword, tier, niche, priority_score, search_volume, source FROM priority_keywords WHERE is_active = TRUE ORDER BY priority_score DESC, keyword')
         rows = c.fetchall()
-        conn.close()
+        release_db(conn)
 
         keywords = [{
             'keyword': r[0], 'tier': r[1], 'niche': r[2],
@@ -5986,7 +6029,7 @@ def toggle_priority_keywords():
                 ''', (kw_lower, active, email, active))
                 inserted += 1
         conn.commit()
-        conn.close()
+        release_db(conn)
         return jsonify({'success': True, 'updated': updated, 'inserted': inserted})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -6039,7 +6082,7 @@ def add_custom_keyword():
             ON CONFLICT (keyword) DO UPDATE SET is_active = TRUE, source = 'custom', added_by = %s, is_primary = %s, parent_keyword = %s
         ''', (keyword, tier, niche, priority_score, email, is_primary, parent_kw, email, is_primary, parent_kw))
         conn.commit()
-        conn.close()
+        release_db(conn)
         return jsonify({
             'success': True, 'keyword': keyword,
             'tier': tier, 'niche': niche, 'priority_score': priority_score,
@@ -6076,13 +6119,13 @@ def delete_priority_keywords():
         blocked = c.fetchall()
         if blocked:
             blocked_list = [f"{row[0]} ({row[1]} secondaries)" for row in blocked]
-            conn.close()
+            release_db(conn)
             return jsonify({'success': False, 'error': f"Cannot delete primary keywords with secondaries: {', '.join(blocked_list)}. Remove secondaries first."}), 400
 
         c.execute('DELETE FROM priority_keywords WHERE keyword = ANY(%s)', (kw_lower,))
         deleted = c.rowcount
         conn.commit()
-        conn.close()
+        release_db(conn)
         return jsonify({'success': True, 'deleted': deleted})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -6143,7 +6186,7 @@ def update_keyword_roles():
             updated += c.rowcount
 
         conn.commit()
-        conn.close()
+        release_db(conn)
         return jsonify({'success': True, 'updated': updated})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -6169,7 +6212,7 @@ def get_domination_data():
                 c = conn.cursor()
                 c.execute('SELECT audit_json, created_at FROM domination_audits ORDER BY created_at DESC LIMIT 1')
                 row = c.fetchone()
-                conn.close()
+                release_db(conn)
                 if row and row[0]:
                     audit_data = json.loads(row[0])
                     source = 'database'
@@ -6283,7 +6326,7 @@ def get_domination_data():
                     'updated_by': row[2],
                     'updated_at': str(row[3]) if row[3] else None
                 }
-            conn.close()
+            release_db(conn)
         except Exception as e:
             print(f"[DOMINATION] Error loading targets: {e}")
 
@@ -6340,7 +6383,7 @@ def get_domination_targets():
         c = conn.cursor()
         c.execute('SELECT keyword, target_dom_score, updated_by, updated_at FROM keyword_dom_targets')
         rows = c.fetchall()
-        conn.close()
+        release_db(conn)
         targets = {row[0]: {'target': row[1], 'updated_by': row[2], 'updated_at': str(row[3]) if row[3] else None} for row in rows}
         return jsonify({'success': True, 'targets': targets})
     except Exception as e:
@@ -6375,7 +6418,7 @@ def set_domination_target():
                 updated_at = NOW()
         ''', (keyword, int(target), updated_by))
         conn.commit()
-        conn.close()
+        release_db(conn)
 
         return jsonify({'success': True, 'keyword': keyword, 'target_dom_score': int(target), 'updated_by': updated_by})
     except Exception as e:
@@ -6470,7 +6513,7 @@ def store_ranking_snapshot(data):
         ''')
 
         conn.commit()
-        conn.close()
+        release_db(conn)
         print(f"[AUDIT] Snapshot stored in DB ({len(data.get('all_results', []))} keywords)")
     except Exception as e:
         print(f"[AUDIT] Postgres store failed: {e}, trying REST API...")
@@ -6647,7 +6690,7 @@ def get_domination_history():
             ''')
 
         rows = c.fetchall()
-        conn.close()
+        release_db(conn)
 
         history = [{
             'keyword': row[0],
@@ -6746,7 +6789,7 @@ def collect_yt_data_background(batch_size=50):
                 results['failed'] += 1
                 results['processed'] += 1
 
-        conn.close()
+        release_db(conn)
         print(f"[CRON-YT] Complete: {results}")
 
     except Exception as e:
@@ -6806,7 +6849,7 @@ def cron_yt_status():
         c.execute('SELECT COUNT(*) FROM keyword_yt_data')
         collected_count = c.fetchone()[0]
 
-        conn.close()
+        release_db(conn)
 
         # Count keywords needing data
         keywords_without_yt = sum(1 for kw in KEYWORDS if not kw.get('ytViews') or kw.get('ytViews') == 0)
@@ -6855,7 +6898,7 @@ def load_trends_cache():
             'publishWindow': row[6],
             'trendUpdated': row[7].strftime('%Y-%m-%d') if row[7] else None
         } for row in c.fetchall()}
-        conn.close()
+        release_db(conn)
         TRENDS_CACHE_LOADED = True
         print(f"[TRENDS-CACHE] Loaded {len(TRENDS_CACHE)} cached trends into memory")
     except Exception as e:
@@ -6900,7 +6943,7 @@ def get_keyword_trend():
         cached = c.fetchone()
 
         if cached:
-            conn.close()
+            release_db(conn)
             return jsonify({
                 'success': True,
                 'keyword': keyword,
@@ -6951,7 +6994,7 @@ def get_keyword_trend():
             # Update in-memory cache
             update_trends_cache(keyword, trend_data)
 
-        conn.close()
+        release_db(conn)
 
         return jsonify({
             'success': trend_data.get('success', False),
@@ -7098,7 +7141,7 @@ def collect_trends_data_background(batch_size=25):
                         break
 
         try:
-            conn.close()
+            release_db(conn)
         except Exception:
             pass
         print(f"[TRENDS] Complete: {results}")
@@ -7172,7 +7215,7 @@ def cron_trends_status():
         c.execute("SELECT COUNT(*) FROM keyword_trends WHERE updated_at > NOW() - INTERVAL '7 days'")
         fresh_count = c.fetchone()[0]
 
-        conn.close()
+        release_db(conn)
 
         return jsonify({
             'success': True,
@@ -7208,7 +7251,7 @@ def run_domination_audit_job():
                 c = conn.cursor()
                 c.execute('SELECT keyword, niche, priority_score, search_volume FROM priority_keywords WHERE is_active = TRUE ORDER BY priority_score DESC')
                 priority_rows = c.fetchall()
-                conn.close()
+                release_db(conn)
 
                 if priority_rows:
                     # Also load revenue from keyword_tracking.json for enrichment
@@ -7262,7 +7305,7 @@ def run_domination_audit_job():
                         c = conn.cursor()
                         c.execute('SELECT audit_json FROM domination_audits ORDER BY created_at DESC LIMIT 1')
                         row = c.fetchone()
-                        conn.close()
+                        release_db(conn)
                         if row and row[0]:
                             current_data = json.loads(row[0])
                     except Exception:
@@ -7293,7 +7336,7 @@ def run_domination_audit_job():
                         for row in c.fetchall():
                             keywords_to_check.append(row[0])
                             keyword_meta[row[0]] = {'revenue': row[1] or 0, 'is_secondary': False}
-                        conn.close()
+                        release_db(conn)
                         keyword_source = 'keywords_master'
                     except Exception:
                         pass
@@ -7466,7 +7509,7 @@ def check_data_staleness():
             if last_dom_dt:
                 staleness['domination_stale'] = (datetime.now() - last_dom_dt).total_seconds() > 86400
 
-            conn.close()
+            release_db(conn)
         except Exception as e:
             print(f"[STALENESS] Supabase staleness check error: {e}")
 
@@ -7491,7 +7534,7 @@ def check_data_staleness():
         fresh_trends = c.fetchone()[0]
         staleness['trends_fresh'] = fresh_trends
         staleness['trends_stale'] = fresh_trends < len(KEYWORDS) * 0.1
-        conn.close()
+        release_db(conn)
     except Exception as e:
         print(f"[STALENESS] Trends staleness check error: {e}")
 
@@ -7738,7 +7781,7 @@ def opportunity_finder():
         ''')
         votes = {row[0]: row[1] for row in c.fetchall()}
 
-        conn.close()
+        release_db(conn)
     except Exception as e:
         print(f"[OPPORTUNITY] DB unavailable, using in-memory data only: {e}")
 
@@ -8616,7 +8659,7 @@ def smart_picks():
         ''')
         votes = {row[0]: row[1] for row in c.fetchall()}
 
-        conn.close()
+        release_db(conn)
     except Exception as e:
         print(f"[SMART-PICKS] DB unavailable, using in-memory data only: {e}")
 
@@ -8815,7 +8858,7 @@ def get_bq_cache(cache_key, max_age_hours=24):
             WHERE cache_key = %s AND updated_at > NOW() - INTERVAL '%s hours'
         ''', (cache_key, max_age_hours))
         row = c.fetchone()
-        conn.close()
+        release_db(conn)
         if row:
             return {'data': row[0], 'updated_at': row[1].strftime('%Y-%m-%d %H:%M') if row[1] else None}
     except Exception as e:
@@ -8837,7 +8880,7 @@ def set_bq_cache(cache_key, data):
                 updated_at = CURRENT_TIMESTAMP
         ''', (cache_key, _json.dumps(data)))
         conn.commit()
-        conn.close()
+        release_db(conn)
         print(f"[BQ-CACHE] Saved {cache_key}")
     except Exception as e:
         print(f"[BQ-CACHE] Write error for {cache_key}: {e}")
