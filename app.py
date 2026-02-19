@@ -395,6 +395,19 @@ ALL_MATCH_PATTERNS = []
 for _ch_data in DIGIDOM_CHANNELS.values():
     ALL_MATCH_PATTERNS.extend(_ch_data['match_patterns'])
 
+def is_digidom_channel(channel_name):
+    """Check if a channel name matches any Digidom channel."""
+    if not channel_name:
+        return False
+    name_lower = channel_name.lower().strip()
+    for bq_name in ALL_BQ_CHANNEL_NAMES:
+        if bq_name.lower() == name_lower:
+            return True
+    for pattern in ALL_MATCH_PATTERNS:
+        if pattern in name_lower or name_lower in pattern:
+            return True
+    return False
+
 # ============================================
 # DATABASE SETUP (Supabase Postgres)
 # ============================================
@@ -783,6 +796,25 @@ def init_db():
             started_at TIMESTAMP,
             completed_at TIMESTAMP,
             UNIQUE(scan_date, channel_name)
+        )
+    ''')
+    try:
+        c.execute("ALTER TABLE competitor_scan_log ADD COLUMN IF NOT EXISTS discovery_source TEXT DEFAULT 'bigquery'")
+    except Exception:
+        pass
+
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS yt_discovered_competitors (
+            id SERIAL PRIMARY KEY,
+            channel_name TEXT NOT NULL,
+            channel_id TEXT,
+            niches TEXT DEFAULT '',
+            keyword_hits INTEGER DEFAULT 0,
+            sample_keywords TEXT DEFAULT '',
+            discovered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_scanned_at TIMESTAMP,
+            is_active BOOLEAN DEFAULT TRUE,
+            UNIQUE(channel_name)
         )
     ''')
 
@@ -9015,11 +9047,48 @@ def _bq_live_competitors(silo_filter=''):
         return jsonify({'success': False, 'error': 'BigQuery not available'}), 500
     ch_names_str = ', '.join(f"'{name}'" for name in ALL_BQ_CHANNEL_NAMES)
 
+    # Fetch priority_keywords from Supabase to include in our_keywords
+    priority_kws = []
+    try:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute('SELECT LOWER(keyword) FROM priority_keywords WHERE is_active = TRUE')
+        priority_kws = [r[0] for r in c.fetchall()]
+        release_db(conn)
+    except Exception:
+        # Fallback to REST API
+        rows = supabase_rest_select('priority_keywords', select='keyword', filters={'is_active': 'eq.true'}, limit=5000)
+        if rows:
+            priority_kws = [r['keyword'].lower() for r in rows if r.get('keyword')]
+
     silo_clause = ""
     query_params = []
     if silo_filter:
         silo_clause = "AND LOWER(Silo) = LOWER(@silo_filter)"
         query_params.append(bq.ScalarQueryParameter("silo_filter", "STRING", silo_filter))
+
+    # Add priority_keywords as array parameter
+    if priority_kws:
+        query_params.append(bq.ArrayQueryParameter("priority_kws", "STRING", priority_kws))
+    priority_kws_cte = """
+        UNION DISTINCT
+        SELECT DISTINCT kw FROM UNNEST(@priority_kws) as kw
+    """ if priority_kws else ""
+
+    # Subquery to find latest valid scrape date
+    scrape_date_subquery = f"""
+        SELECT Scrape_date FROM (
+            SELECT Scrape_date, COUNT(*) as cnt
+            FROM {BQ_SERP_TABLE}
+            WHERE Scrape_date = BQ_asia_scrape_date
+              AND Scrape_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
+              AND Rank BETWEEN 1 AND 10
+            GROUP BY Scrape_date
+            HAVING cnt >= 1000
+            ORDER BY Scrape_date DESC
+            LIMIT 1
+        )
+    """
 
     query = f"""
     WITH serp AS (
@@ -9029,36 +9098,35 @@ def _bq_live_competitors(silo_filter=''):
             Rank,
             Views,
             Silo,
-            CASE WHEN Channel_title IN ({ch_names_str}) THEN 1 ELSE 0 END as is_digidom
+            CASE WHEN competitor_checker = 'Digidom' OR Channel_title IN ({ch_names_str}) THEN 1 ELSE 0 END as is_digidom
         FROM {BQ_SERP_TABLE}
         WHERE Scrape_date = BQ_asia_scrape_date
-          AND Scrape_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
-          AND Scrape_date = (
-              SELECT Scrape_date FROM (
-                  SELECT Scrape_date, COUNT(*) as cnt
-                  FROM {BQ_SERP_TABLE}
-                  WHERE Scrape_date = BQ_asia_scrape_date
-                    AND Scrape_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
-                    AND Rank BETWEEN 1 AND 10
-                  GROUP BY Scrape_date
-                  HAVING cnt >= 1000
-                  ORDER BY Scrape_date DESC
-                  LIMIT 1
-              )
-          )
+          AND Scrape_date = ({scrape_date_subquery})
           AND Rank BETWEEN 1 AND 10
           AND Channel_title IS NOT NULL
           AND TRIM(Channel_title) != ''
           {silo_clause}
     ),
+    -- All Digidom keywords across ALL time for ownership check
+    all_digidom_kws AS (
+        SELECT DISTINCT LOWER(Keyword) as kw
+        FROM {BQ_SERP_TABLE}
+        WHERE competitor_checker = 'Digidom'
+        UNION DISTINCT
+        SELECT DISTINCT LOWER(Keyword) as kw
+        FROM {BQ_SERP_TABLE}
+        WHERE Channel_title IN ({ch_names_str})
+          AND Scrape_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 90 DAY)
+    ),
     digidom_kws AS (
         SELECT DISTINCT kw FROM serp WHERE is_digidom = 1
     ),
     our_keywords AS (
-        SELECT DISTINCT kw FROM digidom_kws
+        SELECT DISTINCT kw FROM all_digidom_kws
         UNION DISTINCT
         SELECT DISTINCT LOWER(main_keyword) as kw FROM {BQ_GENERAL_INFO_TABLE}
         WHERE main_keyword IS NOT NULL AND TRIM(main_keyword) != ''
+        {priority_kws_cte}
     )
     SELECT
         s.Channel_title,
@@ -9080,7 +9148,7 @@ def _bq_live_competitors(silo_filter=''):
     LIMIT 50
     """
 
-    job_config = bq.QueryJobConfig(query_parameters=query_params) if query_params else None
+    job_config = bq.QueryJobConfig(query_parameters=query_params)
 
     rows = client.query(query, job_config=job_config).result()
     competitors = []
@@ -9106,35 +9174,34 @@ def _bq_live_competitors(silo_filter=''):
                 LOWER(Keyword) as kw,
                 Channel_title,
                 COALESCE(NULLIF(TRIM(Silo), ''), 'other') as Silo,
-                CASE WHEN Channel_title IN ({ch_names_str}) THEN 1 ELSE 0 END as is_digidom
+                CASE WHEN competitor_checker = 'Digidom' OR Channel_title IN ({ch_names_str}) THEN 1 ELSE 0 END as is_digidom
             FROM {BQ_SERP_TABLE}
             WHERE Scrape_date = BQ_asia_scrape_date
-              AND Scrape_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
-              AND Scrape_date = (
-                  SELECT Scrape_date FROM (
-                      SELECT Scrape_date, COUNT(*) as cnt
-                      FROM {BQ_SERP_TABLE}
-                      WHERE Scrape_date = BQ_asia_scrape_date
-                        AND Scrape_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
-                        AND Rank BETWEEN 1 AND 10
-                      GROUP BY Scrape_date
-                      HAVING cnt >= 1000
-                      ORDER BY Scrape_date DESC
-                      LIMIT 1
-                  )
-              )
+              AND Scrape_date = ({scrape_date_subquery})
               AND Rank BETWEEN 1 AND 10
               AND Channel_title IS NOT NULL
               AND TRIM(Channel_title) != ''
+        ),
+        -- All Digidom keywords across ALL time for ownership check
+        all_digidom_kws AS (
+            SELECT DISTINCT LOWER(Keyword) as kw
+            FROM {BQ_SERP_TABLE}
+            WHERE competitor_checker = 'Digidom'
+            UNION DISTINCT
+            SELECT DISTINCT LOWER(Keyword) as kw
+            FROM {BQ_SERP_TABLE}
+            WHERE Channel_title IN ({ch_names_str})
+              AND Scrape_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 90 DAY)
         ),
         digidom_kws AS (
             SELECT DISTINCT kw FROM serp WHERE is_digidom = 1
         ),
         our_keywords AS (
-            SELECT DISTINCT kw FROM digidom_kws
+            SELECT DISTINCT kw FROM all_digidom_kws
             UNION DISTINCT
             SELECT DISTINCT LOWER(main_keyword) as kw FROM {BQ_GENERAL_INFO_TABLE}
             WHERE main_keyword IS NOT NULL AND TRIM(main_keyword) != ''
+            {priority_kws_cte}
         )
         SELECT
             s.Silo,
@@ -9149,7 +9216,8 @@ def _bq_live_competitors(silo_filter=''):
         ORDER BY gap_keyword_count DESC
         """
         try:
-            silo_rows = client.query(silo_query).result()
+            silo_job_config = bq.QueryJobConfig(query_parameters=query_params) if query_params else None
+            silo_rows = client.query(silo_query, job_config=silo_job_config).result()
             for sr in silo_rows:
                 silo_counts[sr.Silo] = {
                     'competitors': sr.competitor_count,
@@ -9170,6 +9238,22 @@ def _bq_live_analysis(competitors, silo_filter=''):
     if not client:
         return jsonify({'success': False, 'error': 'BigQuery not available'}), 500
 
+    # Fetch priority_keywords from Supabase to include in our_keywords
+    priority_kws = set()
+    try:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute('SELECT LOWER(keyword) FROM priority_keywords WHERE is_active = TRUE')
+        priority_kws = set(r[0] for r in c.fetchall())
+        release_db(conn)
+    except Exception:
+        # Fallback to REST API
+        rows = supabase_rest_select('priority_keywords', select='keyword', filters={'is_active': 'eq.true'}, limit=5000)
+        if rows:
+            priority_kws = set(r['keyword'].lower() for r in rows if r.get('keyword'))
+    if priority_kws:
+        print(f"[CONTENT-GAP] Loaded {len(priority_kws)} priority keywords for gap classification")
+
     ch_names_str = ', '.join(f"'{name}'" for name in ALL_BQ_CHANNEL_NAMES)
     comp_params = [bq.ScalarQueryParameter(f"comp_{i}", "STRING", c) for i, c in enumerate(competitors)]
     comp_placeholders = ', '.join(f"@comp_{i}" for i in range(len(competitors)))
@@ -9180,6 +9264,30 @@ def _bq_live_analysis(competitors, silo_filter=''):
         silo_clause = "AND LOWER(Silo) = LOWER(@silo_filter)"
         extra_params.append(bq.ScalarQueryParameter("silo_filter", "STRING", silo_filter))
 
+    # Add priority_keywords as array parameter for BQ our_keywords CTE
+    priority_kws_list = list(priority_kws)
+    if priority_kws_list:
+        extra_params.append(bq.ArrayQueryParameter("priority_kws", "STRING", priority_kws_list))
+    priority_kws_cte = """
+        UNION DISTINCT
+        SELECT DISTINCT keyword FROM UNNEST(@priority_kws) as keyword
+    """ if priority_kws_list else ""
+
+    # Subquery to find latest valid scrape date (reused in main query and all_digidom_kws)
+    scrape_date_subquery = f"""
+        SELECT Scrape_date FROM (
+            SELECT Scrape_date, COUNT(*) as cnt
+            FROM {BQ_SERP_TABLE}
+            WHERE Scrape_date = BQ_asia_scrape_date
+              AND Scrape_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
+              AND Rank BETWEEN 1 AND 10
+            GROUP BY Scrape_date
+            HAVING cnt >= 1000
+            ORDER BY Scrape_date DESC
+            LIMIT 1
+        )
+    """
+
     query = f"""
     WITH serp AS (
         SELECT
@@ -9188,35 +9296,34 @@ def _bq_live_analysis(competitors, silo_filter=''):
             Rank,
             Views,
             Search_Volume,
-            Silo
+            Silo,
+            competitor_checker
         FROM {BQ_SERP_TABLE}
         WHERE Scrape_date = BQ_asia_scrape_date
-          AND Scrape_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
-          AND Scrape_date = (
-              SELECT Scrape_date FROM (
-                  SELECT Scrape_date, COUNT(*) as cnt
-                  FROM {BQ_SERP_TABLE}
-                  WHERE Scrape_date = BQ_asia_scrape_date
-                    AND Scrape_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
-                    AND Rank BETWEEN 1 AND 10
-                  GROUP BY Scrape_date
-                  HAVING cnt >= 1000
-                  ORDER BY Scrape_date DESC
-                  LIMIT 1
-              )
-          )
+          AND Scrape_date = ({scrape_date_subquery})
           AND Rank BETWEEN 1 AND 10
-          AND (Channel_title IN ({ch_names_str}) OR Channel_title IN ({comp_placeholders}))
+          AND (competitor_checker = 'Digidom' OR Channel_title IN ({ch_names_str}) OR Channel_title IN ({comp_placeholders}))
           {silo_clause}
+    ),
+    -- All Digidom keywords across ALL time for ownership check
+    all_digidom_kws AS (
+        SELECT DISTINCT LOWER(Keyword) as keyword
+        FROM {BQ_SERP_TABLE}
+        WHERE competitor_checker = 'Digidom'
+        UNION DISTINCT
+        SELECT DISTINCT LOWER(Keyword) as keyword
+        FROM {BQ_SERP_TABLE}
+        WHERE Channel_title IN ({ch_names_str})
+          AND Scrape_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 90 DAY)
     ),
     digidom_ranks AS (
         SELECT keyword, MIN(Rank) as best_rank, MAX(Views) as best_views
-        FROM serp WHERE Channel_title IN ({ch_names_str})
+        FROM serp WHERE competitor_checker = 'Digidom' OR Channel_title IN ({ch_names_str})
         GROUP BY keyword
     ),
     competitor_ranks AS (
         SELECT keyword, Channel_title as competitor, MIN(Rank) as best_rank, MAX(Views) as best_views
-        FROM serp WHERE Channel_title IN ({comp_placeholders})
+        FROM serp WHERE Channel_title NOT IN ({ch_names_str}) AND competitor_checker != 'Digidom' AND Channel_title IN ({comp_placeholders})
         GROUP BY keyword, Channel_title
     ),
     all_keywords AS (
@@ -9225,10 +9332,11 @@ def _bq_live_analysis(competitors, silo_filter=''):
         GROUP BY keyword
     ),
     our_keywords AS (
-        SELECT DISTINCT keyword FROM digidom_ranks
+        SELECT DISTINCT keyword FROM all_digidom_kws
         UNION DISTINCT
         SELECT DISTINCT LOWER(main_keyword) as keyword FROM {BQ_GENERAL_INFO_TABLE}
         WHERE main_keyword IS NOT NULL AND TRIM(main_keyword) != ''
+        {priority_kws_cte}
     )
     SELECT
         ak.keyword, ak.search_volume, ak.silo,
@@ -9243,6 +9351,7 @@ def _bq_live_analysis(competitors, silo_filter=''):
     """
 
     job_config = bq.QueryJobConfig(query_parameters=comp_params + extra_params)
+
     rows = client.query(query, job_config=job_config).result()
 
     keyword_map = {}
@@ -9274,19 +9383,27 @@ def _bq_live_analysis(competitors, silo_filter=''):
         has_competitor = len(info['competitors']) > 0
         keyword_type = classify_keyword_type(kw)
 
+        # Include priority_keywords in "is_ours" check
+        is_ours = info['is_ours'] or (kw in priority_kws)
+
+        # Infer silo from keyword content if blank
+        silo = info['silo']
+        if not silo or not silo.strip():
+            silo = detect_niche(kw)
+
         entry = {
             'keyword': kw,
             'search_volume': info['search_volume'],
-            'silo': info['silo'],
+            'silo': silo,
             'digidom_rank': info['digidom_rank'],
             'digidom_views': info['digidom_views'],
             'competitors': info['competitors'],
             'keyword_type': keyword_type,
-            'in_library': info['is_ours'],
+            'in_library': is_ours,
         }
 
         if has_competitor and not has_digidom:
-            if info['is_ours']:
+            if is_ours:
                 not_ranking_keywords.append(entry)
             else:
                 gap_keywords.append(entry)
@@ -9912,6 +10029,218 @@ def discover_top_competitors_from_bq(limit=30):
         return []
 
 
+def discover_competitors_from_youtube_search(max_keywords_per_niche=3, max_total_searches=30):
+    """Discover competitor channels by searching YouTube for priority keywords via SerpAPI."""
+    import re as _re
+
+    if not SERPAPI_API_KEY:
+        print("[COMP-SCAN] Step 0: No SerpAPI key, skipping YouTube discovery")
+        return []
+
+    # A. Build discovery keyword list from priority_keywords
+    rows = []
+    try:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute('''
+            SELECT keyword, niche, priority_score
+            FROM priority_keywords
+            WHERE is_active = TRUE AND niche IS NOT NULL AND niche != ''
+            ORDER BY priority_score DESC
+        ''')
+        rows = c.fetchall()
+        release_db(conn)
+    except Exception:
+        rows_data = supabase_rest_select(
+            'priority_keywords',
+            select='keyword,niche,priority_score',
+            filters={'is_active': 'eq.true'},
+            order='priority_score.desc',
+            limit=500
+        )
+        if rows_data:
+            rows = [(r['keyword'], r.get('niche', ''), r.get('priority_score', 0)) for r in rows_data if r.get('niche')]
+
+    if not rows:
+        print("[COMP-SCAN] Step 0: No niche-tagged keywords found")
+        return []
+
+    # Group by niche
+    niche_keywords = {}
+    for keyword, niche, score in rows:
+        if not niche or niche.lower() == 'other':
+            continue
+        niche_keywords.setdefault(niche, []).append(keyword)
+
+    # Select top N per niche, capped at max_total_searches
+    discovery_keywords = []
+    for niche, kws in niche_keywords.items():
+        for kw in kws[:max_keywords_per_niche]:
+            discovery_keywords.append((kw, niche))
+            if len(discovery_keywords) >= max_total_searches:
+                break
+        if len(discovery_keywords) >= max_total_searches:
+            break
+
+    print(f"[COMP-SCAN] Step 0: Built discovery list: {len(discovery_keywords)} keywords across {len(niche_keywords)} niches")
+
+    # B. Search YouTube for each keyword
+    channel_hits = {}  # channel_name_lower -> info dict
+
+    for i, (keyword, niche) in enumerate(discovery_keywords):
+        print(f"[COMP-SCAN] Step 0: Searching \"{keyword}\" ({niche}) [{i+1}/{len(discovery_keywords)}]")
+
+        try:
+            videos = search_youtube_videos(keyword, max_results=20)
+        except Exception as e:
+            print(f"[COMP-SCAN] Step 0: Search error for '{keyword}': {e}")
+            continue
+
+        for video in videos:
+            ch_info = video.get('channel', {})
+            if not isinstance(ch_info, dict):
+                continue
+            ch_name = (ch_info.get('name', '') or '').strip()
+            ch_link = ch_info.get('link', '') or ''
+
+            if not ch_name or is_digidom_channel(ch_name):
+                continue
+
+            ch_id_match = _re.search(r'/channel/(UC[a-zA-Z0-9_-]+)', ch_link)
+            ch_id = ch_id_match.group(1) if ch_id_match else None
+
+            name_lower = ch_name.lower()
+            if name_lower not in channel_hits:
+                channel_hits[name_lower] = {
+                    'channel': ch_name,
+                    'channel_id': ch_id,
+                    'keyword_hits': 0,
+                    'niches_seen': set(),
+                    'sample_keywords': [],
+                }
+
+            entry = channel_hits[name_lower]
+            if keyword not in entry['sample_keywords']:
+                entry['keyword_hits'] += 1
+                entry['sample_keywords'].append(keyword)
+            entry['niches_seen'].add(niche)
+            if ch_id and not entry['channel_id']:
+                entry['channel_id'] = ch_id
+
+        time.sleep(0.5)
+
+    print(f"[COMP-SCAN] Step 0: Raw channels found: {len(channel_hits)}")
+
+    # C. Rank and filter - must appear in 2+ keyword searches
+    ranked = sorted(channel_hits.values(), key=lambda x: x['keyword_hits'], reverse=True)
+    filtered = [ch for ch in ranked if ch['keyword_hits'] >= 2]
+    print(f"[COMP-SCAN] Step 0: After min-hits filter (>=2): {len(filtered)} channels")
+
+    top_channels = filtered[:15]
+
+    # D. Cache discovered channels to Supabase
+    for ch in top_channels:
+        try:
+            conn = get_db()
+            c = conn.cursor()
+            c.execute('''
+                INSERT INTO yt_discovered_competitors (channel_name, channel_id, niches, keyword_hits, sample_keywords)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (channel_name) DO UPDATE SET
+                    channel_id = COALESCE(EXCLUDED.channel_id, yt_discovered_competitors.channel_id),
+                    niches = EXCLUDED.niches,
+                    keyword_hits = EXCLUDED.keyword_hits,
+                    sample_keywords = EXCLUDED.sample_keywords,
+                    discovered_at = CURRENT_TIMESTAMP
+            ''', (ch['channel'], ch['channel_id'], ','.join(ch['niches_seen']),
+                  ch['keyword_hits'], ','.join(ch['sample_keywords'][:5])))
+            conn.commit()
+            release_db(conn)
+        except Exception:
+            # REST API fallback for caching
+            try:
+                import requests as _req
+                sb_url = SUPABASE_REST_URL.rstrip('/')
+                _req.post(f"{sb_url}/rest/v1/yt_discovered_competitors",
+                    headers={'apikey': SUPABASE_REST_KEY, 'Authorization': f'Bearer {SUPABASE_REST_KEY}',
+                             'Content-Type': 'application/json', 'Prefer': 'resolution=merge-duplicates'},
+                    json={'channel_name': ch['channel'], 'channel_id': ch['channel_id'],
+                          'niches': ','.join(ch['niches_seen']), 'keyword_hits': ch['keyword_hits'],
+                          'sample_keywords': ','.join(ch['sample_keywords'][:5])},
+                    timeout=10)
+            except Exception:
+                pass
+    print(f"[COMP-SCAN] Step 0: Cached {len(top_channels)} channels to Supabase")
+
+    # E. Also load previously cached YT competitors
+    cached_channels = []
+    try:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute('SELECT channel_name, channel_id, keyword_hits FROM yt_discovered_competitors WHERE is_active = TRUE')
+        cached_channels = [{'channel': r[0], 'channel_id': r[1], 'keyword_hits': r[2]} for r in c.fetchall()]
+        release_db(conn)
+    except Exception:
+        rows = supabase_rest_select('yt_discovered_competitors', select='channel_name,channel_id,keyword_hits',
+                                    filters={'is_active': 'eq.true'}, limit=100)
+        if rows:
+            cached_channels = [{'channel': r['channel_name'], 'channel_id': r.get('channel_id'),
+                                'keyword_hits': r.get('keyword_hits', 0)} for r in rows]
+
+    # Merge fresh discoveries with cached (dedup by name)
+    seen = set()
+    result = []
+    for ch in top_channels:
+        name_lower = ch['channel'].lower()
+        if name_lower not in seen:
+            seen.add(name_lower)
+            result.append({
+                'channel': ch['channel'],
+                'keyword_count': ch['keyword_hits'],
+                'gap_count': ch['keyword_hits'],
+                'source': 'youtube_search',
+                'channel_id': ch['channel_id'],
+            })
+
+    for ch in cached_channels:
+        name_lower = ch['channel'].lower()
+        if name_lower not in seen:
+            seen.add(name_lower)
+            result.append({
+                'channel': ch['channel'],
+                'keyword_count': ch['keyword_hits'],
+                'gap_count': ch['keyword_hits'],
+                'source': 'youtube_search',
+                'channel_id': ch['channel_id'],
+            })
+
+    print(f"[COMP-SCAN] Step 0: {len(top_channels)} fresh + {len(result) - len(top_channels)} cached = {len(result)} total YT competitors")
+    return result
+
+
+def merge_competitor_lists(bq_competitors, yt_competitors):
+    """Merge BQ and YT-discovered competitors, deduplicating by channel name."""
+    bq_names = set()
+    merged = []
+
+    for comp in (bq_competitors or []):
+        name_lower = comp['channel'].lower().strip()
+        bq_names.add(name_lower)
+        comp['source'] = comp.get('source', 'bigquery')
+        merged.append(comp)
+
+    yt_added = 0
+    for comp in (yt_competitors or []):
+        name_lower = comp['channel'].lower().strip()
+        if name_lower not in bq_names:
+            bq_names.add(name_lower)
+            merged.append(comp)
+            yt_added += 1
+
+    print(f"[COMP-SCAN] Merge: {len(bq_competitors or [])} BQ + {yt_added} new from YT = {len(merged)} total")
+    return merged
+
+
 def run_competitor_channel_scan(force=False):
     """Weekly scan: discover top 30 competitors from BQ, scrape their channels, extract keywords."""
     global _competitor_scan_running, _competitor_scan_progress
@@ -9945,13 +10274,31 @@ def run_competitor_channel_scan(force=False):
     _competitor_scan_progress = {'status': 'discovering', 'channel': '', 'done': 0, 'total': 0, 'started_at': datetime.now().isoformat()}
 
     try:
+        # Step 0: Discover competitors from YouTube Search (SerpAPI)
+        _competitor_scan_progress['status'] = 'discovering_youtube'
+        print("[COMP-SCAN] Step 0: Discovering competitors from YouTube Search...")
+        yt_competitors = []
+        try:
+            yt_competitors = discover_competitors_from_youtube_search(
+                max_keywords_per_niche=3,
+                max_total_searches=30
+            )
+            print(f"[COMP-SCAN] Step 0 complete: {len(yt_competitors)} channels from YouTube Search")
+        except Exception as e:
+            print(f"[COMP-SCAN] Step 0 error (non-fatal): {e}")
+
         # Step 1: Discover top 30 competitors from BigQuery
+        _competitor_scan_progress['status'] = 'discovering_bq'
         print("[COMP-SCAN] Step 1: Discovering competitors from BigQuery...")
-        competitors = discover_top_competitors_from_bq(limit=30)
+        bq_competitors = discover_top_competitors_from_bq(limit=30)
+
+        # Merge & deduplicate
+        competitors = merge_competitor_lists(bq_competitors, yt_competitors)
+
         if not competitors:
-            print("[COMP-SCAN] No competitors found, aborting")
+            print("[COMP-SCAN] No competitors found from either source, aborting")
             _competitor_scan_progress['status'] = 'error'
-            _competitor_scan_progress['error'] = 'No competitors found in BigQuery'
+            _competitor_scan_progress['error'] = 'No competitors found'
             return
 
         _competitor_scan_progress['total'] = len(competitors)
@@ -9966,26 +10313,30 @@ def run_competitor_channel_scan(force=False):
             _competitor_scan_progress['channel'] = channel_name
             _competitor_scan_progress['done'] = i
 
-            print(f"[COMP-SCAN] Scanning {i+1}/{len(competitors)}: {channel_name}")
+            source = comp.get('source', 'bigquery')
+            print(f"[COMP-SCAN] Scanning {i+1}/{len(competitors)}: {channel_name} (source: {source})")
 
             # Insert/update scan log
             try:
                 conn = get_db()
                 c = conn.cursor()
                 c.execute('''
-                    INSERT INTO competitor_scan_log (scan_date, channel_name, status, started_at)
-                    VALUES (%s, %s, 'scanning', CURRENT_TIMESTAMP)
+                    INSERT INTO competitor_scan_log (scan_date, channel_name, status, started_at, discovery_source)
+                    VALUES (%s, %s, 'scanning', CURRENT_TIMESTAMP, %s)
                     ON CONFLICT (scan_date, channel_name) DO UPDATE SET
                         status = 'scanning', started_at = CURRENT_TIMESTAMP
-                ''', (today, channel_name))
+                ''', (today, channel_name, source))
                 conn.commit()
                 release_db(conn)
             except Exception as e:
                 print(f"[COMP-SCAN] Log insert error for {channel_name}: {e}")
 
             try:
-                # Scrape channel videos
-                yt_results = search_competitor_youtube(channel_name)
+                # Scrape channel videos (use channel_id URL if available from YT discovery)
+                search_target = channel_name
+                if comp.get('channel_id'):
+                    search_target = f"https://www.youtube.com/channel/{comp['channel_id']}"
+                yt_results = search_competitor_youtube(search_target)
                 if not yt_results.get('success'):
                     raise Exception(yt_results.get('error', 'Channel scrape failed'))
 
@@ -10055,6 +10406,17 @@ def run_competitor_channel_scan(force=False):
                     pass
 
                 print(f"[COMP-SCAN]   Extracted {keywords_inserted} keywords from {channel_name}")
+
+                # Update last_scanned_at for YT-discovered channels
+                if source == 'youtube_search':
+                    try:
+                        conn = get_db()
+                        c = conn.cursor()
+                        c.execute('UPDATE yt_discovered_competitors SET last_scanned_at = CURRENT_TIMESTAMP WHERE channel_name = %s', (channel_name,))
+                        conn.commit()
+                        release_db(conn)
+                    except Exception:
+                        pass
 
             except Exception as e:
                 print(f"[COMP-SCAN]   Error scanning {channel_name}: {e}")
@@ -10171,18 +10533,6 @@ def content_gap_scan_status():
         release_db(conn)
     except Exception as e:
         print(f"[SCAN-STATUS] Error: {e}")
-        # Mock data for local dev
-        result['last_scan'] = {
-            'date': '2026-02-16',
-            'channels_attempted': 30,
-            'channels_done': 28,
-            'channels_failed': 2,
-            'total_keywords': 4230,
-            'total_videos': 892,
-        }
-        result['total_cached_keywords'] = 4230
-        result['total_cached_channels'] = 28
-        result['mock_data'] = True
 
     return jsonify(result)
 
