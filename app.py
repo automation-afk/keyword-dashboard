@@ -8878,51 +8878,39 @@ def content_gap_competitors():
         query_params.append(bq.ScalarQueryParameter("silo_filter", "STRING", silo_filter))
 
     query = f"""
-    WITH latest_scrape AS (
-        SELECT Scrape_date FROM (
-            SELECT Scrape_date, COUNT(*) as row_cnt
-            FROM {BQ_SERP_TABLE}
-            WHERE Scrape_date = BQ_asia_scrape_date
-              AND Scrape_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
-            GROUP BY Scrape_date
-            HAVING COUNT(*) > 5000
-            ORDER BY Scrape_date DESC
-            LIMIT 1
-        )
-    ),
-    digidom_keywords AS (
-        SELECT DISTINCT LOWER(Keyword) as kw
-        FROM {BQ_SERP_TABLE}
-        WHERE Scrape_date = (SELECT Scrape_date FROM latest_scrape)
-          AND Rank BETWEEN 1 AND 10
-          AND Channel_title IN ({ch_names_str})
-    ),
-    comp_data AS (
+    WITH serp AS (
         SELECT
-            Channel_title,
             LOWER(Keyword) as kw,
+            Channel_title,
             Rank,
-            Views
+            Views,
+            Silo,
+            CASE WHEN Channel_title IN ({ch_names_str}) THEN 1 ELSE 0 END as is_digidom
         FROM {BQ_SERP_TABLE}
-        WHERE Scrape_date = (SELECT Scrape_date FROM latest_scrape)
+        WHERE Scrape_date = BQ_asia_scrape_date
+          AND Scrape_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
+          AND Scrape_date = (SELECT MAX(Scrape_date) FROM {BQ_SERP_TABLE} WHERE Scrape_date = BQ_asia_scrape_date AND Scrape_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY))
           AND Rank BETWEEN 1 AND 10
-          AND Channel_title NOT IN ({ch_names_str})
           AND Channel_title IS NOT NULL
           AND TRIM(Channel_title) != ''
           {silo_clause}
+    ),
+    digidom_kws AS (
+        SELECT DISTINCT kw FROM serp WHERE is_digidom = 1
     )
     SELECT
-        cd.Channel_title,
-        COUNT(DISTINCT cd.kw) as keyword_count,
+        s.Channel_title,
+        COUNT(DISTINCT s.kw) as keyword_count,
         COUNT(*) as total_appearances,
-        AVG(cd.Rank) as avg_rank,
-        SUM(cd.Views) as total_views,
-        COUNT(DISTINCT CASE WHEN dk.kw IS NULL THEN cd.kw END) as gap_count,
-        COUNT(DISTINCT CASE WHEN dk.kw IS NOT NULL THEN cd.kw END) as overlap_count,
-        (SELECT COUNT(DISTINCT kw) FROM digidom_keywords) - COUNT(DISTINCT CASE WHEN dk.kw IS NOT NULL THEN cd.kw END) as win_count
-    FROM comp_data cd
-    LEFT JOIN digidom_keywords dk ON cd.kw = dk.kw
-    GROUP BY cd.Channel_title
+        AVG(s.Rank) as avg_rank,
+        SUM(s.Views) as total_views,
+        COUNT(DISTINCT CASE WHEN dk.kw IS NULL THEN s.kw END) as gap_count,
+        COUNT(DISTINCT CASE WHEN dk.kw IS NOT NULL THEN s.kw END) as overlap_count,
+        (SELECT COUNT(*) FROM digidom_kws) - COUNT(DISTINCT CASE WHEN dk.kw IS NOT NULL THEN s.kw END) as win_count
+    FROM serp s
+    LEFT JOIN digidom_kws dk ON s.kw = dk.kw
+    WHERE s.is_digidom = 0
+    GROUP BY s.Channel_title
     HAVING keyword_count >= {1 if silo_filter else 3}
     ORDER BY gap_count DESC, keyword_count DESC
     LIMIT 50
@@ -8949,43 +8937,33 @@ def content_gap_competitors():
         silo_counts = {}
         if not silo_filter:
             silo_query = f"""
-            WITH latest_scrape AS (
-                SELECT Scrape_date FROM (
-                    SELECT Scrape_date, COUNT(*) as row_cnt
-                    FROM {BQ_SERP_TABLE}
-                    WHERE Scrape_date = BQ_asia_scrape_date
-                      AND Scrape_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
-                    GROUP BY Scrape_date
-                    HAVING COUNT(*) > 5000
-                    ORDER BY Scrape_date DESC
-                    LIMIT 1
-                )
-            ),
-            digidom_keywords AS (
-                SELECT DISTINCT LOWER(Keyword) as kw
+            WITH serp AS (
+                SELECT
+                    LOWER(Keyword) as kw,
+                    Channel_title,
+                    Silo,
+                    CASE WHEN Channel_title IN ({ch_names_str}) THEN 1 ELSE 0 END as is_digidom
                 FROM {BQ_SERP_TABLE}
-                WHERE Scrape_date = (SELECT Scrape_date FROM latest_scrape)
+                WHERE Scrape_date = BQ_asia_scrape_date
+                  AND Scrape_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
+                  AND Scrape_date = (SELECT MAX(Scrape_date) FROM {BQ_SERP_TABLE} WHERE Scrape_date = BQ_asia_scrape_date AND Scrape_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY))
                   AND Rank BETWEEN 1 AND 10
-                  AND Channel_title IN ({ch_names_str})
-            ),
-            competitor_rows AS (
-                SELECT Channel_title, LOWER(Keyword) as kw, Silo
-                FROM {BQ_SERP_TABLE}
-                WHERE Scrape_date = (SELECT Scrape_date FROM latest_scrape)
-                  AND Rank BETWEEN 1 AND 10
-                  AND Channel_title NOT IN ({ch_names_str})
                   AND Channel_title IS NOT NULL
                   AND TRIM(Channel_title) != ''
                   AND Silo IS NOT NULL
                   AND TRIM(Silo) != ''
+            ),
+            digidom_kws AS (
+                SELECT DISTINCT kw FROM serp WHERE is_digidom = 1
             )
             SELECT
-                cr.Silo,
-                COUNT(DISTINCT cr.Channel_title) as competitor_count,
-                COUNT(DISTINCT CASE WHEN dk.kw IS NULL THEN cr.kw END) as gap_keyword_count
-            FROM competitor_rows cr
-            LEFT JOIN digidom_keywords dk ON cr.kw = dk.kw
-            GROUP BY cr.Silo
+                s.Silo,
+                COUNT(DISTINCT s.Channel_title) as competitor_count,
+                COUNT(DISTINCT CASE WHEN dk.kw IS NULL THEN s.kw END) as gap_keyword_count
+            FROM serp s
+            LEFT JOIN digidom_kws dk ON s.kw = dk.kw
+            WHERE s.is_digidom = 0
+            GROUP BY s.Silo
             ORDER BY gap_keyword_count DESC
             """
             try:
@@ -9055,19 +9033,7 @@ def content_gap_analysis():
         extra_params.append(bq.ScalarQueryParameter("silo_filter", "STRING", silo_filter))
 
     query = f"""
-    WITH latest_scrape AS (
-        SELECT Scrape_date FROM (
-            SELECT Scrape_date, COUNT(*) as row_cnt
-            FROM {BQ_SERP_TABLE}
-            WHERE Scrape_date = BQ_asia_scrape_date
-              AND Scrape_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
-            GROUP BY Scrape_date
-            HAVING COUNT(*) > 5000
-            ORDER BY Scrape_date DESC
-            LIMIT 1
-        )
-    ),
-    serp_data AS (
+    WITH serp AS (
         SELECT
             LOWER(Keyword) as keyword,
             Channel_title,
@@ -9077,44 +9043,31 @@ def content_gap_analysis():
             Silo
         FROM {BQ_SERP_TABLE}
         WHERE Scrape_date = BQ_asia_scrape_date
-          AND Scrape_date = (SELECT Scrape_date FROM latest_scrape)
+          AND Scrape_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
+          AND Scrape_date = (SELECT MAX(Scrape_date) FROM {BQ_SERP_TABLE} WHERE Scrape_date = BQ_asia_scrape_date AND Scrape_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY))
           AND Rank BETWEEN 1 AND 10
+          AND (Channel_title IN ({ch_names_str}) OR Channel_title IN ({comp_placeholders}))
           {silo_clause}
     ),
     digidom_ranks AS (
-        SELECT
-            keyword,
-            MIN(Rank) as best_rank,
-            MAX(Views) as best_views
-        FROM serp_data
-        WHERE Channel_title IN ({ch_names_str})
+        SELECT keyword, MIN(Rank) as best_rank, MAX(Views) as best_views
+        FROM serp WHERE Channel_title IN ({ch_names_str})
         GROUP BY keyword
     ),
     competitor_ranks AS (
-        SELECT
-            keyword,
-            Channel_title as competitor,
-            MIN(Rank) as best_rank,
-            MAX(Views) as best_views
-        FROM serp_data
-        WHERE Channel_title IN ({comp_placeholders})
+        SELECT keyword, Channel_title as competitor, MIN(Rank) as best_rank, MAX(Views) as best_views
+        FROM serp WHERE Channel_title IN ({comp_placeholders})
         GROUP BY keyword, Channel_title
     ),
     all_keywords AS (
-        SELECT DISTINCT keyword, MAX(Search_Volume) as search_volume, MAX(Silo) as silo
-        FROM serp_data
-        WHERE Channel_title IN ({ch_names_str}) OR Channel_title IN ({comp_placeholders})
+        SELECT keyword, MAX(Search_Volume) as search_volume, MAX(Silo) as silo
+        FROM serp
         GROUP BY keyword
     )
     SELECT
-        ak.keyword,
-        ak.search_volume,
-        ak.silo,
-        dr.best_rank as digidom_rank,
-        dr.best_views as digidom_views,
-        cr.competitor,
-        cr.best_rank as comp_rank,
-        cr.best_views as comp_views
+        ak.keyword, ak.search_volume, ak.silo,
+        dr.best_rank as digidom_rank, dr.best_views as digidom_views,
+        cr.competitor, cr.best_rank as comp_rank, cr.best_views as comp_views
     FROM all_keywords ak
     LEFT JOIN digidom_ranks dr ON ak.keyword = dr.keyword
     LEFT JOIN competitor_ranks cr ON ak.keyword = cr.keyword
