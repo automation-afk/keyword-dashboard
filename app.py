@@ -736,6 +736,12 @@ def init_db():
         except Exception:
             pass
 
+    # Ensure created_at exists on keyword_additions (may be missing on older DBs)
+    try:
+        c.execute("ALTER TABLE keyword_additions ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+    except Exception:
+        pass
+
     c.execute('''
         CREATE TABLE IF NOT EXISTS bq_cache (
             cache_key TEXT PRIMARY KEY,
