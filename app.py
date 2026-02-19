@@ -2558,12 +2558,12 @@ def get_keywords():
         c.execute('SELECT keyword, COUNT(*) FROM keyword_comments GROUP BY keyword')
         comment_counts = {row[0]: row[1] for row in c.fetchall()}
 
-        # Get who added each keyword
-        c.execute('SELECT keyword, user_name, user_email, source FROM keyword_additions')
+        # Get who added each keyword (with timestamp)
+        c.execute('SELECT keyword, user_name, user_email, source, created_at FROM keyword_additions')
         for row in c.fetchall():
             if row[0] not in additions:
                 additions[row[0]] = []
-            additions[row[0]].append({'name': row[1] or row[2], 'source': row[3]})
+            additions[row[0]].append({'name': row[1] or row[2], 'source': row[3], 'added_at': row[4].isoformat() if row[4] else None})
 
         # Use in-memory trends cache (no DB query needed)
         trends_data = TRENDS_CACHE
@@ -2629,7 +2629,14 @@ def get_keywords():
         kw['trendUpdated'] = kw_trend.get('trendUpdated')
 
         # Add who added this keyword
-        kw['addedBy'] = additions.get(k['keyword'], [])
+        kw_additions = additions.get(k['keyword'], [])
+        kw['addedBy'] = kw_additions
+        # Expose most recent addition timestamp for "New" filtering
+        if kw_additions:
+            dates = [a['added_at'] for a in kw_additions if a.get('added_at')]
+            kw['addedAt'] = max(dates) if dates else None
+        else:
+            kw['addedAt'] = None
 
         result.append(kw)
 

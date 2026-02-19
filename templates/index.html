@@ -1470,6 +1470,7 @@
                         <button class="label-btn" data-label="maybe">? Maybe</button>
                         <button class="label-btn" data-label="not_interested">✗ Not Int.</button>
                         <button class="label-btn" data-label="favorite">⭐ Favorites</button>
+                        <button class="label-btn" data-label="new" style="border-color:rgba(56,189,248,0.4);color:#38bdf8;">NEW</button>
                     </div>
                 </div>
                 <div class="filter-group" style="margin-left: auto;">
@@ -3750,11 +3751,14 @@
             const tier = document.querySelector('.tier-btn.active').dataset.tier;
             const label = document.querySelector('.label-btn.active').dataset.label;
 
+            const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+
             filteredData = allData.filter(d => {
                 if (search && !d.keyword.toLowerCase().includes(search)) return false;
                 if (tier && d.tier !== tier) return false;
+                if (label === 'new' && !(d.addedAt && d.addedAt >= sevenDaysAgo)) return false;
                 if (label === 'favorite' && !d.favorite) return false;
-                if (label && label !== 'favorite' && d.label !== label) return false;
+                if (label && label !== 'favorite' && label !== 'new' && d.label !== label) return false;
                 // Advanced filters (AND logic)
                 for (const f of advancedFilters) {
                     if (!matchAdvancedFilter(d, f)) return false;
@@ -3815,7 +3819,7 @@
                             <button class="action-btn not-interested" onclick="setLabel('${escapedKw}', 'not_interested')" title="Not Interested">✗</button>
                         </div>
                     </td>
-                    <td class="keyword-cell">${escapeHtml(d.keyword)}</td>
+                    <td class="keyword-cell">${escapeHtml(d.keyword)}${d.addedAt && d.addedAt >= new Date(Date.now() - 7*24*60*60*1000).toISOString() ? ' <span style="background:#0ea5e9;color:#fff;font-size:0.6rem;padding:1px 5px;border-radius:3px;font-weight:700;vertical-align:middle;">NEW</span>' : ''}</td>
                     <td class="vote-cell">
                         <div class="vote-container">
                             <button class="vote-btn upvote ${userVote === 1 ? 'active' : ''}" onclick="voteKeyword('${escapedKw}', ${userVote === 1 ? 0 : 1})" title="Upvote">▲</button>
