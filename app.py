@@ -9279,7 +9279,16 @@ def content_gap_analysis():
         winning_keywords = []
         overlap_keywords = []
 
-        existing_kw_set = set(k['keyword'].lower().strip() for k in KEYWORDS)
+        # Use priority_keywords (tracked) for library check - consistent with silo counts
+        tracked_kw_set = set()
+        try:
+            conn = get_db()
+            c = conn.cursor()
+            c.execute('SELECT LOWER(keyword) FROM priority_keywords')
+            tracked_kw_set = set(r[0] for r in c.fetchall())
+            release_db(conn)
+        except Exception as e:
+            print(f"[CONTENT-GAP-ANALYSIS] Error fetching tracked keywords: {e}")
 
         for kw, info in keyword_map.items():
             has_digidom = info['digidom_rank'] is not None
@@ -9294,11 +9303,11 @@ def content_gap_analysis():
                 'digidom_views': info['digidom_views'],
                 'competitors': info['competitors'],
                 'keyword_type': keyword_type,
-                'in_library': kw in existing_kw_set,
+                'in_library': kw in tracked_kw_set,
             }
 
             if has_competitor and not has_digidom:
-                if kw in existing_kw_set:
+                if kw in tracked_kw_set:
                     not_ranking_keywords.append(entry)
                 else:
                     gap_keywords.append(entry)
