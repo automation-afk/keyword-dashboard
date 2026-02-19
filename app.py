@@ -8993,7 +8993,19 @@ def content_gap_competitors():
         FROM {BQ_SERP_TABLE}
         WHERE Scrape_date = BQ_asia_scrape_date
           AND Scrape_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
-          AND Scrape_date = (SELECT MAX(Scrape_date) FROM {BQ_SERP_TABLE} WHERE Scrape_date = BQ_asia_scrape_date AND Scrape_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY))
+          AND Scrape_date = (
+              SELECT Scrape_date FROM (
+                  SELECT Scrape_date, COUNT(*) as cnt
+                  FROM {BQ_SERP_TABLE}
+                  WHERE Scrape_date = BQ_asia_scrape_date
+                    AND Scrape_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
+                    AND Rank BETWEEN 1 AND 10
+                  GROUP BY Scrape_date
+                  HAVING cnt >= 1000
+                  ORDER BY Scrape_date DESC
+                  LIMIT 1
+              )
+          )
           AND Rank BETWEEN 1 AND 10
           AND Channel_title IS NOT NULL
           AND TRIM(Channel_title) != ''
@@ -9050,7 +9062,19 @@ def content_gap_competitors():
                 FROM {BQ_SERP_TABLE}
                 WHERE Scrape_date = BQ_asia_scrape_date
                   AND Scrape_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
-                  AND Scrape_date = (SELECT MAX(Scrape_date) FROM {BQ_SERP_TABLE} WHERE Scrape_date = BQ_asia_scrape_date AND Scrape_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY))
+                  AND Scrape_date = (
+                      SELECT Scrape_date FROM (
+                          SELECT Scrape_date, COUNT(*) as cnt
+                          FROM {BQ_SERP_TABLE}
+                          WHERE Scrape_date = BQ_asia_scrape_date
+                            AND Scrape_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
+                            AND Rank BETWEEN 1 AND 10
+                          GROUP BY Scrape_date
+                          HAVING cnt >= 1000
+                          ORDER BY Scrape_date DESC
+                          LIMIT 1
+                      )
+                  )
                   AND Rank BETWEEN 1 AND 10
                   AND Channel_title IS NOT NULL
                   AND TRIM(Channel_title) != ''
@@ -9148,7 +9172,19 @@ def content_gap_analysis():
         FROM {BQ_SERP_TABLE}
         WHERE Scrape_date = BQ_asia_scrape_date
           AND Scrape_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
-          AND Scrape_date = (SELECT MAX(Scrape_date) FROM {BQ_SERP_TABLE} WHERE Scrape_date = BQ_asia_scrape_date AND Scrape_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY))
+          AND Scrape_date = (
+              SELECT Scrape_date FROM (
+                  SELECT Scrape_date, COUNT(*) as cnt
+                  FROM {BQ_SERP_TABLE}
+                  WHERE Scrape_date = BQ_asia_scrape_date
+                    AND Scrape_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
+                    AND Rank BETWEEN 1 AND 10
+                  GROUP BY Scrape_date
+                  HAVING cnt >= 1000
+                  ORDER BY Scrape_date DESC
+                  LIMIT 1
+              )
+          )
           AND Rank BETWEEN 1 AND 10
           AND (Channel_title IN ({ch_names_str}) OR Channel_title IN ({comp_placeholders}))
           {silo_clause}
