@@ -8982,8 +8982,19 @@ def content_gap_competitors():
         return jsonify({'success': False, 'error': 'BigQuery not available'}), 500
     ch_names_str = ', '.join(f"'{name}'" for name in ALL_BQ_CHANNEL_NAMES)
 
+    # Fetch all tracked keywords from priority_keywords to distinguish true gaps vs not-ranking
+    tracked_keywords = []
+    try:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute('SELECT LOWER(keyword) FROM priority_keywords')
+        tracked_keywords = [r[0] for r in c.fetchall()]
+        release_db(conn)
+    except Exception as e:
+        print(f"[CONTENT-GAP] Error fetching tracked keywords: {e}")
+
     silo_clause = ""
-    query_params = []
+    query_params = [bq.ArrayQueryParameter("tracked_kws", "STRING", tracked_keywords)]
     if silo_filter:
         silo_clause = "AND LOWER(Silo) = LOWER(@silo_filter)"
         query_params.append(bq.ScalarQueryParameter("silo_filter", "STRING", silo_filter))
@@ -9020,6 +9031,9 @@ def content_gap_competitors():
     ),
     digidom_kws AS (
         SELECT DISTINCT kw FROM serp WHERE is_digidom = 1
+    ),
+    tracked AS (
+        SELECT DISTINCT kw FROM UNNEST(@tracked_kws) as kw
     )
     SELECT
         s.Channel_title,
@@ -9027,11 +9041,13 @@ def content_gap_competitors():
         COUNT(*) as total_appearances,
         AVG(s.Rank) as avg_rank,
         SUM(s.Views) as total_views,
-        COUNT(DISTINCT CASE WHEN dk.kw IS NULL THEN s.kw END) as gap_count,
+        COUNT(DISTINCT CASE WHEN dk.kw IS NULL AND tk.kw IS NULL THEN s.kw END) as gap_count,
+        COUNT(DISTINCT CASE WHEN dk.kw IS NULL AND tk.kw IS NOT NULL THEN s.kw END) as not_ranking_count,
         COUNT(DISTINCT CASE WHEN dk.kw IS NOT NULL THEN s.kw END) as overlap_count,
         (SELECT COUNT(*) FROM digidom_kws) - COUNT(DISTINCT CASE WHEN dk.kw IS NOT NULL THEN s.kw END) as win_count
     FROM serp s
     LEFT JOIN digidom_kws dk ON s.kw = dk.kw
+    LEFT JOIN tracked tk ON s.kw = tk.kw
     WHERE s.is_digidom = 0
     GROUP BY s.Channel_title
     HAVING keyword_count >= {1 if silo_filter else 3}
@@ -9052,6 +9068,7 @@ def content_gap_competitors():
                 'avg_rank': round(row.avg_rank, 1),
                 'total_views': row.total_views or 0,
                 'gap_count': row.gap_count,
+                'not_ranking_count': row.not_ranking_count,
                 'overlap_count': row.overlap_count,
                 'win_count': row.win_count,
             })
@@ -9090,23 +9107,30 @@ def content_gap_competitors():
             ),
             digidom_kws AS (
                 SELECT DISTINCT kw FROM serp WHERE is_digidom = 1
+            ),
+            tracked AS (
+                SELECT DISTINCT kw FROM UNNEST(@tracked_kws) as kw
             )
             SELECT
                 s.Silo,
                 COUNT(DISTINCT s.Channel_title) as competitor_count,
-                COUNT(DISTINCT CASE WHEN dk.kw IS NULL THEN s.kw END) as gap_keyword_count
+                COUNT(DISTINCT CASE WHEN dk.kw IS NULL AND tk.kw IS NULL THEN s.kw END) as gap_keyword_count,
+                COUNT(DISTINCT CASE WHEN dk.kw IS NULL AND tk.kw IS NOT NULL THEN s.kw END) as not_ranking_count
             FROM serp s
             LEFT JOIN digidom_kws dk ON s.kw = dk.kw
+            LEFT JOIN tracked tk ON s.kw = tk.kw
             WHERE s.is_digidom = 0
             GROUP BY s.Silo
             ORDER BY gap_keyword_count DESC
             """
             try:
-                silo_rows = client.query(silo_query).result()
+                silo_job_config = bq.QueryJobConfig(query_parameters=[bq.ArrayQueryParameter("tracked_kws", "STRING", tracked_keywords)])
+                silo_rows = client.query(silo_query, job_config=silo_job_config).result()
                 for sr in silo_rows:
                     silo_counts[sr.Silo] = {
                         'competitors': sr.competitor_count,
-                        'gaps': sr.gap_keyword_count
+                        'gaps': sr.gap_keyword_count,
+                        'not_ranking': sr.not_ranking_count,
                     }
             except Exception as se:
                 print(f"[CONTENT-GAP] Silo counts query error: {se}")
@@ -9245,6 +9269,7 @@ def content_gap_analysis():
                 }
 
         gap_keywords = []
+        not_ranking_keywords = []
         winning_keywords = []
         overlap_keywords = []
 
@@ -9267,17 +9292,17 @@ def content_gap_analysis():
             }
 
             if has_competitor and not has_digidom:
-                gap_keywords.append(entry)
+                if kw in existing_kw_set:
+                    not_ranking_keywords.append(entry)
+                else:
+                    gap_keywords.append(entry)
             elif has_digidom and not has_competitor:
                 winning_keywords.append(entry)
             elif has_digidom and has_competitor:
                 overlap_keywords.append(entry)
 
         gap_keywords.sort(key=lambda x: x['search_volume'], reverse=True)
-
-        # Filter out keywords already in library - they're not real gaps
-        gap_in_library_count = sum(1 for g in gap_keywords if g['in_library'])
-        gap_keywords = [g for g in gap_keywords if not g['in_library']]
+        not_ranking_keywords.sort(key=lambda x: x['search_volume'], reverse=True)
 
         # Enrich top 30 gap keywords with revenue estimates
         for gk in gap_keywords[:30]:
@@ -9300,23 +9325,23 @@ def content_gap_analysis():
         total_gap_volume = sum(g['search_volume'] for g in gap_keywords)
         total_gap_revenue = sum(g.get('revenue_estimate', 0) for g in gap_keywords[:30])
 
-        print(f"[CONTENT-GAP] Analysis complete: {len(gap_keywords)} gaps, {len(overlap_keywords)} overlap, {len(winning_keywords)} winning")
+        print(f"[CONTENT-GAP] Analysis complete: {len(gap_keywords)} gaps, {len(not_ranking_keywords)} not ranking, {len(overlap_keywords)} overlap, {len(winning_keywords)} winning")
 
         result = {
             'success': True,
             'competitors': competitors,
             'gap_keywords': gap_keywords[:100],
+            'not_ranking_keywords': not_ranking_keywords[:100],
             'winning_keywords': winning_keywords[:50],
             'overlap_keywords': overlap_keywords[:100],
             'summary': {
                 'total_keywords_compared': len(keyword_map),
                 'gap_count': len(gap_keywords),
+                'not_ranking_count': len(not_ranking_keywords),
                 'winning_count': len(winning_keywords),
                 'overlap_count': len(overlap_keywords),
                 'total_gap_volume': total_gap_volume,
                 'top_30_gap_revenue': round(total_gap_revenue, 0),
-                'gap_in_library': gap_in_library_count,
-                'gap_not_in_library': len(gap_keywords),
             },
         }
         set_bq_cache(cache_key, result)

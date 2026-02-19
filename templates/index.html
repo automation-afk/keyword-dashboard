@@ -2358,6 +2358,7 @@
                 <!-- Summary Stats -->
                 <div class="cg-summary-grid">
                     <div class="cg-stat"><div class="cg-value" style="color:#f87171;" id="cg-gap-count">-</div><div class="cg-label">Gap Keywords</div></div>
+                    <div class="cg-stat"><div class="cg-value" style="color:#fb923c;" id="cg-not-ranking-count">-</div><div class="cg-label">Not Ranking</div></div>
                     <div class="cg-stat"><div class="cg-value" style="color:#4ade80;" id="cg-winning-count">-</div><div class="cg-label">You Win</div></div>
                     <div class="cg-stat"><div class="cg-value" style="color:#60a5fa;" id="cg-overlap-count">-</div><div class="cg-label">Both Rank</div></div>
                     <div class="cg-stat"><div class="cg-value" style="color:#fbbf24;" id="cg-gap-volume">-</div><div class="cg-label">Gap Search Volume</div></div>
@@ -2379,6 +2380,7 @@
                 <!-- Sub-views: Gaps / Overlap / Winning -->
                 <div style="display:flex;gap:4px;margin-bottom:16px;">
                     <button class="opp-filter-btn active" data-cg-view="gaps" onclick="switchGapView('gaps', this)">Gaps (<span id="cg-gaps-badge">0</span>)</button>
+                    <button class="opp-filter-btn" data-cg-view="not-ranking" onclick="switchGapView('not-ranking', this)">Not Ranking (<span id="cg-not-ranking-badge">0</span>)</button>
                     <button class="opp-filter-btn" data-cg-view="overlap" onclick="switchGapView('overlap', this)">Overlap (<span id="cg-overlap-badge">0</span>)</button>
                     <button class="opp-filter-btn" data-cg-view="winning" onclick="switchGapView('winning', this)">Winning (<span id="cg-winning-badge">0</span>)</button>
                 </div>
@@ -2393,6 +2395,16 @@
                     </div>
                     <div id="cg-gap-show-more" style="text-align:center;padding:20px;display:none;">
                         <button class="research-btn" onclick="showMoreGapKeywords()" style="background:rgba(71,85,105,0.5);padding:10px 30px;">Show More</button>
+                    </div>
+                </div>
+
+                <!-- Not Ranking Table -->
+                <div id="cg-not-ranking-view" style="display:none;">
+                    <div class="research-box" style="overflow-x:auto;">
+                        <table style="width:100%;border-collapse:collapse;" id="cg-not-ranking-table">
+                            <thead id="cg-not-ranking-thead"></thead>
+                            <tbody id="cg-not-ranking-tbody"></tbody>
+                        </table>
                     </div>
                 </div>
 
@@ -7209,6 +7221,7 @@
                     </div>
                     <div style="display:flex;gap:12px;margin-top:8px;font-size:0.8rem;flex-wrap:wrap;">
                         <span style="color:#f87171;font-weight:600;">${c.gap_count} gaps</span>
+                        <span style="color:#fb923c;">${c.not_ranking_count || 0} not ranking</span>
                         <span style="color:#60a5fa;">${c.overlap_count} overlap</span>
                         <span style="color:#4ade80;">${c.win_count} we win</span>
                         <span style="color:#94a3b8;">Avg #${c.avg_rank}</span>
@@ -7250,10 +7263,11 @@
             const totalComps = cgCompetitors.length;
             const sorted = Object.entries(cgSiloCounts).sort((a, b) => b[1].gaps - a[1].gaps);
             const totalGaps = sorted.reduce((sum, [, d]) => sum + d.gaps, 0);
-            select.innerHTML = `<option value="">All Silos — ${totalGaps} gaps, ${totalComps} comps</option>`;
+            const totalNR = sorted.reduce((sum, [, d]) => sum + (d.not_ranking || 0), 0);
+            select.innerHTML = `<option value="">All Silos — ${totalGaps} gaps, ${totalNR} not ranking, ${totalComps} comps</option>`;
             sorted.forEach(([s, data]) => {
                 const label = s.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
-                select.innerHTML += `<option value="${s}">${label} — ${data.gaps} gaps, ${data.competitors} comps</option>`;
+                select.innerHTML += `<option value="${s}">${label} — ${data.gaps} gaps, ${data.not_ranking || 0} NR, ${data.competitors} comps</option>`;
             });
         }
 
@@ -7307,6 +7321,7 @@
         function renderGapSummary(data) {
             const s = data.summary;
             document.getElementById('cg-gap-count').textContent = s.gap_count.toLocaleString();
+            document.getElementById('cg-not-ranking-count').textContent = (s.not_ranking_count || 0).toLocaleString();
             document.getElementById('cg-winning-count').textContent = s.winning_count.toLocaleString();
             document.getElementById('cg-overlap-count').textContent = s.overlap_count.toLocaleString();
             document.getElementById('cg-gap-volume').textContent = s.total_gap_volume.toLocaleString();
@@ -7316,9 +7331,10 @@
             document.getElementById('cg-library-status').textContent =
                 s.gap_count + ' new keyword opportunities found';
             document.getElementById('cg-library-detail').textContent =
-                s.gap_in_library + ' keywords already in your library were excluded from gaps.';
+                (s.not_ranking_count || 0) + ' keywords in your library are not ranking (competitors rank for them).';
 
             document.getElementById('cg-gaps-badge').textContent = s.gap_count;
+            document.getElementById('cg-not-ranking-badge').textContent = s.not_ranking_count || 0;
             document.getElementById('cg-overlap-badge').textContent = s.overlap_count;
             document.getElementById('cg-winning-badge').textContent = s.winning_count;
         }
@@ -7366,8 +7382,39 @@
             document.getElementById('cg-gap-show-more').style.display =
                 data.gap_keywords.length > cgGapDisplayLimit ? 'block' : 'none';
 
+            renderNotRankingTable(data);
             renderOverlapTable(data);
             renderWinningTable(data);
+        }
+
+        function renderNotRankingTable(data) {
+            const comps = data.competitors;
+            const nrKeywords = data.not_ranking_keywords || [];
+            const th = 'style="text-align:center;padding:10px;color:#94a3b8;font-size:0.75rem;"';
+
+            let headerHtml = `<tr style="border-bottom:1px solid rgba(71,85,105,0.5);">
+                <th style="text-align:left;padding:10px;color:#94a3b8;font-size:0.75rem;">KEYWORD</th>
+                <th ${th}>VOL</th>
+                <th ${th}>TYPE</th>`;
+            comps.forEach(c => { headerHtml += `<th ${th}>${escapeHtml(c)}</th>`; });
+            headerHtml += `<th ${th}>SILO</th></tr>`;
+            document.getElementById('cg-not-ranking-thead').innerHTML = headerHtml;
+
+            document.getElementById('cg-not-ranking-tbody').innerHTML = nrKeywords.slice(0, 100).map(g => {
+                const typeColors = {comparison:'#a78bfa', review:'#60a5fa', deal:'#fbbf24', best_of:'#f472b6', informational:'#94a3b8', other:'#64748b'};
+                let compCells = '';
+                comps.forEach(c => {
+                    const cd = g.competitors[c];
+                    compCells += `<td style="padding:10px;text-align:center;">${cd ? cgRankBadge(cd.rank) : '-'}</td>`;
+                });
+                return `<tr style="border-bottom:1px solid rgba(71,85,105,0.2);">
+                    <td style="padding:10px;color:#e2e8f0;">${escapeHtml(g.keyword)}</td>
+                    <td style="padding:10px;text-align:center;color:#60a5fa;">${(g.search_volume || 0).toLocaleString()}</td>
+                    <td style="padding:10px;text-align:center;"><span style="color:${typeColors[g.keyword_type] || '#94a3b8'};font-size:0.8rem;">${(g.keyword_type || '').replace(/_/g,' ')}</span></td>
+                    ${compCells}
+                    <td style="padding:10px;text-align:center;font-size:0.8rem;color:#94a3b8;">${g.silo || '-'}</td>
+                </tr>`;
+            }).join('');
         }
 
         function renderOverlapTable(data) {
@@ -7423,6 +7470,7 @@
             document.querySelectorAll('[data-cg-view]').forEach(b => b.classList.remove('active'));
             btnEl.classList.add('active');
             document.getElementById('cg-gaps-view').style.display = view === 'gaps' ? 'block' : 'none';
+            document.getElementById('cg-not-ranking-view').style.display = view === 'not-ranking' ? 'block' : 'none';
             document.getElementById('cg-overlap-view').style.display = view === 'overlap' ? 'block' : 'none';
             document.getElementById('cg-winning-view').style.display = view === 'winning' ? 'block' : 'none';
         }
