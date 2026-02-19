@@ -9013,7 +9013,16 @@ def content_gap_competitors():
     silo_filter = request.args.get('silo', '').strip()
 
     try:
-        conn = get_db()
+        try:
+            conn = get_db()
+        except Exception:
+            return jsonify({
+                'success': True,
+                'competitors': [],
+                'silo_counts': {},
+                'no_scan_data': True,
+                'message': 'Database unavailable. Scan data will appear after the next Monday scan.',
+            })
         c = conn.cursor()
 
         # Get our library keywords for cross-referencing
@@ -9175,7 +9184,10 @@ def content_gap_analysis():
         return jsonify({'success': False, 'error': 'Select at least one competitor'}), 400
 
     try:
-        conn = get_db()
+        try:
+            conn = get_db()
+        except Exception:
+            return jsonify({'success': False, 'error': 'Database unavailable. Please try again later.'}), 503
         c = conn.cursor()
 
         # 1. Get competitor keywords from scan cache
