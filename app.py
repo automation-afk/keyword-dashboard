@@ -8988,19 +8988,8 @@ def content_gap_competitors():
         return jsonify({'success': False, 'error': 'BigQuery not available'}), 500
     ch_names_str = ', '.join(f"'{name}'" for name in ALL_BQ_CHANNEL_NAMES)
 
-    # Fetch all tracked keywords from priority_keywords to distinguish true gaps vs not-ranking
-    tracked_keywords = []
-    try:
-        conn = get_db()
-        c = conn.cursor()
-        c.execute('SELECT LOWER(keyword) FROM priority_keywords')
-        tracked_keywords = [r[0] for r in c.fetchall()]
-        release_db(conn)
-    except Exception as e:
-        print(f"[CONTENT-GAP] Error fetching tracked keywords: {e}")
-
     silo_clause = ""
-    query_params = [bq.ArrayQueryParameter("tracked_kws", "STRING", tracked_keywords)]
+    query_params = []
     if silo_filter:
         silo_clause = "AND LOWER(Silo) = LOWER(@silo_filter)"
         query_params.append(bq.ScalarQueryParameter("silo_filter", "STRING", silo_filter))
@@ -9038,8 +9027,11 @@ def content_gap_competitors():
     digidom_kws AS (
         SELECT DISTINCT kw FROM serp WHERE is_digidom = 1
     ),
-    tracked AS (
-        SELECT DISTINCT kw FROM UNNEST(@tracked_kws) as kw
+    our_keywords AS (
+        SELECT DISTINCT kw FROM digidom_kws
+        UNION DISTINCT
+        SELECT DISTINCT LOWER(main_keyword) as kw FROM {BQ_GENERAL_INFO_TABLE}
+        WHERE main_keyword IS NOT NULL AND TRIM(main_keyword) != ''
     )
     SELECT
         s.Channel_title,
@@ -9047,13 +9039,13 @@ def content_gap_competitors():
         COUNT(*) as total_appearances,
         AVG(s.Rank) as avg_rank,
         SUM(s.Views) as total_views,
-        COUNT(DISTINCT CASE WHEN dk.kw IS NULL AND tk.kw IS NULL THEN s.kw END) as gap_count,
-        COUNT(DISTINCT CASE WHEN dk.kw IS NULL AND tk.kw IS NOT NULL THEN s.kw END) as not_ranking_count,
+        COUNT(DISTINCT CASE WHEN dk.kw IS NULL AND ok.kw IS NULL THEN s.kw END) as gap_count,
+        COUNT(DISTINCT CASE WHEN dk.kw IS NULL AND ok.kw IS NOT NULL THEN s.kw END) as not_ranking_count,
         COUNT(DISTINCT CASE WHEN dk.kw IS NOT NULL THEN s.kw END) as overlap_count,
         (SELECT COUNT(*) FROM digidom_kws) - COUNT(DISTINCT CASE WHEN dk.kw IS NOT NULL THEN s.kw END) as win_count
     FROM serp s
     LEFT JOIN digidom_kws dk ON s.kw = dk.kw
-    LEFT JOIN tracked tk ON s.kw = tk.kw
+    LEFT JOIN our_keywords ok ON s.kw = ok.kw
     WHERE s.is_digidom = 0
     GROUP BY s.Channel_title
     HAVING keyword_count >= {1 if silo_filter else 3}
@@ -9114,24 +9106,26 @@ def content_gap_competitors():
             digidom_kws AS (
                 SELECT DISTINCT kw FROM serp WHERE is_digidom = 1
             ),
-            tracked AS (
-                SELECT DISTINCT kw FROM UNNEST(@tracked_kws) as kw
+            our_keywords AS (
+                SELECT DISTINCT kw FROM digidom_kws
+                UNION DISTINCT
+                SELECT DISTINCT LOWER(main_keyword) as kw FROM {BQ_GENERAL_INFO_TABLE}
+                WHERE main_keyword IS NOT NULL AND TRIM(main_keyword) != ''
             )
             SELECT
                 s.Silo,
                 COUNT(DISTINCT s.Channel_title) as competitor_count,
-                COUNT(DISTINCT CASE WHEN dk.kw IS NULL AND tk.kw IS NULL THEN s.kw END) as gap_keyword_count,
-                COUNT(DISTINCT CASE WHEN dk.kw IS NULL AND tk.kw IS NOT NULL THEN s.kw END) as not_ranking_count
+                COUNT(DISTINCT CASE WHEN dk.kw IS NULL AND ok.kw IS NULL THEN s.kw END) as gap_keyword_count,
+                COUNT(DISTINCT CASE WHEN dk.kw IS NULL AND ok.kw IS NOT NULL THEN s.kw END) as not_ranking_count
             FROM serp s
             LEFT JOIN digidom_kws dk ON s.kw = dk.kw
-            LEFT JOIN tracked tk ON s.kw = tk.kw
+            LEFT JOIN our_keywords ok ON s.kw = ok.kw
             WHERE s.is_digidom = 0
             GROUP BY s.Silo
             ORDER BY gap_keyword_count DESC
             """
             try:
-                silo_job_config = bq.QueryJobConfig(query_parameters=[bq.ArrayQueryParameter("tracked_kws", "STRING", tracked_keywords)])
-                silo_rows = client.query(silo_query, job_config=silo_job_config).result()
+                silo_rows = client.query(silo_query).result()
                 for sr in silo_rows:
                     silo_counts[sr.Silo] = {
                         'competitors': sr.competitor_count,
@@ -9240,14 +9234,22 @@ def content_gap_analysis():
         SELECT keyword, MAX(Search_Volume) as search_volume, MAX(Silo) as silo
         FROM serp
         GROUP BY keyword
+    ),
+    our_keywords AS (
+        SELECT DISTINCT keyword FROM digidom_ranks
+        UNION DISTINCT
+        SELECT DISTINCT LOWER(main_keyword) as keyword FROM {BQ_GENERAL_INFO_TABLE}
+        WHERE main_keyword IS NOT NULL AND TRIM(main_keyword) != ''
     )
     SELECT
         ak.keyword, ak.search_volume, ak.silo,
         dr.best_rank as digidom_rank, dr.best_views as digidom_views,
-        cr.competitor, cr.best_rank as comp_rank, cr.best_views as comp_views
+        cr.competitor, cr.best_rank as comp_rank, cr.best_views as comp_views,
+        CASE WHEN ok.keyword IS NOT NULL THEN TRUE ELSE FALSE END as is_ours
     FROM all_keywords ak
     LEFT JOIN digidom_ranks dr ON ak.keyword = dr.keyword
     LEFT JOIN competitor_ranks cr ON ak.keyword = cr.keyword
+    LEFT JOIN our_keywords ok ON ak.keyword = ok.keyword
     ORDER BY ak.search_volume DESC NULLS LAST, ak.keyword
     """
 
@@ -9266,6 +9268,7 @@ def content_gap_analysis():
                     'silo': row.silo or '',
                     'digidom_rank': row.digidom_rank,
                     'digidom_views': row.digidom_views or 0,
+                    'is_ours': row.is_ours,
                     'competitors': {},
                 }
             if row.competitor:
@@ -9278,17 +9281,6 @@ def content_gap_analysis():
         not_ranking_keywords = []
         winning_keywords = []
         overlap_keywords = []
-
-        # Use priority_keywords (tracked) for library check - consistent with silo counts
-        tracked_kw_set = set()
-        try:
-            conn = get_db()
-            c = conn.cursor()
-            c.execute('SELECT LOWER(keyword) FROM priority_keywords')
-            tracked_kw_set = set(r[0] for r in c.fetchall())
-            release_db(conn)
-        except Exception as e:
-            print(f"[CONTENT-GAP-ANALYSIS] Error fetching tracked keywords: {e}")
 
         for kw, info in keyword_map.items():
             has_digidom = info['digidom_rank'] is not None
@@ -9303,11 +9295,11 @@ def content_gap_analysis():
                 'digidom_views': info['digidom_views'],
                 'competitors': info['competitors'],
                 'keyword_type': keyword_type,
-                'in_library': kw in tracked_kw_set,
+                'in_library': info['is_ours'],
             }
 
             if has_competitor and not has_digidom:
-                if kw in tracked_kw_set:
+                if info['is_ours']:
                     not_ranking_keywords.append(entry)
                 else:
                     gap_keywords.append(entry)
