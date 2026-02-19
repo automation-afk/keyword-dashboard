@@ -18,6 +18,9 @@ from datetime import datetime
 import psycopg2
 import psycopg2.extras
 from functools import wraps
+import gzip
+import io
+import hashlib
 from authlib.integrations.flask_client import OAuth
 from werkzeug.middleware.proxy_fix import ProxyFix
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -47,6 +50,58 @@ def add_no_cache_headers(response):
         response.headers['Pragma'] = 'no-cache'
         response.headers['Expires'] = '0'
     return response
+
+
+# ============================================
+# GZIP COMPRESSION
+# ============================================
+@app.after_request
+def gzip_response(response):
+    """Compress JSON responses with gzip (70-80% size reduction)."""
+    if response.status_code < 200 or response.status_code >= 300:
+        return response
+    if 'gzip' not in request.headers.get('Accept-Encoding', ''):
+        return response
+    if response.content_length is not None and response.content_length < 500:
+        return response
+    if 'application/json' not in response.content_type:
+        return response
+
+    gzip_buf = io.BytesIO()
+    with gzip.GzipFile(fileobj=gzip_buf, mode='wb', compresslevel=6) as gz:
+        gz.write(response.get_data())
+    response.set_data(gzip_buf.getvalue())
+    response.headers['Content-Encoding'] = 'gzip'
+    response.headers['Content-Length'] = len(response.get_data())
+    return response
+
+
+# ============================================
+# IN-MEMORY RESPONSE CACHE
+# ============================================
+_response_cache = {}  # {key: {data: ..., expires: timestamp}}
+
+def cache_response(cache_key, ttl_seconds=300):
+    """Decorator to cache endpoint responses in memory."""
+    def decorator(f):
+        @wraps(f)
+        def wrapper(*args, **kwargs):
+            now = time.time()
+            # Check if ?refresh=true to bust cache
+            refresh = request.args.get('refresh', '').lower() == 'true'
+            cached = _response_cache.get(cache_key)
+            if cached and not refresh and cached['expires'] > now:
+                return cached['data']
+            result = f(*args, **kwargs)
+            _response_cache[cache_key] = {'data': result, 'expires': now + ttl_seconds}
+            return result
+        return wrapper
+    return decorator
+
+def invalidate_cache(*keys):
+    """Clear specific cache keys (call after data changes)."""
+    for k in keys:
+        _response_cache.pop(k, None)
 
 # ============================================
 # GOOGLE OAUTH CONFIG
@@ -2449,6 +2504,7 @@ def refresh_keywords():
 
 @app.route('/api/keywords')
 @login_required
+@cache_response('keywords', ttl_seconds=300)  # 5 min cache
 def get_keywords():
     user = get_current_user()
     user_email = user.get('email', 'anonymous') if user else 'anonymous'
@@ -2827,6 +2883,7 @@ def set_label():
                   (keyword, label, user_email, label, user_email))
         conn.commit()
         release_db(conn)
+        invalidate_cache('keywords', 'smart_picks', 'opportunity_finder')
         return jsonify({'success': True, 'keyword': keyword, 'label': label, 'updatedBy': user_email})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -2856,6 +2913,7 @@ def toggle_favorite():
 
         conn.commit()
         release_db(conn)
+        invalidate_cache('keywords', 'smart_picks', 'opportunity_finder')
         return jsonify({'success': True, 'keyword': keyword, 'favorite': new_status, 'updatedBy': user_email})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -7737,6 +7795,7 @@ def trending_gaps():
 
 @app.route('/api/opportunity-finder')
 @login_required
+@cache_response('opportunity_finder', ttl_seconds=600)  # 10 min cache
 def opportunity_finder():
     """
     Analyzes every keyword for $3K/mo revenue feasibility.
@@ -8314,6 +8373,7 @@ PROBLEM_KEYWORDS = {
 
 @app.route('/api/keyword-universe')
 @login_required
+@cache_response('keyword_universe', ttl_seconds=600)  # 10 min cache
 def keyword_universe():
     """
     Maps the total keyword universe per niche, showing coverage gaps.
@@ -8619,6 +8679,7 @@ def plain_english_reason(keyword_data, keyword_type):
 
 @app.route('/api/smart-picks')
 @login_required
+@cache_response('smart_picks', ttl_seconds=600)  # 10 min cache
 def smart_picks():
     """
     Beginner-friendly keyword recommendations.
