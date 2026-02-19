@@ -9105,7 +9105,7 @@ def _bq_live_competitors(silo_filter=''):
             SELECT
                 LOWER(Keyword) as kw,
                 Channel_title,
-                Silo,
+                COALESCE(NULLIF(TRIM(Silo), ''), 'other') as Silo,
                 CASE WHEN Channel_title IN ({ch_names_str}) THEN 1 ELSE 0 END as is_digidom
             FROM {BQ_SERP_TABLE}
             WHERE Scrape_date = BQ_asia_scrape_date
@@ -9126,8 +9126,6 @@ def _bq_live_competitors(silo_filter=''):
               AND Rank BETWEEN 1 AND 10
               AND Channel_title IS NOT NULL
               AND TRIM(Channel_title) != ''
-              AND Silo IS NOT NULL
-              AND TRIM(Silo) != ''
         ),
         digidom_kws AS (
             SELECT DISTINCT kw FROM serp WHERE is_digidom = 1
