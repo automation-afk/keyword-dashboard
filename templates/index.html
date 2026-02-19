@@ -2310,11 +2310,15 @@
                     Compare Digidom's YouTube keyword coverage against competitors.
                     Find keywords they rank for that you're missing.
                 </p>
-                <button class="research-btn" id="cg-load-competitors-btn" onclick="loadGapCompetitors()"
-                        style="background:linear-gradient(135deg, #ec4899, #8b5cf6);">
-                    <span id="cg-comp-btn-text">Discover Top Competitors</span>
-                    <div class="spinner" id="cg-comp-spinner" style="display:none;"></div>
-                </button>
+                <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+                    <button class="research-btn" id="cg-load-competitors-btn" onclick="loadGapCompetitors()"
+                            style="background:linear-gradient(135deg, #ec4899, #8b5cf6);">
+                        <span id="cg-comp-btn-text">Discover Top Competitors</span>
+                        <div class="spinner" id="cg-comp-spinner" style="display:none;"></div>
+                    </button>
+                    <button id="cg-refresh-btn" onclick="loadGapCompetitors(null, true)" style="display:none;background:#334155;color:#94a3b8;border:none;padding:8px 14px;border-radius:8px;cursor:pointer;font-size:0.8rem;">Refresh from BigQuery</button>
+                    <span id="cg-cache-info" style="display:none;color:#64748b;font-size:0.7rem;"></span>
+                </div>
             </div>
 
             <!-- Competitor Selection -->
@@ -7126,19 +7130,26 @@
         let cgGapDisplayLimit = 30;
         let cgSiloCounts = {};
 
-        async function loadGapCompetitors(silo) {
+        async function loadGapCompetitors(silo, refresh) {
             const btn = document.getElementById('cg-load-competitors-btn');
             const btnText = document.getElementById('cg-comp-btn-text');
             const spinner = document.getElementById('cg-comp-spinner');
+            const refreshBtn = document.getElementById('cg-refresh-btn');
+            const cacheInfo = document.getElementById('cg-cache-info');
 
             btn.disabled = true;
-            btnText.textContent = 'Discovering...';
+            if (refreshBtn) refreshBtn.disabled = true;
+            btnText.textContent = refresh ? 'Refreshing from BigQuery...' : 'Discovering...';
             spinner.style.display = 'block';
 
-            const siloParam = silo ? '?silo=' + encodeURIComponent(silo) : '';
+            let url = '/api/content-gap/competitors';
+            const params = [];
+            if (silo) params.push('silo=' + encodeURIComponent(silo));
+            if (refresh) params.push('refresh=true');
+            if (params.length) url += '?' + params.join('&');
 
             try {
-                const response = await fetch('/api/content-gap/competitors' + siloParam);
+                const response = await fetch(url);
                 if (!response.ok) { alert('Error ' + response.status + ': ' + response.statusText); return; }
                 const text = await response.text();
                 let data;
@@ -7156,6 +7167,15 @@
                         if (data.silo_counts) cgSiloCounts = data.silo_counts;
                         populateCgSiloFilter();
                     }
+                    // Show cache info and refresh button
+                    if (refreshBtn) refreshBtn.style.display = '';
+                    if (cacheInfo && data.cache_updated) {
+                        cacheInfo.style.display = '';
+                        cacheInfo.textContent = 'Data from: ' + data.cache_updated + (data.stale ? ' (stale)' : '');
+                    } else if (cacheInfo) {
+                        cacheInfo.style.display = '';
+                        cacheInfo.textContent = 'Fresh data loaded just now';
+                    }
                 } else {
                     alert('Error: ' + (data.error || 'Unknown'));
                 }
@@ -7164,6 +7184,7 @@
                 alert('Error loading competitors: ' + error.message);
             } finally {
                 btn.disabled = false;
+                if (refreshBtn) refreshBtn.disabled = false;
                 btnText.textContent = 'Discover Top Competitors';
                 spinner.style.display = 'none';
             }
@@ -7261,6 +7282,11 @@
                     renderGapSummary(data);
                     renderGapTable(data);
                     document.getElementById('cg-results').style.display = 'block';
+                    // Show cache info
+                    const cacheInfo = document.getElementById('cg-cache-info');
+                    if (cacheInfo && data.cache_updated) {
+                        cacheInfo.textContent = 'Data from: ' + data.cache_updated;
+                    }
                 } else {
                     alert('Error: ' + (data.error || 'Unknown'));
                 }

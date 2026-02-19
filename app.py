@@ -639,6 +639,14 @@ def init_db():
             pass
 
     c.execute('''
+        CREATE TABLE IF NOT EXISTS bq_cache (
+            cache_key TEXT PRIMARY KEY,
+            data JSONB NOT NULL,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+
+    c.execute('''
         CREATE TABLE IF NOT EXISTS keywords_master (
             id SERIAL PRIMARY KEY,
             keyword TEXT UNIQUE NOT NULL,
@@ -8794,6 +8802,48 @@ def smart_picks():
 
 
 # ============================================
+# BIGQUERY CACHE (Supabase)
+# ============================================
+
+def get_bq_cache(cache_key, max_age_hours=24):
+    """Get cached BigQuery result from Supabase. Returns data dict or None."""
+    try:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute('''
+            SELECT data, updated_at FROM bq_cache
+            WHERE cache_key = %s AND updated_at > NOW() - INTERVAL '%s hours'
+        ''', (cache_key, max_age_hours))
+        row = c.fetchone()
+        conn.close()
+        if row:
+            return {'data': row[0], 'updated_at': row[1].strftime('%Y-%m-%d %H:%M') if row[1] else None}
+    except Exception as e:
+        print(f"[BQ-CACHE] Read error for {cache_key}: {e}")
+    return None
+
+
+def set_bq_cache(cache_key, data):
+    """Save BigQuery result to Supabase cache."""
+    import json as _json
+    try:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute('''
+            INSERT INTO bq_cache (cache_key, data, updated_at)
+            VALUES (%s, %s, CURRENT_TIMESTAMP)
+            ON CONFLICT (cache_key) DO UPDATE SET
+                data = EXCLUDED.data,
+                updated_at = CURRENT_TIMESTAMP
+        ''', (cache_key, _json.dumps(data)))
+        conn.commit()
+        conn.close()
+        print(f"[BQ-CACHE] Saved {cache_key}")
+    except Exception as e:
+        print(f"[BQ-CACHE] Write error for {cache_key}: {e}")
+
+
+# ============================================
 # CONTENT GAP ANALYSIS
 # ============================================
 
@@ -8803,11 +8853,22 @@ def content_gap_competitors():
     """Find top competitor channels from BigQuery SERP data."""
     from google.cloud import bigquery as bq
 
+    silo_filter = request.args.get('silo', '').strip()
+    refresh = request.args.get('refresh', '').lower() == 'true'
+
+    # Check cache first (unless refresh requested)
+    cache_key = f"content_gap_competitors:{silo_filter or 'all'}"
+    if not refresh:
+        cached = get_bq_cache(cache_key, max_age_hours=24)
+        if cached:
+            result = cached['data']
+            result['cached'] = True
+            result['cache_updated'] = cached['updated_at']
+            return jsonify(result)
+
     client = get_bq_client()
     if not client:
         return jsonify({'success': False, 'error': 'BigQuery not available'}), 500
-
-    silo_filter = request.args.get('silo', '').strip()
     ch_names_str = ', '.join(f"'{name}'" for name in ALL_BQ_CHANNEL_NAMES)
 
     silo_clause = ""
@@ -8937,9 +8998,19 @@ def content_gap_competitors():
             except Exception as se:
                 print(f"[CONTENT-GAP] Silo counts query error: {se}")
 
-        return jsonify({'success': True, 'competitors': competitors, 'silo_counts': silo_counts})
+        result = {'success': True, 'competitors': competitors, 'silo_counts': silo_counts}
+        set_bq_cache(cache_key, result)
+        return jsonify(result)
     except Exception as e:
         print(f"[CONTENT-GAP] Competitors query error: {e}")
+        # Try stale cache as fallback
+        stale = get_bq_cache(cache_key, max_age_hours=168)  # 7 day fallback
+        if stale:
+            result = stale['data']
+            result['cached'] = True
+            result['cache_updated'] = stale['updated_at']
+            result['stale'] = True
+            return jsonify(result)
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
@@ -8948,13 +9019,26 @@ def content_gap_competitors():
 def content_gap_analysis():
     """Side-by-side ranking comparison + gap identification."""
     from google.cloud import bigquery as bq
+    import hashlib
 
     data = request.get_json()
     competitors = data.get('competitors', [])
     silo_filter = data.get('silo_filter', '')
+    refresh = data.get('refresh', False)
 
     if not competitors:
         return jsonify({'success': False, 'error': 'Select at least one competitor'}), 400
+
+    # Check cache first
+    comp_hash = hashlib.md5(','.join(sorted(competitors)).encode()).hexdigest()[:8]
+    cache_key = f"content_gap_analysis:{comp_hash}:{silo_filter or 'all'}"
+    if not refresh:
+        cached = get_bq_cache(cache_key, max_age_hours=24)
+        if cached:
+            result = cached['data']
+            result['cached'] = True
+            result['cache_updated'] = cached['updated_at']
+            return jsonify(result)
 
     client = get_bq_client()
     if not client:
@@ -9114,7 +9198,7 @@ def content_gap_analysis():
 
         print(f"[CONTENT-GAP] Analysis complete: {len(gap_keywords)} gaps, {len(overlap_keywords)} overlap, {len(winning_keywords)} winning")
 
-        return jsonify({
+        result = {
             'success': True,
             'competitors': competitors,
             'gap_keywords': gap_keywords[:100],
@@ -9130,11 +9214,21 @@ def content_gap_analysis():
                 'gap_in_library': sum(1 for g in gap_keywords if g['in_library']),
                 'gap_not_in_library': sum(1 for g in gap_keywords if not g['in_library']),
             },
-        })
+        }
+        set_bq_cache(cache_key, result)
+        return jsonify(result)
     except Exception as e:
         import traceback
         traceback.print_exc()
         print(f"[CONTENT-GAP] Analysis error: {e}")
+        # Try stale cache as fallback
+        stale = get_bq_cache(cache_key, max_age_hours=168)
+        if stale:
+            result = stale['data']
+            result['cached'] = True
+            result['cache_updated'] = stale['updated_at']
+            result['stale'] = True
+            return jsonify(result)
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
