@@ -6185,6 +6185,12 @@ CHANGELOG = [
         'description': 'View ranking history graphs and revenue data for your priority keywords.',
         'detail': 'Each priority keyword now has historical ranking data displayed as a graph, showing position changes over time. Revenue estimates are also available, helping you track the monetary impact of your ranking improvements and prioritize high-value keywords.'
     },
+    {
+        'version': 9, 'date': '2026-02-20', 'tab': 'opportunity',
+        'title': 'Low Comp + High Rev Filter',
+        'description': 'New filter in $3K Finder to surface low competition, high revenue keywords.',
+        'detail': 'The $3K Finder now has a "Low Comp + High Rev" filter that highlights keywords with low competition but high revenue potential. Use this to quickly find the best opportunities — keywords that are easier to rank for and bring in the most money.'
+    },
 ]
 
 CHANGELOG_CURRENT_VERSION = max(item['version'] for item in CHANGELOG)
