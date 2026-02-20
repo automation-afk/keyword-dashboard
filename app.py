@@ -9520,19 +9520,30 @@ def content_gap_competitors():
         except Exception as bq_err:
             print(f"[CONTENT-GAP] BQ ranked keywords error: {bq_err}")
 
-        # Also get general_info keywords (we have content for these)
+        # All-time ownership: competitor_checker = 'Digidom' + Channel_title + Digibot_General_info
+        # Matches guide query for knowing what keywords we already have
         our_content_kws = set(bq_ranked_kws)
         try:
             bq_client = get_bq_client()
             if bq_client:
-                gi_query = f"""
+                ch_names_str2 = ', '.join(f"'{name}'" for name in ALL_BQ_CHANNEL_NAMES)
+                ownership_query = f"""
+                SELECT DISTINCT LOWER(Keyword) as kw
+                FROM {BQ_SERP_TABLE}
+                WHERE competitor_checker = 'Digidom'
+                UNION DISTINCT
+                SELECT DISTINCT LOWER(Keyword) as kw
+                FROM {BQ_SERP_TABLE}
+                WHERE Channel_title IN ({ch_names_str2})
+                  AND Scrape_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 90 DAY)
+                UNION DISTINCT
                 SELECT DISTINCT LOWER(main_keyword) as kw FROM {BQ_GENERAL_INFO_TABLE}
                 WHERE main_keyword IS NOT NULL AND TRIM(main_keyword) != ''
                 """
-                gi_rows = bq_client.query(gi_query).result()
-                our_content_kws.update(row.kw for row in gi_rows)
-        except Exception:
-            pass
+                ownership_rows = bq_client.query(ownership_query).result()
+                our_content_kws.update(row.kw for row in ownership_rows)
+        except Exception as e:
+            print(f"[CONTENT-GAP] Ownership query error: {e}")
 
         # Build silo filter clause
         silo_clause = ""
@@ -9758,13 +9769,22 @@ def content_gap_analysis():
                             'views': row.best_views or 0,
                         }
 
-                # Get general_info keywords
-                gi_query = f"""
+                # All-time ownership: competitor_checker = 'Digidom' + Channel_title + Digibot
+                ownership_query = f"""
+                SELECT DISTINCT LOWER(Keyword) as kw
+                FROM {BQ_SERP_TABLE}
+                WHERE competitor_checker = 'Digidom'
+                UNION DISTINCT
+                SELECT DISTINCT LOWER(Keyword) as kw
+                FROM {BQ_SERP_TABLE}
+                WHERE Channel_title IN ({ch_names_str})
+                  AND Scrape_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 90 DAY)
+                UNION DISTINCT
                 SELECT DISTINCT LOWER(main_keyword) as kw FROM {BQ_GENERAL_INFO_TABLE}
                 WHERE main_keyword IS NOT NULL AND TRIM(main_keyword) != ''
                 """
-                gi_rows = bq_client.query(gi_query).result()
-                our_content_kws = set(row.kw for row in gi_rows)
+                ownership_rows = bq_client.query(ownership_query).result()
+                our_content_kws = set(row.kw for row in ownership_rows)
                 our_content_kws.update(bq_ranked_kws.keys())
         except Exception as bq_err:
             print(f"[CONTENT-GAP] BQ cross-reference error: {bq_err}")
