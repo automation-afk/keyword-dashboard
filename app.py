@@ -25,6 +25,7 @@ from authlib.integrations.flask_client import OAuth
 from werkzeug.middleware.proxy_fix import ProxyFix
 from apscheduler.schedulers.background import BackgroundScheduler
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from sheets_sync import sync_priority_keywords, sync_domination
 
 app = Flask(__name__)
 
@@ -6169,6 +6170,7 @@ def toggle_priority_keywords():
                 inserted += 1
         conn.commit()
         release_db(conn)
+        sync_priority_keywords(get_db, release_db)
         return jsonify({'success': True, 'updated': updated, 'inserted': inserted})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -6222,6 +6224,7 @@ def add_custom_keyword():
         ''', (keyword, tier, niche, priority_score, email, is_primary, parent_kw, email, is_primary, parent_kw))
         conn.commit()
         release_db(conn)
+        sync_priority_keywords(get_db, release_db)
         return jsonify({
             'success': True, 'keyword': keyword,
             'tier': tier, 'niche': niche, 'priority_score': priority_score,
@@ -6265,6 +6268,7 @@ def delete_priority_keywords():
         deleted = c.rowcount
         conn.commit()
         release_db(conn)
+        sync_priority_keywords(get_db, release_db)
         return jsonify({'success': True, 'deleted': deleted})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -6326,6 +6330,7 @@ def update_keyword_roles():
 
         conn.commit()
         release_db(conn)
+        sync_priority_keywords(get_db, release_db)
         return jsonify({'success': True, 'updated': updated})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -6500,7 +6505,7 @@ def get_domination_data():
                             kw_entry['revenue'] = bq_revenue[kw_lower]
 
         # 6. Return combined response
-        return jsonify({
+        response_data = {
             'success': True,
             'source': source,
             'tracking': tracking,
@@ -6509,7 +6514,9 @@ def get_domination_data():
             'audit_results_by_keyword': audit_results_by_kw,
             'timestamp': audit_data.get('timestamp') if audit_data else None,
             'revenue_source': 'bigquery' if bq_revenue else 'config'
-        })
+        }
+        sync_domination(response_data)
+        return jsonify(response_data)
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
