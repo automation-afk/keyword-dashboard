@@ -2492,6 +2492,91 @@ def suggest_ideal_brand(keyword, niche='other'):
     # Generic fallback
     return '-'
 
+
+def estimate_keyword_expiration(keyword, trend_data=None, seasonality_score=0):
+    """
+    Estimate how long a keyword will stay relevant.
+    Returns a dict with label, months, and color for display.
+
+    Signals used:
+    - Year mentions (e.g., "2025", "2026") → expires when year ends
+    - Event/news keywords → short shelf life
+    - Trend direction (falling = shorter, rising = longer)
+    - Seasonality (highly seasonal = limited window)
+    - Evergreen patterns ("how to", "best", "what is") → long life
+    """
+    import re
+    kw_lower = keyword.lower()
+    trend_data = trend_data or {}
+
+    # 1) Year-specific keywords - expire when the year passes
+    year_match = re.search(r'\b(202[4-9]|203[0-9])\b', kw_lower)
+    if year_match:
+        mentioned_year = int(year_match.group())
+        current_year = datetime.now().year
+        months_left = max(0, (mentioned_year - current_year) * 12 + (12 - datetime.now().month))
+        if months_left <= 0:
+            return {'label': 'Expired', 'months': 0, 'color': '#ef4444'}
+        elif months_left <= 3:
+            return {'label': f'{months_left}mo left', 'months': months_left, 'color': '#f87171'}
+        elif months_left <= 6:
+            return {'label': f'{months_left}mo left', 'months': months_left, 'color': '#fbbf24'}
+        else:
+            return {'label': f'{months_left}mo left', 'months': months_left, 'color': '#4ade80'}
+
+    # 2) News/event/trending keywords - short shelf life
+    news_signals = ['scandal', 'leak', 'update ', 'announcement', 'launched', 'new release',
+                    'breaking', 'recall', 'outage', 'hack ', 'breach', 'controversy']
+    if any(sig in kw_lower for sig in news_signals):
+        return {'label': '1-3 months', 'months': 2, 'color': '#f87171'}
+
+    # 3) Seasonal keywords
+    seasonal_signals = ['black friday', 'cyber monday', 'christmas', 'halloween',
+                        'summer', 'winter', 'spring', 'back to school', 'valentine',
+                        'prime day', 'tax season', 'new year']
+    if any(sig in kw_lower for sig in seasonal_signals):
+        return {'label': 'Seasonal', 'months': 3, 'color': '#a78bfa'}
+
+    # 4) Check trend data for decay signals
+    trend = trend_data.get('trend', 'unknown')
+    trend_change = trend_data.get('trend_change_pct', 0)
+
+    if trend == 'falling' and trend_change < -30:
+        return {'label': '3-6 months', 'months': 4, 'color': '#fbbf24'}
+    elif trend == 'falling':
+        return {'label': '6-12 months', 'months': 9, 'color': '#fbbf24'}
+
+    # 5) High seasonality score → limited peak window
+    if seasonality_score and seasonality_score > 70:
+        return {'label': 'Seasonal peak', 'months': 4, 'color': '#a78bfa'}
+
+    # 6) Evergreen signals
+    evergreen_signals = ['how to', 'what is', 'best ', 'vs ', ' vs ', 'review',
+                         'alternative', 'worth it', 'pros and cons', 'comparison',
+                         'safe', 'legit', 'scam', 'cancel', 'setup', 'install',
+                         'tutorial', 'guide', 'tips', 'for kids', 'for seniors',
+                         'for beginners', 'for small business', 'pricing', 'cost',
+                         'free trial', 'discount', 'coupon']
+    if any(sig in kw_lower for sig in evergreen_signals):
+        if trend == 'rising':
+            return {'label': 'Evergreen+', 'months': 36, 'color': '#22d3ee'}
+        return {'label': 'Evergreen', 'months': 24, 'color': '#4ade80'}
+
+    # 7) Brand-specific queries tend to be evergreen (people always search brands)
+    brand_signals = ['nordvpn', 'expressvpn', 'surfshark', 'norton', 'mcafee',
+                     'aura', 'lifelock', 'qustodio', 'bark', 'deleteme', 'incogni',
+                     'siteground', 'bluehost', 'simplisafe', 'ring', 'zenbusiness']
+    if any(brand in kw_lower for brand in brand_signals):
+        return {'label': '12+ months', 'months': 18, 'color': '#4ade80'}
+
+    # 8) Rising trend = longer life
+    if trend == 'rising':
+        return {'label': '12+ months', 'months': 18, 'color': '#4ade80'}
+
+    # Default: stable/unknown - assume moderate lifespan
+    return {'label': '12+ months', 'months': 12, 'color': '#4ade80'}
+
+
 def estimate_revenue_potential(keyword_data, yt_data, niche='general', keyword=''):
     """
     CALIBRATED REVENUE MODEL - Based on ALL-TIME revenue data (356 keywords)
@@ -2732,6 +2817,13 @@ def get_keywords():
         kw['publishWindow'] = kw_trend.get('publishWindow')
         kw['trendUpdated'] = kw_trend.get('trendUpdated')
 
+        # Estimate keyword expiration / shelf life
+        kw['expiration'] = estimate_keyword_expiration(
+            k['keyword'],
+            trend_data={'trend': kw['trend'], 'trend_change_pct': kw['trendChange']},
+            seasonality_score=kw['seasonalityScore']
+        )
+
         # Add who added this keyword
         kw_additions = additions.get(k['keyword'], [])
         kw['addedBy'] = kw_additions
@@ -2922,6 +3014,8 @@ def research_keyword():
         seed_result['epv'] = revenue_data['epv']
         seed_result['capture_rate'] = revenue_data['capture_rate']
         seed_result['estimated_traffic'] = revenue_data['estimated_traffic']
+        seed_result['idealBrand'] = suggest_ideal_brand(seed_keyword, niche)
+        seed_result['expiration'] = estimate_keyword_expiration(seed_keyword, trend_data if trend_data.get('success') else {})
 
         results['keywords'].append(seed_result)
 
@@ -2960,6 +3054,8 @@ def research_keyword():
                 rk_result['epv'] = rk_revenue['epv']
                 rk_result['capture_rate'] = rk_revenue['capture_rate']
                 rk_result['estimated_traffic'] = rk_revenue['estimated_traffic']
+                rk_result['idealBrand'] = suggest_ideal_brand(kw, niche)
+                rk_result['expiration'] = estimate_keyword_expiration(kw, {})
 
                 results['keywords'].append(rk_result)
 
@@ -6255,6 +6351,18 @@ CHANGELOG = [
         'title': 'Advanced Filters in Keyword Library',
         'description': 'Stack multiple filters to slice your keyword list by any column.',
         'detail': '<ul><li>Click <strong>"+ Add Filter"</strong> to add advanced filters</li><li>Filter by: Trend, Season, Volume, Revenue, Priority Score, Buying Intent, Niche, Tier, Conversion, Competition, Content Angle, YT Views, YT Pattern, Label, Source, Votes</li><li><strong>Include or Exclude</strong> mode with operators: Equals, Greater Than, Less Than, Between, Contains</li><li>Stack multiple filters &mdash; they combine with <strong>AND logic</strong></li><li>Example: "Rising trend + Volume &gt; 1000 + Evergreen"</li></ul>'
+    },
+    {
+        'version': 12, 'date': '2026-02-21', 'tab': 'library',
+        'title': 'Keyword Expiration Date',
+        'description': 'See how long each keyword will stay relevant before it expires or loses search interest.',
+        'detail': '<ul><li><strong>Evergreen</strong> &mdash; keywords like "how to", "best", "vs" that stay relevant long-term</li><li><strong>Seasonal</strong> &mdash; keywords tied to events like Black Friday, summer, etc.</li><li><strong>Year-based</strong> &mdash; keywords with a year (e.g. "best vpn 2026") show months remaining</li><li><strong>Expiring</strong> &mdash; falling trends or news-based keywords flagged as short shelf life</li><li>New column in Keyword Library (sortable) + shown in Research Results</li><li>Filter by expiration in Advanced Filters</li></ul>'
+    },
+    {
+        'version': 13, 'date': '2026-02-21', 'tab': 'research',
+        'title': 'Ideal Brand in Research Results',
+        'description': 'Research results now show the recommended brand/product to promote for each keyword.',
+        'detail': '<ul><li>Same Ideal Brand logic from the Keyword Library now appears in Research cards</li><li>See the best CTA brand <strong>before</strong> adding a keyword to your library</li><li>Brand suggestions are niche-aware (e.g. Qustodio for parental control, NordVPN for VPN)</li><li>Helps you pick the right affiliate offer from the start</li></ul>'
     },
 ]
 

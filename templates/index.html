@@ -1723,6 +1723,7 @@
                                     <option value="trend">Trend</option>
                                     <option value="season">Season</option>
                                     <option value="seasonalityScore">Seasonality Score</option>
+                                    <option value="expiration">Expiration</option>
                                 </optgroup>
                                 <optgroup label="Performance">
                                     <option value="volume">Volume</option>
@@ -1837,11 +1838,12 @@
                                 <th data-sort="volume">Volume</th>
                                 <th data-sort="trendInterest">Trend</th>
                                 <th data-sort="seasonalityScore">Season</th>
+                                <th data-sort="expiration">Expiration</th>
                                 <th data-sort="source">Source</th>
                             </tr>
                         </thead>
                         <tbody id="table-body">
-                            <tr><td colspan="19" style="text-align:center;padding:40px;color:#94a3b8;">Loading keywords...</td></tr>
+                            <tr><td colspan="20" style="text-align:center;padding:40px;color:#94a3b8;">Loading keywords...</td></tr>
                         </tbody>
                     </table>
                 </div>
@@ -2740,6 +2742,7 @@
             label:               { label: 'Label',             type: 'enum',   field: 'label',               values: ['none','interested','maybe','not_interested','researching'] },
             source:              { label: 'Source',             type: 'enum',   field: 'source',              values: 'dynamic' },
             voteScore:           { label: 'Votes',             type: 'number', field: 'voteScore' },
+            expiration:          { label: 'Expiration',        type: 'enum',   field: '_expiration',          values: ['Expired','1-3 months','3-6 months','6-12 months','12+ months','Seasonal','Seasonal peak','Evergreen','Evergreen+'] },
         };
 
         function getSeasonStatus(d) {
@@ -2764,6 +2767,7 @@
             allData.forEach(d => {
                 let v;
                 if (field === '_season') v = getSeasonStatus(d);
+                else if (field === '_expiration') v = d.expiration ? d.expiration.label : '-';
                 else v = d[field];
                 if (v !== undefined && v !== null && v !== '') vals.add(String(v));
             });
@@ -2906,6 +2910,8 @@
             let itemValue;
             if (cat.field === '_season') {
                 itemValue = getSeasonStatus(item);
+            } else if (cat.field === '_expiration') {
+                itemValue = item.expiration ? item.expiration.label : '-';
             } else {
                 itemValue = item[cat.field];
             }
@@ -3096,6 +3102,14 @@
                             <div class="metric">
                                 <div class="metric-value" style="color:${(kw.competition || 0) < 0.3 ? '#4ade80' : (kw.competition || 0) < 0.6 ? '#fbbf24' : '#f87171'};">${kw.competition ? (kw.competition <= 1 ? (kw.competition * 100).toFixed(0) + '%' : kw.competition) : 'N/A'}</div>
                                 <div class="metric-label">Competition</div>
+                            </div>
+                            <div class="metric">
+                                <div class="metric-value" style="color:#60a5fa;">${kw.idealBrand || '-'}</div>
+                                <div class="metric-label">Ideal Brand</div>
+                            </div>
+                            <div class="metric">
+                                <div class="metric-value" style="color:${kw.expiration ? kw.expiration.color : '#94a3b8'};">${kw.expiration ? kw.expiration.label : '-'}</div>
+                                <div class="metric-label">Expiration</div>
                             </div>
                         </div>
                     </div>
@@ -4013,6 +4027,11 @@
             filteredData.sort((a, b) => {
                 let aVal = a[sortColumn];
                 let bVal = b[sortColumn];
+                // Handle expiration object sorting by months
+                if (sortColumn === 'expiration') {
+                    aVal = aVal ? aVal.months : 999;
+                    bVal = bVal ? bVal.months : 999;
+                }
                 if (typeof aVal === 'string') {
                     aVal = aVal.toLowerCase();
                     bVal = bVal.toLowerCase();
@@ -4077,6 +4096,7 @@
                     <td class="number-cell">${d.volume ? d.volume.toLocaleString() : '-'}</td>
                     <td class="trend-cell">${formatTrendBadge(d)}</td>
                     <td class="season-cell">${formatSeasonBadge(d)}</td>
+                    <td><span style="color:${d.expiration ? d.expiration.color : '#94a3b8'};font-size:0.75rem;font-weight:500;">${d.expiration ? d.expiration.label : '-'}</span></td>
                     <td style="font-size:0.7rem;color:#94a3b8;max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${d.addedByEmail || d.source || 'csv'}">${formatAddedBy(d)}</td>
                     <td>${(d.source && d.source !== 'csv') ? `<button onclick="deleteFromLibrary('${escapedKw}')" style="background:none;border:none;color:#64748b;cursor:pointer;font-size:1rem;padding:2px 6px;border-radius:4px;transition:all 0.2s;" onmouseover="this.style.color='#f87171';this.style.background='rgba(248,113,113,0.1)'" onmouseout="this.style.color='#64748b';this.style.background='none'" title="Delete from library">&times;</button>` : ''}</td>
                 </tr>
