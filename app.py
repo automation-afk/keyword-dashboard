@@ -3390,6 +3390,50 @@ def add_to_library():
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
+
+@app.route('/api/library/delete', methods=['POST'])
+@login_required
+def delete_from_library():
+    """Delete a keyword from the library (only research/manual/channel_analysis sources)."""
+    data = request.get_json()
+    keyword = data.get('keyword', '').strip()
+
+    if not keyword:
+        return jsonify({'success': False, 'error': 'Keyword is required'}), 400
+
+    try:
+        conn = get_db()
+        c = conn.cursor()
+
+        # Only allow deleting non-CSV keywords
+        c.execute('SELECT source FROM keywords_master WHERE keyword = %s', (keyword,))
+        row = c.fetchone()
+        if not row:
+            release_db(conn)
+            return jsonify({'success': False, 'error': 'Keyword not found'}), 404
+
+        source = row[0] or 'csv'
+        if source == 'csv':
+            release_db(conn)
+            return jsonify({'success': False, 'error': 'Cannot delete CSV-imported keywords'}), 400
+
+        # Delete from keywords_master
+        c.execute('DELETE FROM keywords_master WHERE keyword = %s', (keyword,))
+        # Also clean up related tables
+        c.execute('DELETE FROM keyword_additions WHERE keyword = %s', (keyword,))
+        c.execute('DELETE FROM researched_keywords WHERE keyword = %s', (keyword,))
+        conn.commit()
+        release_db(conn)
+
+        # Remove from in-memory KEYWORDS list
+        global KEYWORDS
+        KEYWORDS = [kw for kw in KEYWORDS if kw.get('keyword') != keyword]
+
+        return jsonify({'success': True, 'keyword': keyword})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
 @app.route('/api/keywords/add-manual', methods=['POST'])
 @login_required
 def add_keyword_manual():
@@ -6150,67 +6194,67 @@ CHANGELOG = [
         'version': 1, 'date': '2026-02-18', 'tab': 'domination',
         'title': 'Google Sheets Auto-Sync',
         'description': 'Priority keywords and rank domination data now auto-push to Google Sheets on every change.',
-        'detail': 'Every time you add, delete, toggle, or update keyword roles, the full priority keywords list is automatically synced to the "kwResearchToolapp" tab in Google Sheets. Rank domination data syncs when you load the Domination Score page. No manual export needed — your spreadsheet stays up to date in real time.'
+        'detail': '<ul><li>Add, delete, toggle, or update keyword roles &rarr; automatically synced to Google Sheets</li><li>Rank domination data syncs when you load the Domination Score page</li><li>Data goes to the "kwResearchToolapp" tab</li><li>No manual export needed &mdash; your spreadsheet stays up to date in real time</li></ul>'
     },
     {
         'version': 2, 'date': '2026-02-18', 'tab': 'library',
         'title': 'Delete Research Keywords',
         'description': 'You can now delete keywords added from research in the Keyword Library.',
-        'detail': 'Previously, only custom-added keywords had a delete button. Now keywords with source "research" also show the red X delete button in the Keyword Library. Filter by "NEW" to see recently researched keywords and remove any you don\'t need.'
+        'detail': '<ul><li>Keywords with source "research" now show the red X delete button</li><li>Previously only custom-added keywords could be deleted</li><li>Filter by "NEW" to see recently researched keywords</li><li>Remove any you don\'t need with one click</li></ul>'
     },
     {
         'version': 3, 'date': '2026-02-20', 'tab': 'contentgap',
         'title': 'Content Gap Ownership Check',
         'description': 'Content gap analysis now checks all-time scan data for ownership.',
-        'detail': 'The content gap analysis previously only checked the most recent competitor scan. It now looks across all historical scan data to determine if you already own a keyword position, giving more accurate gap identification and reducing false positives.'
+        'detail': '<ul><li>Previously only checked the most recent competitor scan</li><li>Now looks across <strong>all historical scan data</strong> to determine ownership</li><li>More accurate gap identification</li><li>Reduces false positives for keywords you already rank for</li></ul>'
     },
     {
         'version': 4, 'date': '2026-02-20', 'tab': 'contentgap',
         'title': 'Daily Competitor Scans',
         'description': 'Competitor discovery scans now run daily instead of weekly.',
-        'detail': 'Competitor channel keyword scans have been upgraded from weekly (Monday only) to daily. This means fresher competitor data, faster discovery of new competitor keywords, and more up-to-date content gap analysis.'
+        'detail': '<ul><li>Upgraded from weekly (Monday only) to <strong>daily</strong> scans</li><li>Fresher competitor data</li><li>Faster discovery of new competitor keywords</li><li>More up-to-date content gap analysis</li></ul>'
     },
     {
         'version': 5, 'date': '2026-02-20', 'tab': 'contentgap',
         'title': 'YouTube Competitor Discovery',
         'description': 'New YouTube Search method added to competitor discovery alongside BQ-based discovery.',
-        'detail': 'A second competitor discovery method is now available: YouTube Search API. This runs alongside the existing BigQuery-based discovery to find competitors that may not appear in BQ data. Discovered competitors are automatically added to the scan rotation for keyword extraction.'
+        'detail': '<ul><li>New discovery method: <strong>YouTube Search API</strong></li><li>Runs alongside the existing BigQuery-based discovery</li><li>Finds competitors that may not appear in BQ data</li><li>Discovered competitors are auto-added to scan rotation for keyword extraction</li></ul>'
     },
     {
         'version': 6, 'date': '2026-02-19', 'tab': 'library',
         'title': 'Add to Library + Delete',
         'description': 'Add keywords to the library from research — they show as NEW and can be deleted.',
-        'detail': 'When you research keywords, you can now add them directly to the Keyword Library. Added keywords appear with a "NEW" badge so you can easily spot them. You can also delete any research-sourced keyword from the library using the X button if you no longer need it.'
+        'detail': '<ul><li>Add keywords directly to the Keyword Library from research</li><li>Added keywords appear with a <strong>"NEW" badge</strong></li><li>Delete any research-sourced keyword using the X button</li><li>Easily spot and manage newly researched keywords</li></ul>'
     },
     {
         'version': 7, 'date': '2026-02-13', 'tab': 'domination',
         'title': 'Rank Domination Keyword Manager',
         'description': 'Manage and prioritize your keywords directly from the Rank Domination dashboard.',
-        'detail': 'The Rank Domination tab now includes a keyword manager that lets you organize, activate, deactivate, and set roles (primary/secondary) for your priority keywords. Manage your entire keyword strategy from one place without switching tabs.'
+        'detail': '<ul><li>Organize, activate, and deactivate priority keywords</li><li>Set roles: <strong>primary</strong> or <strong>secondary</strong></li><li>Manage your entire keyword strategy from one place</li><li>No need to switch tabs</li></ul>'
     },
     {
         'version': 8, 'date': '2026-02-13', 'tab': 'domination',
         'title': 'Historical Graph & Revenue',
         'description': 'View ranking history graphs and revenue data for your priority keywords.',
-        'detail': 'Each priority keyword now has historical ranking data displayed as a graph, showing position changes over time. Revenue estimates are also available, helping you track the monetary impact of your ranking improvements and prioritize high-value keywords.'
+        'detail': '<ul><li>Historical ranking data displayed as a <strong>graph</strong></li><li>Shows position changes over time</li><li>Revenue estimates for each keyword</li><li>Track the monetary impact of your ranking improvements</li></ul>'
     },
     {
         'version': 9, 'date': '2026-02-20', 'tab': 'opportunity',
         'title': 'Low Comp + High Rev Filter',
         'description': 'New filter in $3K Finder to surface low competition, high revenue keywords.',
-        'detail': 'The $3K Finder now has a "Low Comp + High Rev" filter that highlights keywords with low competition but high revenue potential. Use this to quickly find the best opportunities — keywords that are easier to rank for and bring in the most money.'
+        'detail': '<ul><li>New <strong>"Low Comp + High Rev"</strong> filter button</li><li>Highlights keywords with low competition but high revenue potential</li><li>Quickly find the best opportunities</li><li>Keywords that are easier to rank for and bring in the most money</li></ul>'
     },
     {
         'version': 10, 'date': '2026-02-20', 'tab': 'library',
         'title': 'Trend & Season Indicators',
         'description': 'See trend direction and seasonal timing for every keyword in the library.',
-        'detail': 'Each keyword now shows a Trend badge (Rising, Stable, or Declining) based on search interest over time, and a Season status. Season tells you if a keyword is Evergreen (consistent year-round), Seasonal with peak months, or has a "Publish NOW" / "Peak NOW" window — meaning this is the best time to create or push content for it. Click "Fetch" on any keyword to pull fresh trend and seasonality data. Use this to prioritize which content to create next based on timing.'
+        'detail': '<ul><li><strong>Trend badge:</strong> Rising, Stable, or Declining based on search interest</li><li><strong>Season status:</strong> Evergreen, Seasonal, Publish NOW, or Peak NOW</li><li>"Publish NOW" / "Peak NOW" = best time to create or push content</li><li>Click "Fetch" on any keyword to pull fresh data</li><li>Prioritize content creation based on timing</li></ul>'
     },
     {
         'version': 11, 'date': '2026-02-20', 'tab': 'library',
         'title': 'Advanced Filters in Keyword Library',
         'description': 'Stack multiple filters to slice your keyword list by any column.',
-        'detail': 'Click "+ Add Filter" in the Keyword Library to add advanced filters. You can filter by Trend, Season, Seasonality Score, Volume, Revenue, Priority Score, Buying Intent, Niche, Tier, Conversion, Competition, Content Angle, YT Views, YT Pattern, Label, Source, and Votes. Filters support Include or Exclude mode with operators like Equals, Greater Than, Less Than, Between, and Contains. Stack multiple filters together — they combine with AND logic so you can drill down to exactly the keywords you need (e.g. "Rising trend + Volume > 1000 + Evergreen").'
+        'detail': '<ul><li>Click <strong>"+ Add Filter"</strong> to add advanced filters</li><li>Filter by: Trend, Season, Volume, Revenue, Priority Score, Buying Intent, Niche, Tier, Conversion, Competition, Content Angle, YT Views, YT Pattern, Label, Source, Votes</li><li><strong>Include or Exclude</strong> mode with operators: Equals, Greater Than, Less Than, Between, Contains</li><li>Stack multiple filters &mdash; they combine with <strong>AND logic</strong></li><li>Example: "Rising trend + Volume &gt; 1000 + Evergreen"</li></ul>'
     },
 ]
 

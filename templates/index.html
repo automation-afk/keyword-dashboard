@@ -1302,6 +1302,25 @@
             line-height: 1.7;
             margin-bottom: 24px;
         }
+        .wn-modal-detail ul {
+            margin: 0;
+            padding-left: 18px;
+        }
+        .wn-modal-detail li {
+            margin-bottom: 6px;
+        }
+        @keyframes wn-spin { to { transform: rotate(360deg); } }
+        .wn-spinner {
+            display: inline-block;
+            width: 16px;
+            height: 16px;
+            border: 2px solid rgba(100,116,139,0.3);
+            border-top-color: #60a5fa;
+            border-radius: 50%;
+            animation: wn-spin 0.6s linear infinite;
+            vertical-align: middle;
+            margin-right: 6px;
+        }
         .wn-modal-actions {
             display: flex;
             gap: 10px;
@@ -1373,7 +1392,7 @@
                     </button>
                     <div class="whats-new-dropdown" id="whatsNewDropdown">
                         <div class="whats-new-header">What's New</div>
-                        <div id="whatsNewList"></div>
+                        <div id="whatsNewList"><div style="padding:20px;text-align:center;color:#64748b;"><span class="wn-spinner"></span> Loading...</div></div>
                     </div>
                 </div>
                 {% if user %}
@@ -4059,6 +4078,7 @@
                     <td class="trend-cell">${formatTrendBadge(d)}</td>
                     <td class="season-cell">${formatSeasonBadge(d)}</td>
                     <td style="font-size:0.7rem;color:#94a3b8;max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${d.addedByEmail || d.source || 'csv'}">${formatAddedBy(d)}</td>
+                    <td>${(d.source && d.source !== 'csv') ? `<button onclick="deleteFromLibrary('${escapedKw}')" style="background:none;border:none;color:#64748b;cursor:pointer;font-size:1rem;padding:2px 6px;border-radius:4px;transition:all 0.2s;" onmouseover="this.style.color='#f87171';this.style.background='rgba(248,113,113,0.1)'" onmouseout="this.style.color='#64748b';this.style.background='none'" title="Delete from library">&times;</button>` : ''}</td>
                 </tr>
                 `;
             }).join('');
@@ -4112,6 +4132,26 @@
                 applyFilters();
             } catch (error) {
                 console.error('Error toggling favorite:', error);
+            }
+        }
+
+        async function deleteFromLibrary(keyword) {
+            if (!confirm(`Delete "${keyword}" from the library?`)) return;
+            try {
+                const resp = await fetch('/api/library/delete', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ keyword })
+                });
+                const data = await resp.json();
+                if (data.success) {
+                    allData = allData.filter(d => d.keyword !== keyword);
+                    applyFilters();
+                } else {
+                    alert(data.error || 'Failed to delete');
+                }
+            } catch (error) {
+                console.error('Error deleting keyword:', error);
             }
         }
 
@@ -7895,7 +7935,7 @@
             document.getElementById('wnModalTag').textContent = entry.date;
             document.getElementById('wnModalTitle').textContent = entry.title;
             document.getElementById('wnModalDate').textContent = entry.description;
-            document.getElementById('wnModalDetail').textContent = entry.detail || entry.description;
+            document.getElementById('wnModalDetail').innerHTML = entry.detail || entry.description;
             const gotoBtn = document.getElementById('wnModalGoto');
             if (entry.tab) {
                 wnModalTab = entry.tab;
