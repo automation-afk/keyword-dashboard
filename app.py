@@ -875,6 +875,16 @@ def init_db():
         )
     ''')
 
+    # Per-item read tracking (replaces sequential last_seen_version)
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS user_changelog_read (
+            email TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            read_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (email, version)
+        )
+    ''')
+
     conn.commit()
     release_db(conn)
 
@@ -2575,11 +2585,10 @@ def index():
         email = user['email'] if user else 'anonymous'
         conn = get_db()
         c = conn.cursor()
-        c.execute('SELECT last_seen_version FROM user_changelog_seen WHERE email = %s', (email,))
-        row = c.fetchone()
+        c.execute('SELECT version FROM user_changelog_read WHERE email = %s', (email,))
+        read_versions = set(r[0] for r in c.fetchall())
         release_db(conn)
-        last_seen = row[0] if row else 0
-        changelog_unread = sum(1 for item in CHANGELOG if item['version'] > last_seen)
+        changelog_unread = sum(1 for item in CHANGELOG if item['version'] not in read_versions)
     except Exception:
         pass
     return render_template('index.html', user=user, changelog_unread=changelog_unread)
@@ -6218,46 +6227,44 @@ def get_changelog():
 
         conn = get_db()
         c = conn.cursor()
-        c.execute('SELECT last_seen_version FROM user_changelog_seen WHERE email = %s', (email,))
-        row = c.fetchone()
+        c.execute('SELECT version FROM user_changelog_read WHERE email = %s', (email,))
+        read_versions = [r[0] for r in c.fetchall()]
         release_db(conn)
 
-        last_seen = row[0] if row else 0
-        unread_count = sum(1 for item in CHANGELOG if item['version'] > last_seen)
+        unread_count = sum(1 for item in CHANGELOG if item['version'] not in read_versions)
 
         return jsonify({
             'success': True,
             'entries': CHANGELOG,
-            'last_seen_version': last_seen,
+            'read_versions': read_versions,
             'current_version': CHANGELOG_CURRENT_VERSION,
             'unread_count': unread_count
         })
     except Exception as e:
         print(f"[CHANGELOG] Error: {e}")
         unread_count = len(CHANGELOG)
-        return jsonify({'success': True, 'entries': CHANGELOG, 'unread_count': unread_count, 'last_seen_version': 0, 'current_version': CHANGELOG_CURRENT_VERSION, 'db_unavailable': True})
+        return jsonify({'success': True, 'entries': CHANGELOG, 'unread_count': unread_count, 'read_versions': [], 'current_version': CHANGELOG_CURRENT_VERSION, 'db_unavailable': True})
 
 
 @app.route('/api/changelog/mark-read', methods=['POST'])
 @login_required
 def mark_changelog_read():
-    """Mark changelog entries as read up to a version for current user."""
+    """Mark a single changelog version as read for current user."""
     try:
         user = get_current_user()
         email = user['email'] if user else 'anonymous'
 
         data = request.get_json(silent=True) or {}
-        version = data.get('version', CHANGELOG_CURRENT_VERSION)
+        version = data.get('version')
+        if not version:
+            return jsonify({'success': False, 'error': 'version required'}), 400
 
         conn = get_db()
         c = conn.cursor()
-        # Only update if the new version is higher than what's stored
         c.execute('''
-            INSERT INTO user_changelog_seen (email, last_seen_version, updated_at)
+            INSERT INTO user_changelog_read (email, version, read_at)
             VALUES (%s, %s, CURRENT_TIMESTAMP)
-            ON CONFLICT (email) DO UPDATE SET
-                last_seen_version = GREATEST(user_changelog_seen.last_seen_version, EXCLUDED.last_seen_version),
-                updated_at = CURRENT_TIMESTAMP
+            ON CONFLICT (email, version) DO NOTHING
         ''', (email, version))
         conn.commit()
         release_db(conn)

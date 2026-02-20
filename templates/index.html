@@ -7843,9 +7843,9 @@
                 if (data.success) {
                     // If DB is unavailable, use localStorage fallback
                     if (data.db_unavailable) {
-                        const localSeen = parseInt(localStorage.getItem('changelog_last_seen') || '0');
-                        data.last_seen_version = localSeen;
-                        data.unread_count = data.entries.filter(e => e.version > localSeen).length;
+                        const localRead = JSON.parse(localStorage.getItem('changelog_read_versions') || '[]');
+                        data.read_versions = localRead;
+                        data.unread_count = data.entries.filter(e => !localRead.includes(e.version)).length;
                     }
                     whatsNewData = data;
                     renderWhatsNew(data);
@@ -7865,9 +7865,10 @@
 
         function renderWhatsNew(data) {
             const list = document.getElementById('whatsNewList');
+            const readSet = new Set(data.read_versions || []);
             const entries = [...data.entries].sort((a, b) => b.version - a.version);
             list.innerHTML = entries.map((e, i) => {
-                const isUnread = e.version > data.last_seen_version;
+                const isUnread = !readSet.has(e.version);
                 return `
                 <div class="whats-new-item ${isUnread ? 'unread' : ''}" style="cursor:pointer" onclick="openWnModal(${e.version})">
                     <div class="wn-title">${e.title} ${isUnread ? '<span class="wn-new-tag">NEW</span>' : ''}</div>
@@ -7909,15 +7910,17 @@
 
         function closeWnModal() {
             document.getElementById('wnModalOverlay').classList.remove('open');
-            // Mark as read up to the highest version the user has opened
+            // Mark only THIS version as read
             if (wnModalVersion && whatsNewData) {
-                const currentSeen = whatsNewData.last_seen_version || 0;
-                if (wnModalVersion > currentSeen) {
-                    whatsNewData.last_seen_version = wnModalVersion;
-                    localStorage.setItem('changelog_last_seen', String(wnModalVersion));
+                const readSet = new Set(whatsNewData.read_versions || []);
+                if (!readSet.has(wnModalVersion)) {
+                    readSet.add(wnModalVersion);
+                    whatsNewData.read_versions = [...readSet];
+                    localStorage.setItem('changelog_read_versions', JSON.stringify(whatsNewData.read_versions));
                     fetch('/api/changelog/mark-read', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({version: wnModalVersion}) });
                     // Update badge count
-                    const remaining = whatsNewData.entries.filter(e => e.version > wnModalVersion).length;
+                    const remaining = whatsNewData.entries.filter(e => !readSet.has(e.version)).length;
+                    whatsNewData.unread_count = remaining;
                     const badge = document.getElementById('whatsNewBadge');
                     if (remaining > 0) {
                         badge.textContent = remaining;
@@ -7925,7 +7928,7 @@
                     } else {
                         badge.style.display = 'none';
                     }
-                    // Re-render to update unread styling
+                    // Re-render to update only this item's styling
                     renderWhatsNew(whatsNewData);
                 }
             }
