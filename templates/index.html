@@ -1157,6 +1157,175 @@
         .cg-rank-badge.top10 { background: rgba(251,191,36,0.15); color: #fbbf24; }
         .cg-rank-badge.none { background: rgba(248,113,113,0.1); color: #f87171; }
 
+        /* What's New Bell */
+        .whats-new-btn {
+            position: relative;
+            background: none;
+            border: none;
+            cursor: pointer;
+            font-size: 1.2rem;
+            padding: 4px 8px;
+            color: #94a3b8;
+            transition: color 0.2s;
+        }
+        .whats-new-btn:hover { color: #e2e8f0; }
+        .whats-new-badge {
+            position: absolute;
+            top: -2px;
+            right: 0;
+            background: #ef4444;
+            color: #fff;
+            font-size: 0.6rem;
+            font-weight: 700;
+            min-width: 16px;
+            height: 16px;
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            line-height: 1;
+        }
+        .whats-new-dropdown {
+            display: none;
+            position: absolute;
+            top: 100%;
+            right: 0;
+            margin-top: 8px;
+            width: 340px;
+            max-height: 400px;
+            overflow-y: auto;
+            background: #1e293b;
+            border: 1px solid rgba(71,85,105,0.6);
+            border-radius: 12px;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+            z-index: 1000;
+            padding: 0;
+        }
+        .whats-new-dropdown.open { display: block; }
+        .whats-new-header {
+            padding: 12px 16px;
+            border-bottom: 1px solid rgba(71,85,105,0.4);
+            font-weight: 600;
+            font-size: 0.85rem;
+            color: #e2e8f0;
+        }
+        .whats-new-item {
+            padding: 12px 16px;
+            border-bottom: 1px solid rgba(71,85,105,0.2);
+            transition: background 0.15s;
+            opacity: 0.55;
+        }
+        .whats-new-item:last-child { border-bottom: none; }
+        .whats-new-item:hover { background: rgba(71,85,105,0.15); }
+        .whats-new-item.unread {
+            border-left: 3px solid #60a5fa;
+            background: rgba(96,165,250,0.06);
+            opacity: 1;
+        }
+        .whats-new-item .wn-title {
+            font-size: 0.8rem;
+            font-weight: 600;
+            color: #e2e8f0;
+            margin-bottom: 2px;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .wn-new-tag {
+            display: inline-block;
+            font-size: 0.55rem;
+            font-weight: 700;
+            padding: 1px 5px;
+            border-radius: 3px;
+            background: #ef4444;
+            color: #fff;
+            letter-spacing: 0.5px;
+            text-transform: uppercase;
+        }
+        .whats-new-item .wn-desc {
+            font-size: 0.72rem;
+            color: #94a3b8;
+            line-height: 1.4;
+        }
+        .whats-new-item .wn-date {
+            font-size: 0.65rem;
+            color: #64748b;
+            margin-top: 4px;
+        }
+
+        /* What's New Modal */
+        .wn-modal-overlay {
+            display: none;
+            position: fixed;
+            inset: 0;
+            background: rgba(0,0,0,0.6);
+            z-index: 2000;
+            align-items: center;
+            justify-content: center;
+        }
+        .wn-modal-overlay.open { display: flex; }
+        .wn-modal {
+            background: #1e293b;
+            border: 1px solid rgba(71,85,105,0.6);
+            border-radius: 16px;
+            box-shadow: 0 12px 48px rgba(0,0,0,0.5);
+            width: 480px;
+            max-width: 90vw;
+            max-height: 80vh;
+            overflow-y: auto;
+            padding: 28px;
+        }
+        .wn-modal-tag {
+            display: inline-block;
+            font-size: 0.65rem;
+            font-weight: 600;
+            padding: 3px 8px;
+            border-radius: 4px;
+            background: rgba(96,165,250,0.15);
+            color: #60a5fa;
+            margin-bottom: 8px;
+        }
+        .wn-modal-title {
+            font-size: 1.2rem;
+            font-weight: 700;
+            color: #f1f5f9;
+            margin-bottom: 6px;
+        }
+        .wn-modal-date {
+            font-size: 0.75rem;
+            color: #64748b;
+            margin-bottom: 16px;
+        }
+        .wn-modal-detail {
+            font-size: 0.85rem;
+            color: #cbd5e1;
+            line-height: 1.7;
+            margin-bottom: 24px;
+        }
+        .wn-modal-actions {
+            display: flex;
+            gap: 10px;
+            justify-content: flex-end;
+        }
+        .wn-modal-actions button {
+            padding: 8px 18px;
+            border-radius: 8px;
+            font-size: 0.8rem;
+            font-weight: 600;
+            cursor: pointer;
+            border: none;
+        }
+        .wn-modal-close {
+            background: rgba(71,85,105,0.3);
+            color: #94a3b8;
+        }
+        .wn-modal-close:hover { background: rgba(71,85,105,0.5); }
+        .wn-modal-goto {
+            background: linear-gradient(135deg, #3b82f6, #6366f1);
+            color: #fff;
+        }
+        .wn-modal-goto:hover { opacity: 0.9; }
+
         /* Responsive */
         @media (max-width: 768px) {
             header h1 { font-size: 1.8rem; }
@@ -1167,14 +1336,28 @@
     </style>
 </head>
 <body>
+    <!-- What's New Detail Modal -->
+    <div class="wn-modal-overlay" id="wnModalOverlay" onclick="if(event.target===this)closeWnModal()">
+        <div class="wn-modal">
+            <div class="wn-modal-tag" id="wnModalTag"></div>
+            <div class="wn-modal-title" id="wnModalTitle"></div>
+            <div class="wn-modal-date" id="wnModalDate"></div>
+            <div class="wn-modal-detail" id="wnModalDetail"></div>
+            <div class="wn-modal-actions">
+                <button class="wn-modal-close" onclick="closeWnModal()">Close</button>
+                <button class="wn-modal-goto" id="wnModalGoto" onclick="wnModalGoToTab()">Go to tab</button>
+            </div>
+        </div>
+    </div>
+
     <div class="container">
         <header style="position:relative;">
             <h1>🔬 Keyword Research Command Center</h1>
             <p>Research, analyze, and prioritize affiliate keywords with real data</p>
 
-            <!-- User Info (when logged in) -->
-            {% if user %}
+            <!-- Top-right controls -->
             <div style="position:absolute;top:0;right:0;display:flex;align-items:center;gap:12px;background:rgba(30,41,59,0.8);padding:8px 16px;border-radius:12px;border:1px solid rgba(71,85,105,0.5);">
+                {% if user %}
                 {% if user.picture %}
                 <img src="{{ user.picture }}" alt="Profile" style="width:32px;height:32px;border-radius:50%;">
                 {% endif %}
@@ -1182,9 +1365,21 @@
                     <div style="font-size:0.85rem;color:#e2e8f0;">{{ user.name or user.email }}</div>
                     <div style="font-size:0.7rem;color:#64748b;">{{ user.email }}</div>
                 </div>
+                {% endif %}
+                <div style="position:relative;">
+                    <button class="whats-new-btn" id="whatsNewBtn" onclick="toggleWhatsNew()" title="What's New">
+                        &#x1F514;
+                        <span class="whats-new-badge" id="whatsNewBadge" style="display:{% if changelog_unread and changelog_unread > 0 %}flex{% else %}none{% endif %};">{{ changelog_unread or 0 }}</span>
+                    </button>
+                    <div class="whats-new-dropdown" id="whatsNewDropdown">
+                        <div class="whats-new-header">What's New</div>
+                        <div id="whatsNewList"></div>
+                    </div>
+                </div>
+                {% if user %}
                 <a href="/logout" style="background:rgba(239,68,68,0.2);color:#f87171;padding:6px 12px;border-radius:6px;text-decoration:none;font-size:0.75rem;border:1px solid rgba(239,68,68,0.3);">Logout</a>
+                {% endif %}
             </div>
-            {% endif %}
         </header>
 
         <!-- Tabs -->
@@ -7636,6 +7831,134 @@
         // Auto-load domination data on page load
         loadDominationData();
         checkDataFreshness();
+
+        // --- What's New Changelog ---
+        let whatsNewOpen = false;
+        let whatsNewData = null;
+
+        async function loadWhatsNew() {
+            try {
+                const resp = await fetch('/api/changelog');
+                const data = await resp.json();
+                if (data.success) {
+                    // If DB is unavailable, use localStorage fallback
+                    if (data.db_unavailable) {
+                        const localSeen = parseInt(localStorage.getItem('changelog_last_seen') || '0');
+                        data.last_seen_version = localSeen;
+                        data.unread_count = data.entries.filter(e => e.version > localSeen).length;
+                    }
+                    whatsNewData = data;
+                    renderWhatsNew(data);
+                    const badge = document.getElementById('whatsNewBadge');
+                    if (data.unread_count > 0) {
+                        badge.textContent = data.unread_count;
+                        badge.style.display = 'flex';
+                    } else {
+                        badge.style.display = 'none';
+                    }
+                }
+            } catch(e) { console.error('Changelog load error:', e); }
+        }
+
+        const tabLabels = {smart:'Smart Picks',research:'Research',library:'Keyword Library',domination:'Domination Score',planner:'Content Planner',analytics:'Analytics',opportunity:'$3K Finder',universe:'Universe Map',contentgap:'Content Gap'};
+        let wnModalTab = null;
+
+        function renderWhatsNew(data) {
+            const list = document.getElementById('whatsNewList');
+            const entries = [...data.entries].sort((a, b) => b.version - a.version);
+            list.innerHTML = entries.map((e, i) => {
+                const isUnread = e.version > data.last_seen_version;
+                return `
+                <div class="whats-new-item ${isUnread ? 'unread' : ''}" style="cursor:pointer" onclick="openWnModal(${e.version})">
+                    <div class="wn-title">${e.title} ${isUnread ? '<span class="wn-new-tag">NEW</span>' : ''}</div>
+                    <div class="wn-desc">${e.description}</div>
+                    <div style="display:flex;justify-content:space-between;align-items:center;margin-top:4px;">
+                        <span class="wn-date">${e.date}</span>
+                        ${e.tab ? `<span style="font-size:0.65rem;color:#60a5fa;font-weight:500;">${tabLabels[e.tab] || e.tab} &rarr;</span>` : ''}
+                    </div>
+                </div>`;
+            }).join('');
+        }
+
+        let wnModalVersion = null;
+
+        function openWnModal(version) {
+            if (!whatsNewData) return;
+            const entry = whatsNewData.entries.find(e => e.version === version);
+            if (!entry) return;
+            wnModalVersion = version;
+            // Close dropdown
+            whatsNewOpen = false;
+            document.getElementById('whatsNewDropdown').classList.remove('open');
+            // Fill modal
+            document.getElementById('wnModalTag').textContent = entry.date;
+            document.getElementById('wnModalTitle').textContent = entry.title;
+            document.getElementById('wnModalDate').textContent = entry.description;
+            document.getElementById('wnModalDetail').textContent = entry.detail || entry.description;
+            const gotoBtn = document.getElementById('wnModalGoto');
+            if (entry.tab) {
+                wnModalTab = entry.tab;
+                gotoBtn.textContent = 'Go to ' + (tabLabels[entry.tab] || entry.tab);
+                gotoBtn.style.display = '';
+            } else {
+                wnModalTab = null;
+                gotoBtn.style.display = 'none';
+            }
+            document.getElementById('wnModalOverlay').classList.add('open');
+        }
+
+        function closeWnModal() {
+            document.getElementById('wnModalOverlay').classList.remove('open');
+            // Mark as read up to the highest version the user has opened
+            if (wnModalVersion && whatsNewData) {
+                const currentSeen = whatsNewData.last_seen_version || 0;
+                if (wnModalVersion > currentSeen) {
+                    whatsNewData.last_seen_version = wnModalVersion;
+                    localStorage.setItem('changelog_last_seen', String(wnModalVersion));
+                    fetch('/api/changelog/mark-read', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({version: wnModalVersion}) });
+                    // Update badge count
+                    const remaining = whatsNewData.entries.filter(e => e.version > wnModalVersion).length;
+                    const badge = document.getElementById('whatsNewBadge');
+                    if (remaining > 0) {
+                        badge.textContent = remaining;
+                        badge.style.display = 'flex';
+                    } else {
+                        badge.style.display = 'none';
+                    }
+                    // Re-render to update unread styling
+                    renderWhatsNew(whatsNewData);
+                }
+            }
+        }
+
+        function wnModalGoToTab() {
+            closeWnModal();
+            if (wnModalTab) {
+                const tabBtn = document.querySelector(`.tab[data-tab="${wnModalTab}"]`);
+                if (tabBtn) tabBtn.click();
+            }
+        }
+
+        function toggleWhatsNew() {
+            const dropdown = document.getElementById('whatsNewDropdown');
+            whatsNewOpen = !whatsNewOpen;
+            dropdown.classList.toggle('open', whatsNewOpen);
+
+            if (whatsNewOpen && !whatsNewData) {
+                loadWhatsNew();
+            }
+        }
+
+        // Close dropdown when clicking outside
+        document.addEventListener('click', function(e) {
+            if (whatsNewOpen && !e.target.closest('#whatsNewBtn') && !e.target.closest('#whatsNewDropdown')) {
+                whatsNewOpen = false;
+                document.getElementById('whatsNewDropdown').classList.remove('open');
+            }
+        });
+
+        // Load changelog data on page load
+        loadWhatsNew();
     </script>
 
 <!-- ============================================ -->

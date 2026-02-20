@@ -867,6 +867,14 @@ def init_db():
         )
     ''')
 
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS user_changelog_seen (
+            email TEXT PRIMARY KEY,
+            last_seen_version INTEGER DEFAULT 0,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+
     conn.commit()
     release_db(conn)
 
@@ -2562,7 +2570,19 @@ def estimate_revenue_potential(keyword_data, yt_data, niche='general', keyword='
 @login_required
 def index():
     user = get_current_user()
-    return render_template('index.html', user=user)
+    changelog_unread = 0
+    try:
+        email = user['email'] if user else 'anonymous'
+        conn = get_db()
+        c = conn.cursor()
+        c.execute('SELECT last_seen_version FROM user_changelog_seen WHERE email = %s', (email,))
+        row = c.fetchone()
+        release_db(conn)
+        last_seen = row[0] if row else 0
+        changelog_unread = sum(1 for item in CHANGELOG if item['version'] > last_seen)
+    except Exception:
+        pass
+    return render_template('index.html', user=user, changelog_unread=changelog_unread)
 
 @app.route('/api/keywords/refresh', methods=['POST'])
 @login_required
@@ -6113,6 +6133,121 @@ def manual_sheets_sync():
     """Manually trigger a full Google Sheets sync."""
     sync_priority_keywords(get_db, release_db)
     return jsonify({'success': True, 'message': 'Sheets sync triggered'})
+
+
+# --- What's New Changelog ---
+CHANGELOG = [
+    {
+        'version': 1, 'date': '2026-02-18', 'tab': 'domination',
+        'title': 'Google Sheets Auto-Sync',
+        'description': 'Priority keywords and rank domination data now auto-push to Google Sheets on every change.',
+        'detail': 'Every time you add, delete, toggle, or update keyword roles, the full priority keywords list is automatically synced to the "kwResearchToolapp" tab in Google Sheets. Rank domination data syncs when you load the Domination Score page. No manual export needed — your spreadsheet stays up to date in real time.'
+    },
+    {
+        'version': 2, 'date': '2026-02-18', 'tab': 'library',
+        'title': 'Delete Research Keywords',
+        'description': 'You can now delete keywords added from research in the Keyword Library.',
+        'detail': 'Previously, only custom-added keywords had a delete button. Now keywords with source "research" also show the red X delete button in the Keyword Library. Filter by "NEW" to see recently researched keywords and remove any you don\'t need.'
+    },
+    {
+        'version': 3, 'date': '2026-02-20', 'tab': 'contentgap',
+        'title': 'Content Gap Ownership Check',
+        'description': 'Content gap analysis now checks all-time scan data for ownership.',
+        'detail': 'The content gap analysis previously only checked the most recent competitor scan. It now looks across all historical scan data to determine if you already own a keyword position, giving more accurate gap identification and reducing false positives.'
+    },
+    {
+        'version': 4, 'date': '2026-02-20', 'tab': 'contentgap',
+        'title': 'Daily Competitor Scans',
+        'description': 'Competitor discovery scans now run daily instead of weekly.',
+        'detail': 'Competitor channel keyword scans have been upgraded from weekly (Monday only) to daily. This means fresher competitor data, faster discovery of new competitor keywords, and more up-to-date content gap analysis.'
+    },
+    {
+        'version': 5, 'date': '2026-02-20', 'tab': 'contentgap',
+        'title': 'YouTube Competitor Discovery',
+        'description': 'New YouTube Search method added to competitor discovery alongside BQ-based discovery.',
+        'detail': 'A second competitor discovery method is now available: YouTube Search API. This runs alongside the existing BigQuery-based discovery to find competitors that may not appear in BQ data. Discovered competitors are automatically added to the scan rotation for keyword extraction.'
+    },
+    {
+        'version': 6, 'date': '2026-02-19', 'tab': 'library',
+        'title': 'Add to Library + Delete',
+        'description': 'Add keywords to the library from research — they show as NEW and can be deleted.',
+        'detail': 'When you research keywords, you can now add them directly to the Keyword Library. Added keywords appear with a "NEW" badge so you can easily spot them. You can also delete any research-sourced keyword from the library using the X button if you no longer need it.'
+    },
+    {
+        'version': 7, 'date': '2026-02-13', 'tab': 'domination',
+        'title': 'Rank Domination Keyword Manager',
+        'description': 'Manage and prioritize your keywords directly from the Rank Domination dashboard.',
+        'detail': 'The Rank Domination tab now includes a keyword manager that lets you organize, activate, deactivate, and set roles (primary/secondary) for your priority keywords. Manage your entire keyword strategy from one place without switching tabs.'
+    },
+    {
+        'version': 8, 'date': '2026-02-13', 'tab': 'domination',
+        'title': 'Historical Graph & Revenue',
+        'description': 'View ranking history graphs and revenue data for your priority keywords.',
+        'detail': 'Each priority keyword now has historical ranking data displayed as a graph, showing position changes over time. Revenue estimates are also available, helping you track the monetary impact of your ranking improvements and prioritize high-value keywords.'
+    },
+]
+
+CHANGELOG_CURRENT_VERSION = max(item['version'] for item in CHANGELOG)
+
+
+@app.route('/api/changelog', methods=['GET'])
+@login_required
+def get_changelog():
+    """Get changelog entries and unread count for current user."""
+    try:
+        user = get_current_user()
+        email = user['email'] if user else 'anonymous'
+
+        conn = get_db()
+        c = conn.cursor()
+        c.execute('SELECT last_seen_version FROM user_changelog_seen WHERE email = %s', (email,))
+        row = c.fetchone()
+        release_db(conn)
+
+        last_seen = row[0] if row else 0
+        unread_count = sum(1 for item in CHANGELOG if item['version'] > last_seen)
+
+        return jsonify({
+            'success': True,
+            'entries': CHANGELOG,
+            'last_seen_version': last_seen,
+            'current_version': CHANGELOG_CURRENT_VERSION,
+            'unread_count': unread_count
+        })
+    except Exception as e:
+        print(f"[CHANGELOG] Error: {e}")
+        unread_count = len(CHANGELOG)
+        return jsonify({'success': True, 'entries': CHANGELOG, 'unread_count': unread_count, 'last_seen_version': 0, 'current_version': CHANGELOG_CURRENT_VERSION, 'db_unavailable': True})
+
+
+@app.route('/api/changelog/mark-read', methods=['POST'])
+@login_required
+def mark_changelog_read():
+    """Mark changelog entries as read up to a version for current user."""
+    try:
+        user = get_current_user()
+        email = user['email'] if user else 'anonymous'
+
+        data = request.get_json(silent=True) or {}
+        version = data.get('version', CHANGELOG_CURRENT_VERSION)
+
+        conn = get_db()
+        c = conn.cursor()
+        # Only update if the new version is higher than what's stored
+        c.execute('''
+            INSERT INTO user_changelog_seen (email, last_seen_version, updated_at)
+            VALUES (%s, %s, CURRENT_TIMESTAMP)
+            ON CONFLICT (email) DO UPDATE SET
+                last_seen_version = GREATEST(user_changelog_seen.last_seen_version, EXCLUDED.last_seen_version),
+                updated_at = CURRENT_TIMESTAMP
+        ''', (email, version))
+        conn.commit()
+        release_db(conn)
+
+        return jsonify({'success': True})
+    except Exception as e:
+        print(f"[CHANGELOG] Error marking read: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 
 @app.route('/api/keywords/priority', methods=['GET'])
