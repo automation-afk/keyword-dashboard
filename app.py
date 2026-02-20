@@ -6107,6 +6107,14 @@ def get_available_keywords():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
+@app.route('/api/sheets/sync', methods=['POST'])
+@login_required
+def manual_sheets_sync():
+    """Manually trigger a full Google Sheets sync."""
+    sync_priority_keywords(get_db, release_db)
+    return jsonify({'success': True, 'message': 'Sheets sync triggered'})
+
+
 @app.route('/api/keywords/priority', methods=['GET'])
 @login_required
 def get_priority_keywords():
