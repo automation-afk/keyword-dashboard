@@ -7699,15 +7699,13 @@ def run_startup_collection():
 
 
 def run_daily_collection_job():
-    """Daily job: domination audit + Monday competitor scan."""
+    """Daily job: domination audit + competitor scan."""
     print("[DAILY] Running domination audit...")
     run_domination_audit_job()
 
-    # Monday: also run competitor channel scan
-    from datetime import date
-    if date.today().weekday() == 0:
-        print("[DAILY] Monday detected — running competitor channel scan...")
-        run_competitor_channel_scan(force=False)
+    # Daily competitor channel scan (append-only, skips if already done today)
+    print("[DAILY] Running competitor channel scan...")
+    run_competitor_channel_scan(force=False)
 
 
 # Start scheduler - run every 6 hours to survive Railway restarts
@@ -7720,7 +7718,7 @@ scheduler.add_job(
     replace_existing=True
 )
 scheduler.start()
-print("[SCHEDULER] Collection job scheduled every 6 hours (includes Monday competitor scan)")
+print("[SCHEDULER] Collection job scheduled every 6 hours (includes daily competitor scan)")
 
 # Run startup collection in background thread
 import threading
@@ -10242,7 +10240,7 @@ def merge_competitor_lists(bq_competitors, yt_competitors):
 
 
 def run_competitor_channel_scan(force=False):
-    """Weekly scan: discover top 30 competitors from BQ, scrape their channels, extract keywords."""
+    """Daily scan: discover top 30 competitors from BQ + YouTube Search, scrape their channels, extract keywords. Append-only — existing data is preserved, only new/updated keywords are upserted."""
     global _competitor_scan_running, _competitor_scan_progress
     import time as _time
     from datetime import date
@@ -10251,13 +10249,8 @@ def run_competitor_channel_scan(force=False):
         print("[COMP-SCAN] Scan already running, skipping")
         return
 
-    # Monday check (unless forced)
+    # Check if already scanned today (skip if done, unless forced)
     today = date.today()
-    if not force and today.weekday() != 0:
-        print(f"[COMP-SCAN] Not Monday (day={today.weekday()}), skipping")
-        return
-
-    # Check if already scanned today
     try:
         conn = get_db()
         c = conn.cursor()
@@ -10455,7 +10448,7 @@ def run_competitor_channel_scan(force=False):
 
 @app.route('/api/cron/competitor-scan')
 def cron_competitor_scan():
-    """Trigger weekly competitor channel scan. Monday-only unless force=true.
+    """Trigger daily competitor channel scan. Skips if already done today unless force=true.
     Call: GET /api/cron/competitor-scan?secret=CRON_SECRET&force=true"""
     import threading
 
@@ -10579,8 +10572,8 @@ The app has these tabs and features:
 8. **Universe Map** - See all possible keywords in your niches and find gaps.
    - Click "Map the Universe" to see coverage per niche
 
-9. **Content Gap** - Weekly scan of competitor YouTube channels to find keyword gaps.
-   - Scans top 30 competitors every Monday (or click "Run Scan Now" manually)
+9. **Content Gap** - Daily scan of competitor YouTube channels to find keyword gaps.
+   - Scans top 30+ competitors daily (or click "Run Scan Now" manually)
    - Extracts keywords from competitor video titles and compares against your library + SERP rankings
    - Views: Gaps (they target, you don't), Not Ranking (in library but not ranking), Overlap (both rank), Winning (you rank, they don't)
 
