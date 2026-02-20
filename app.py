@@ -6191,6 +6191,18 @@ CHANGELOG = [
         'description': 'New filter in $3K Finder to surface low competition, high revenue keywords.',
         'detail': 'The $3K Finder now has a "Low Comp + High Rev" filter that highlights keywords with low competition but high revenue potential. Use this to quickly find the best opportunities — keywords that are easier to rank for and bring in the most money.'
     },
+    {
+        'version': 10, 'date': '2026-02-20', 'tab': 'library',
+        'title': 'Trend & Season Indicators',
+        'description': 'See trend direction and seasonal timing for every keyword in the library.',
+        'detail': 'Each keyword now shows a Trend badge (Rising, Stable, or Declining) based on search interest over time, and a Season status. Season tells you if a keyword is Evergreen (consistent year-round), Seasonal with peak months, or has a "Publish NOW" / "Peak NOW" window — meaning this is the best time to create or push content for it. Click "Fetch" on any keyword to pull fresh trend and seasonality data. Use this to prioritize which content to create next based on timing.'
+    },
+    {
+        'version': 11, 'date': '2026-02-20', 'tab': 'library',
+        'title': 'Advanced Filters in Keyword Library',
+        'description': 'Stack multiple filters to slice your keyword list by any column.',
+        'detail': 'Click "+ Add Filter" in the Keyword Library to add advanced filters. You can filter by Trend, Season, Seasonality Score, Volume, Revenue, Priority Score, Buying Intent, Niche, Tier, Conversion, Competition, Content Angle, YT Views, YT Pattern, Label, Source, and Votes. Filters support Include or Exclude mode with operators like Equals, Greater Than, Less Than, Between, and Contains. Stack multiple filters together — they combine with AND logic so you can drill down to exactly the keywords you need (e.g. "Rising trend + Volume > 1000 + Evergreen").'
+    },
 ]
 
 CHANGELOG_CURRENT_VERSION = max(item['version'] for item in CHANGELOG)
