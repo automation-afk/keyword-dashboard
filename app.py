@@ -6364,6 +6364,12 @@ CHANGELOG = [
         'description': 'Research results now show the recommended brand/product to promote for each keyword.',
         'detail': '<ul><li>Same Ideal Brand logic from the Keyword Library now appears in Research cards</li><li>See the best CTA brand <strong>before</strong> adding a keyword to your library</li><li>Brand suggestions are niche-aware (e.g. Qustodio for parental control, NordVPN for VPN)</li><li>Helps you pick the right affiliate offer from the start</li></ul>'
     },
+    {
+        'version': 14, 'date': '2026-02-21', 'tab': 'smart',
+        'title': 'Early Trend Alerts',
+        'description': 'Get alerted to keywords rising in search interest before they peak — so you can publish first.',
+        'detail': '<ul><li><strong>🌱 Early Rise</strong> &mdash; interest is growing but still low, first-mover advantage</li><li><strong>🔥 Peak Soon</strong> &mdash; rising keyword approaching peak months, publish NOW to rank in time</li><li><strong>📝 Publish Now</strong> &mdash; you\'re inside the optimal publish window for this keyword</li><li><strong>🚀 Momentum</strong> &mdash; strong year-over-year growth, ride the wave</li><li>Shows trend %, current interest, revenue, and ideal brand for each alert</li><li>Found on the Smart Picks tab &mdash; click "Check Trends"</li></ul>'
+    },
 ]
 
 CHANGELOG_CURRENT_VERSION = max(item['version'] for item in CHANGELOG)
@@ -9314,6 +9320,118 @@ def smart_picks():
         'picks': picks,
         'nicheSummary': niche_summary,
         'total': len(picks)
+    })
+
+
+@app.route('/api/early-trends')
+@login_required
+@cache_response('early_trends', ttl_seconds=600)
+def early_trend_alerts():
+    """
+    Surface keywords that are rising but haven't peaked yet.
+    Identifies timing opportunities: keywords to create content for NOW
+    before they hit peak interest.
+    """
+    month_names = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+    current_month = month_names[datetime.now().month - 1]
+    current_month_idx = datetime.now().month - 1
+
+    # Use in-memory TRENDS_CACHE + KEYWORDS
+    trends = TRENDS_CACHE
+    alerts = []
+
+    for k in KEYWORDS:
+        keyword = k['keyword']
+        keyword_lower = keyword.lower()
+        niche = k.get('niche', 'general')
+        trend_data = trends.get(keyword_lower, {})
+
+        trend_dir = trend_data.get('trend', 'unknown')
+        trend_change = trend_data.get('trendChange', 0)
+        interest = trend_data.get('trendInterest', 0)
+        peak_months_str = trend_data.get('peakMonths') or ''
+        publish_window = trend_data.get('publishWindow') or ''
+        seasonality = trend_data.get('seasonalityScore', 0)
+
+        # Skip keywords with no trend data or already declining
+        if trend_dir in ('unknown', 'declining'):
+            continue
+
+        # Determine alert type and urgency
+        alert_type = None
+        urgency = 0  # higher = more urgent
+        reason = ''
+
+        # 1) Rising + low current interest = early mover opportunity
+        if trend_dir == 'rising' and 0 < interest < 70:
+            alert_type = 'early_rise'
+            urgency = 80 + trend_change * 0.3  # More momentum = more urgent
+            reason = f'Rising +{trend_change:.0f}% YoY, current interest only {interest}/100 — hasn\'t peaked yet'
+
+        # 2) Rising + approaching peak months = create content NOW
+        elif trend_dir == 'rising' and peak_months_str:
+            peak_months = peak_months_str.split(',')
+            peak_indices = [month_names.index(m.strip()) for m in peak_months if m.strip() in month_names]
+            months_until_peak = min(((pi - current_month_idx) % 12) for pi in peak_indices) if peak_indices else 99
+
+            if 1 <= months_until_peak <= 3:
+                alert_type = 'approaching_peak'
+                urgency = 90 + (3 - months_until_peak) * 10  # Closer = more urgent
+                peak_month_name = month_names[(current_month_idx + months_until_peak) % 12]
+                reason = f'Peak in {months_until_peak}mo ({peak_month_name}) — rising +{trend_change:.0f}% YoY, publish NOW to rank in time'
+
+        # 3) In publish window RIGHT NOW
+        if publish_window and not alert_type:
+            window_months = [m.strip() for m in publish_window.split('-')]
+            if current_month in window_months:
+                alert_type = 'publish_window'
+                urgency = 85
+                reason = f'Inside publish window ({publish_window}) — content published now will rank before peak season'
+
+        # 4) Rising strongly even without seasonal data
+        if not alert_type and trend_dir == 'rising' and trend_change >= 40:
+            alert_type = 'momentum'
+            urgency = 70 + trend_change * 0.2
+            reason = f'Strong momentum +{trend_change:.0f}% YoY — growing fast'
+
+        if not alert_type:
+            continue
+
+        # Calculate revenue for context
+        keyword_type = classify_keyword_type(keyword)
+        willingness = estimate_willingness_to_spend(keyword, keyword_type, niche)
+        epv_by_type = {'deal': 1.18, 'comparison': 0.53, 'review': 0.31, 'best_of': 0.16, 'informational': 0.31, 'other': 0.17}
+        niche_mult = {'vpn': 1.5, 'identity_theft': 1.4, 'data_broker_removal': 1.3, 'antivirus': 1.2, 'web_hosting': 1.3, 'parental_control': 1.1}
+        capture_rates = {'distributed': 0.15, 'top_heavy': 0.08, 'winner_take_all': 0.03, 'no_data': 0.10}
+        pattern = k.get('ytPattern', 'no_data') or 'no_data'
+        volume = k.get('volume', 0) or 0
+        epv = epv_by_type.get(keyword_type, 0.17) * niche_mult.get(niche, 1.0)
+        revenue = volume * capture_rates.get(pattern, 0.10) * epv * willingness
+
+        alerts.append({
+            'keyword': keyword,
+            'niche': niche,
+            'alertType': alert_type,
+            'urgency': min(100, round(urgency)),
+            'reason': reason,
+            'trend': trend_dir,
+            'trendChange': round(trend_change, 1),
+            'interest': interest,
+            'peakMonths': peak_months_str,
+            'publishWindow': publish_window,
+            'volume': volume,
+            'revenue': round(revenue, 0),
+            'pattern': pattern,
+            'idealBrand': suggest_ideal_brand(keyword, niche),
+        })
+
+    # Sort by urgency (most urgent first)
+    alerts.sort(key=lambda x: x['urgency'], reverse=True)
+
+    return jsonify({
+        'success': True,
+        'alerts': alerts[:50],  # Top 50 most urgent
+        'total': len(alerts)
     })
 
 

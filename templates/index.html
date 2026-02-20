@@ -1441,6 +1441,21 @@
                 </div>
             </div>
 
+            <!-- Early Trend Alerts -->
+            <div id="early-trends-section" style="margin-top:20px;">
+                <div class="research-box" style="border-color:rgba(251,191,36,0.3);background:linear-gradient(135deg, rgba(251,191,36,0.08), rgba(245,158,11,0.05));">
+                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+                        <h3 style="color:#fbbf24;margin:0;">🔔 Early Trend Alerts</h3>
+                        <button class="research-btn" id="trends-load-btn" onclick="loadEarlyTrends()" style="background:linear-gradient(135deg, #f59e0b, #d97706);padding:8px 20px;font-size:0.85rem;">
+                            <span id="trends-btn-text">Check Trends</span>
+                            <div class="spinner" id="trends-spinner" style="display:none;"></div>
+                        </button>
+                    </div>
+                    <p style="color:#94a3b8;margin:0;font-size:0.85rem;">Keywords rising in search interest that haven't peaked yet — create content now before everyone else catches on.</p>
+                    <div id="early-trends-container" style="margin-top:16px;"></div>
+                </div>
+            </div>
+
             <!-- Niche Overview -->
             <div id="smart-niche-overview" style="display:none;margin-top:20px;">
                 <div style="display:grid;grid-template-columns:repeat(auto-fit, minmax(160px, 1fr));gap:12px;margin-bottom:20px;" id="smart-niche-cards"></div>
@@ -6967,6 +6982,46 @@
         }
 
         // ============================================
+        // EARLY TREND ALERTS
+        // ============================================
+        async function loadEarlyTrends() {
+            const btn = document.getElementById('trends-load-btn');
+            const btnText = document.getElementById('trends-btn-text');
+            const spinner = document.getElementById('trends-spinner');
+            const container = document.getElementById('early-trends-container');
+            btn.disabled = true; btnText.style.display = 'none'; spinner.style.display = 'inline-block';
+            try {
+                const resp = await fetch('/api/early-trends');
+                const data = await resp.json();
+                if (!data.success || !data.alerts || data.alerts.length === 0) {
+                    container.innerHTML = '<p style="color:#64748b;font-size:0.85rem;">No early trend alerts right now. Fetch trend data for your keywords first.</p>';
+                    return;
+                }
+                const typeLabels = {early_rise: '🌱 Early Rise', approaching_peak: '🔥 Peak Soon', publish_window: '📝 Publish Now', momentum: '🚀 Momentum'};
+                const typeColors = {early_rise: '#4ade80', approaching_peak: '#f87171', publish_window: '#fbbf24', momentum: '#60a5fa'};
+                container.innerHTML = data.alerts.slice(0, 15).map(a => `
+                    <div style="display:flex;justify-content:space-between;align-items:center;padding:12px 16px;background:rgba(15,23,42,0.6);border:1px solid rgba(71,85,105,0.3);border-radius:8px;margin-bottom:8px;">
+                        <div style="flex:1;min-width:0;">
+                            <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+                                <span style="font-weight:600;color:#e2e8f0;">${escapeHtml(a.keyword)}</span>
+                                <span style="font-size:0.65rem;padding:2px 8px;border-radius:4px;background:${typeColors[a.alertType]}22;color:${typeColors[a.alertType]};border:1px solid ${typeColors[a.alertType]}44;">${typeLabels[a.alertType] || a.alertType}</span>
+                                <span style="font-size:0.65rem;color:#94a3b8;background:rgba(71,85,105,0.3);padding:2px 6px;border-radius:4px;">${a.niche.replace(/_/g,' ')}</span>
+                            </div>
+                            <div style="font-size:0.8rem;color:#94a3b8;margin-top:4px;">${a.reason}</div>
+                        </div>
+                        <div style="display:flex;gap:16px;align-items:center;margin-left:16px;flex-shrink:0;">
+                            <div style="text-align:center;"><div style="color:#4ade80;font-weight:600;font-size:0.85rem;">+${a.trendChange}%</div><div style="font-size:0.65rem;color:#64748b;">YoY</div></div>
+                            <div style="text-align:center;"><div style="color:#e2e8f0;font-weight:600;font-size:0.85rem;">${a.interest}/100</div><div style="font-size:0.65rem;color:#64748b;">Interest</div></div>
+                            <div style="text-align:center;"><div style="color:#60a5fa;font-weight:600;font-size:0.85rem;">$${a.revenue}</div><div style="font-size:0.65rem;color:#64748b;">Rev</div></div>
+                            ${a.idealBrand && a.idealBrand !== '-' ? '<div style="text-align:center;"><div style="color:#a78bfa;font-weight:600;font-size:0.85rem;">'+escapeHtml(a.idealBrand)+'</div><div style="font-size:0.65rem;color:#64748b;">Brand</div></div>' : ''}
+                        </div>
+                    </div>
+                `).join('');
+                if (data.total > 15) container.innerHTML += `<p style="color:#64748b;font-size:0.8rem;text-align:center;margin-top:8px;">Showing top 15 of ${data.total} alerts</p>`;
+            } catch(e) { container.innerHTML = '<p style="color:#f87171;">Failed to load trends: ' + e.message + '</p>'; }
+            finally { btn.disabled = false; btnText.style.display = 'inline'; spinner.style.display = 'none'; }
+        }
+
         // SMART PICKS
         // ============================================
         let smartPicksData = [];
