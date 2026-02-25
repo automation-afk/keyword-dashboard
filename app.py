@@ -3060,6 +3060,42 @@ def research_keyword():
                 results['keywords'].append(rk_result)
 
         results['keywords'].sort(key=lambda x: x['priority_score'], reverse=True)
+
+        # Batch check portfolio status for all result keywords
+        try:
+            all_kws = [kw['keyword'].lower() for kw in results['keywords']]
+            if all_kws:
+                conn = get_db()
+                c = conn.cursor()
+                placeholders = ','.join(['%s'] * len(all_kws))
+
+                # Check priority_keywords (active portfolio)
+                c.execute(f'SELECT LOWER(keyword), niche FROM priority_keywords WHERE is_active = TRUE AND LOWER(keyword) IN ({placeholders})', all_kws)
+                priority_set = {row[0]: row[1] for row in c.fetchall()}
+
+                # Check keywords_master (library)
+                c.execute(f'SELECT LOWER(keyword) FROM keywords_master WHERE LOWER(keyword) IN ({placeholders})', all_kws)
+                library_set = {row[0] for row in c.fetchall()}
+
+                release_db(conn)
+
+                for kw in results['keywords']:
+                    kw_lower = kw['keyword'].lower()
+                    if kw_lower in priority_set:
+                        kw['portfolio_status'] = 'priority'
+                        kw['priority_niche'] = priority_set[kw_lower] or ''
+                    elif kw_lower in library_set:
+                        kw['portfolio_status'] = 'in_library'
+                        kw['priority_niche'] = ''
+                    else:
+                        kw['portfolio_status'] = 'new'
+                        kw['priority_niche'] = ''
+        except Exception as e:
+            print(f"Portfolio status check error (non-fatal): {e}")
+            for kw in results['keywords']:
+                kw['portfolio_status'] = 'new'
+                kw['priority_niche'] = ''
+
         return jsonify(results)
 
     except Exception as e:
@@ -3379,6 +3415,8 @@ def add_to_library():
     source = data.get('source', 'manual')
     source_detail = data.get('source_detail', '')
     keyword_data = data.get('keyword_data', {})
+    add_as_priority = data.get('add_as_priority', False)
+    silo = data.get('silo', '')
     user = get_current_user()
     user_email = user.get('email', 'anonymous') if user else 'anonymous'
     user_name = user.get('name', '') if user else ''
@@ -3475,13 +3513,35 @@ def add_to_library():
                 updated_at = CURRENT_TIMESTAMP
         ''', (keyword, user_email, f'[Added by {user_name or user_email} from {source}]', user_email))
 
+        # Promote to priority if requested
+        promoted = False
+        if add_as_priority:
+            silo_to_niche = {
+                'id_theft': 'ID Theft', 'dog': 'Dog',
+                'data_broker': 'Data Broker', 'parental_control': 'Parental Control',
+                'new': ''
+            }
+            priority_niche = silo_to_niche.get(silo, silo) if silo else niche
+            priority_score = keyword_data.get('priority_score', 0) if keyword_data else 0
+            c.execute('''
+                INSERT INTO priority_keywords (keyword, tier, niche, priority_score, source, is_active, added_by)
+                VALUES (%s, 'custom', %s, %s, 'research', TRUE, %s)
+                ON CONFLICT (keyword) DO UPDATE SET is_active = TRUE, niche = EXCLUDED.niche, added_by = EXCLUDED.added_by
+            ''', (keyword.lower(), priority_niche, priority_score, user_email))
+            promoted = True
+
         conn.commit()
         release_db(conn)
+
+        if promoted:
+            sync_priority_keywords(get_db, release_db)
+
         return jsonify({
             'success': True,
             'keyword': keyword,
             'added_by': user_name or user_email,
-            'source': source
+            'source': source,
+            'promoted': promoted
         })
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500

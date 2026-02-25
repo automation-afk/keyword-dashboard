@@ -676,6 +676,62 @@
             cursor: default;
         }
 
+        .add-to-library-btn.in-portfolio {
+            background: rgba(251, 191, 36, 0.2);
+            color: #fbbf24;
+            cursor: default;
+            font-weight: 600;
+        }
+
+        .add-to-library-btn.promote {
+            background: linear-gradient(135deg, #3b82f6, #2563eb);
+            color: white;
+        }
+
+        .add-to-library-btn.promote:hover {
+            box-shadow: 0 2px 8px rgba(59, 130, 246, 0.4);
+        }
+
+        .portfolio-badge {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 0.65rem;
+            font-weight: 700;
+            letter-spacing: 0.5px;
+            background: rgba(251, 191, 36, 0.15);
+            color: #fbbf24;
+            border: 1px solid rgba(251, 191, 36, 0.3);
+        }
+
+        .library-badge {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 0.65rem;
+            font-weight: 700;
+            letter-spacing: 0.5px;
+            background: rgba(59, 130, 246, 0.15);
+            color: #60a5fa;
+            border: 1px solid rgba(59, 130, 246, 0.3);
+        }
+
+        .silo-picker-inline {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+        }
+
+        .silo-picker-inline select {
+            padding: 3px 6px;
+            border-radius: 4px;
+            border: 1px solid rgba(59, 130, 246, 0.4);
+            background: rgba(15, 23, 42, 0.8);
+            color: #e2e8f0;
+            font-size: 0.7rem;
+            cursor: pointer;
+        }
+
         /* Research Results */
         .research-results {
             margin-top: 24px;
@@ -3042,11 +3098,19 @@
                 priority_score: kw.priority_score || 0,
                 opportunity_tier: kw.opportunity_tier || 'B - High Value',
                 niche: kw.niche || data.niche || 'general',
-                keyword_type: kw.keyword_type || 'other'
+                keyword_type: kw.keyword_type || 'other',
+                portfolio_status: kw.portfolio_status || 'new',
+                priority_niche: kw.priority_niche || ''
             }));
+
+            // Count portfolio statuses for Add All summary
+            const statusCounts = { priority: 0, in_library: 0, new: 0 };
+            researchResultsData.forEach(kw => { statusCounts[kw.portfolio_status] = (statusCounts[kw.portfolio_status] || 0) + 1; });
 
             let html = `<h3 style="margin-bottom:8px;">Found ${data.keywords.length} keywords for "${escapeHtml(data.seed_keyword)}"
                 <button class="add-to-library-btn" onclick="addAllResearchToLibrary()" style="margin-left:12px;padding:6px 14px;font-size:0.8rem;">+ Add All to Library</button>
+                ${statusCounts.priority > 0 ? `<span class="portfolio-badge" style="margin-left:8px;">${statusCounts.priority} IN PORTFOLIO</span>` : ''}
+                ${statusCounts.in_library > 0 ? `<span class="library-badge" style="margin-left:4px;">${statusCounts.in_library} IN LIBRARY</span>` : ''}
             </h3>
             <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px;">
                 <button class="opp-filter-btn research-sort-btn ${researchSortMode === 'score' ? 'active' : ''}" onclick="sortResearchResults('score', this)">Best Score</button>
@@ -3072,6 +3136,26 @@
                     'informational': '#94a3b8',
                     'other': '#cbd5e1'
                 };
+                const pStatus = kw.portfolio_status || 'new';
+                const pNiche = kw.priority_niche || '';
+                let addBtnHtml = '';
+                if (pStatus === 'priority') {
+                    addBtnHtml = `<button class="add-to-library-btn in-portfolio" id="research-add-btn-${kwIdx}" disabled title="Already in portfolio${pNiche ? ' (' + escapeHtml(pNiche) + ')' : ''}">✓ Portfolio</button>`;
+                } else if (pStatus === 'in_library') {
+                    addBtnHtml = `<span class="silo-picker-inline" id="research-add-btn-${kwIdx}">
+                        <select id="research-silo-${kwIdx}" title="Select silo for priority">
+                            <option value="">No silo</option>
+                            <option value="id_theft">ID Theft</option>
+                            <option value="dog">Dog</option>
+                            <option value="data_broker">Data Broker</option>
+                            <option value="parental_control">Parental Control</option>
+                        </select>
+                        <button class="add-to-library-btn promote" onclick="promoteResearchKeywordToPriority('${escapeHtml(kw.keyword).replace(/'/g, "\\'")}', researchResultsData[${kwIdx}], ${kwIdx}, this)">↑ Priority</button>
+                    </span>`;
+                } else {
+                    addBtnHtml = `<button class="add-to-library-btn" id="research-add-btn-${kwIdx}" onclick="addResearchKeywordToLibrary('${escapeHtml(kw.keyword).replace(/'/g, "\\'")}', researchResultsData[${kwIdx}], this)">+ Library</button>`;
+                }
+
                 html += `
                     <div class="result-card ${isSeed ? 'seed' : 'related'}">
                         <div class="result-header">
@@ -3079,9 +3163,11 @@
                                 <span class="result-keyword">${escapeHtml(kw.keyword)}</span>
                                 ${isSeed ? '<span style="margin-left:8px;font-size:0.7rem;background:#8b5cf6;padding:2px 8px;border-radius:4px;">SEED</span>' : ''}
                                 <span style="margin-left:8px;font-size:0.65rem;background:${kwTypeColors[kwType]}22;color:${kwTypeColors[kwType]};padding:2px 8px;border-radius:4px;border:1px solid ${kwTypeColors[kwType]}44;">${kwType.replace(/_/g, ' ')}</span>
+                                ${pStatus === 'priority' ? '<span class="portfolio-badge" style="margin-left:8px;">IN PORTFOLIO</span>' : ''}
+                                ${pStatus === 'in_library' ? '<span class="library-badge" style="margin-left:8px;">IN LIBRARY</span>' : ''}
                             </div>
                             <div style="display:flex;align-items:center;gap:8px;">
-                                <button class="add-to-library-btn" id="research-add-btn-${kwIdx}" onclick="addResearchKeywordToLibrary('${escapeHtml(kw.keyword).replace(/'/g, "\\'")}', researchResultsData[${kwIdx}], this)">+ Library</button>
+                                ${addBtnHtml}
                                 <span class="tier-badge tier-${kw.opportunity_tier.charAt(0).toLowerCase()}">${kw.opportunity_tier}</span>
                             </div>
                         </div>
@@ -4384,14 +4470,87 @@
             }
         }
 
+        async function promoteResearchKeywordToPriority(keyword, keywordData, kwIdx, buttonEl) {
+            const siloSelect = document.getElementById(`research-silo-${kwIdx}`);
+            const silo = siloSelect ? siloSelect.value : '';
+            const container = buttonEl.closest('.silo-picker-inline');
+
+            buttonEl.disabled = true;
+            buttonEl.textContent = 'Promoting...';
+
+            try {
+                const response = await fetch('/api/library/add', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        keyword: keyword,
+                        source: 'research',
+                        source_detail: keywordData.seed_keyword || keyword,
+                        keyword_data: keywordData,
+                        add_as_priority: true,
+                        silo: silo
+                    })
+                });
+                const data = await response.json();
+
+                if (data.success) {
+                    // Replace the silo picker + button with a single "Portfolio" badge button
+                    container.innerHTML = `<button class="add-to-library-btn in-portfolio" disabled>✓ Portfolio</button>`;
+                    // Update the badge in the header too
+                    const card = container.closest('.result-card');
+                    const libBadge = card.querySelector('.library-badge');
+                    if (libBadge) {
+                        libBadge.className = 'portfolio-badge';
+                        libBadge.textContent = 'IN PORTFOLIO';
+                    }
+                    keywordData.portfolio_status = 'priority';
+                    loadData();
+                } else {
+                    buttonEl.textContent = 'Error';
+                    buttonEl.disabled = false;
+                    setTimeout(() => { buttonEl.textContent = '↑ Priority'; buttonEl.disabled = false; }, 2000);
+                }
+            } catch (error) {
+                console.error('Error promoting to priority:', error);
+                buttonEl.textContent = 'Error';
+                setTimeout(() => { buttonEl.textContent = '↑ Priority'; buttonEl.disabled = false; }, 2000);
+            }
+        }
+
         async function addAllResearchToLibrary() {
             if (!researchResultsData || researchResultsData.length === 0) return;
-            if (!confirm(`Add all ${researchResultsData.length} keywords to library?`)) return;
+
+            const counts = { new: 0, in_library: 0, priority: 0 };
+            researchResultsData.forEach(kw => {
+                counts[kw.portfolio_status || 'new']++;
+            });
+
+            let msg = `Add keywords to library?\n\n`;
+            if (counts.new > 0) msg += `• ${counts.new} new keyword(s) → will be added to library\n`;
+            if (counts.in_library > 0) msg += `• ${counts.in_library} already in library → will be promoted to priority\n`;
+            if (counts.priority > 0) msg += `• ${counts.priority} already in portfolio → will be skipped\n`;
+
+            if (!confirm(msg)) return;
 
             for (let i = 0; i < researchResultsData.length; i++) {
-                const btn = document.getElementById(`research-add-btn-${i}`);
-                if (btn && !btn.classList.contains('added')) {
-                    await addResearchKeywordToLibrary(researchResultsData[i].keyword, researchResultsData[i], btn);
+                const kw = researchResultsData[i];
+                const status = kw.portfolio_status || 'new';
+
+                if (status === 'priority') continue; // Skip already-priority keywords
+
+                if (status === 'new') {
+                    // Add to library normally
+                    const btn = document.getElementById(`research-add-btn-${i}`);
+                    if (btn && !btn.classList.contains('added')) {
+                        await addResearchKeywordToLibrary(kw.keyword, kw, btn);
+                    }
+                } else if (status === 'in_library') {
+                    // Promote to priority
+                    const container = document.getElementById(`research-add-btn-${i}`);
+                    const promoteBtn = container ? container.querySelector('.promote') : null;
+                    if (promoteBtn && !container.querySelector('.in-portfolio')) {
+                        await promoteResearchKeywordToPriority(kw.keyword, kw, i, promoteBtn);
+                    }
                 }
             }
         }
