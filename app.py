@@ -3064,18 +3064,23 @@ def research_keyword():
         # Batch check portfolio status for all result keywords
         try:
             all_kws = [kw['keyword'].lower() for kw in results['keywords']]
+            print(f"[RESEARCH] Checking portfolio status for {len(all_kws)} keywords: {all_kws[:5]}")
             if all_kws:
                 conn = get_db()
                 c = conn.cursor()
                 placeholders = ','.join(['%s'] * len(all_kws))
 
                 # Check priority_keywords (active portfolio)
-                c.execute(f'SELECT LOWER(keyword), niche FROM priority_keywords WHERE is_active = TRUE AND LOWER(keyword) IN ({placeholders})', all_kws)
-                priority_set = {row[0]: row[1] for row in c.fetchall()}
+                c.execute(f'SELECT LOWER(keyword), niche FROM priority_keywords WHERE is_active = TRUE AND LOWER(keyword) IN ({placeholders})', tuple(all_kws))
+                priority_rows = c.fetchall()
+                priority_set = {row[0]: row[1] for row in priority_rows}
+                print(f"[RESEARCH] Found {len(priority_set)} priority matches: {list(priority_set.keys())[:5]}")
 
                 # Check keywords_master (library)
-                c.execute(f'SELECT LOWER(keyword) FROM keywords_master WHERE LOWER(keyword) IN ({placeholders})', all_kws)
-                library_set = {row[0] for row in c.fetchall()}
+                c.execute(f'SELECT LOWER(keyword) FROM keywords_master WHERE LOWER(keyword) IN ({placeholders})', tuple(all_kws))
+                library_rows = c.fetchall()
+                library_set = {row[0] for row in library_rows}
+                print(f"[RESEARCH] Found {len(library_set)} library matches: {list(library_set)[:5]}")
 
                 release_db(conn)
 
@@ -3091,7 +3096,9 @@ def research_keyword():
                         kw['portfolio_status'] = 'new'
                         kw['priority_niche'] = ''
         except Exception as e:
-            print(f"Portfolio status check error (non-fatal): {e}")
+            import traceback
+            print(f"[RESEARCH] Portfolio status check error: {e}")
+            print(traceback.format_exc())
             for kw in results['keywords']:
                 kw['portfolio_status'] = 'new'
                 kw['priority_niche'] = ''
