@@ -6430,6 +6430,12 @@ CHANGELOG = [
         'description': 'Get alerted to keywords rising in search interest before they peak — so you can publish first.',
         'detail': '<ul><li><strong>🌱 Early Rise</strong> &mdash; interest is growing but still low, first-mover advantage</li><li><strong>🔥 Peak Soon</strong> &mdash; rising keyword approaching peak months, publish NOW to rank in time</li><li><strong>📝 Publish Now</strong> &mdash; you\'re inside the optimal publish window for this keyword</li><li><strong>🚀 Momentum</strong> &mdash; strong year-over-year growth, ride the wave</li><li>Shows trend %, current interest, revenue, and ideal brand for each alert</li><li>Found on the Smart Picks tab &mdash; click "Check Trends"</li></ul>'
     },
+    {
+        'version': 15, 'date': '2026-02-25', 'tab': 'research',
+        'title': 'Portfolio-Aware Research Results',
+        'description': 'Research results now flag keywords you already own — no more accidentally re-adding duplicates.',
+        'detail': '<ul><li><strong>IN PORTFOLIO</strong> badge (gold) &mdash; keyword is already an active priority keyword</li><li><strong>IN LIBRARY</strong> badge (blue) &mdash; keyword is in your library but not yet priority</li><li>Library keywords show a <strong>"↑ Priority"</strong> button with silo picker to promote directly</li><li>Portfolio keywords are auto-skipped &mdash; button shows "✓ Portfolio" (disabled)</li><li><strong>Add All</strong> now shows a summary: new keywords added, library keywords promoted, portfolio keywords skipped</li><li>Uses the same portfolio check as Content Gap for consistency</li></ul>'
+    },
 ]
 
 CHANGELOG_CURRENT_VERSION = max(item['version'] for item in CHANGELOG)
