@@ -3062,44 +3062,52 @@ def research_keyword():
         results['keywords'].sort(key=lambda x: x['priority_score'], reverse=True)
 
         # Batch check portfolio status for all result keywords
-        try:
-            all_kws = [kw['keyword'].lower() for kw in results['keywords']]
-            print(f"[RESEARCH] Checking portfolio status for {len(all_kws)} keywords: {all_kws[:5]}")
-            if all_kws:
+        all_kws = [kw['keyword'].lower() for kw in results['keywords']]
+        priority_set = {}
+        library_set = set()
+        print(f"[RESEARCH] Checking portfolio status for {len(all_kws)} keywords: {all_kws[:5]}")
+
+        if all_kws:
+            # Try SQL first, fall back to REST API
+            try:
                 conn = get_db()
                 c = conn.cursor()
                 placeholders = ','.join(['%s'] * len(all_kws))
-
-                # Check priority_keywords (active portfolio)
                 c.execute(f'SELECT LOWER(keyword), niche FROM priority_keywords WHERE is_active = TRUE AND LOWER(keyword) IN ({placeholders})', tuple(all_kws))
-                priority_rows = c.fetchall()
-                priority_set = {row[0]: row[1] for row in priority_rows}
-                print(f"[RESEARCH] Found {len(priority_set)} priority matches: {list(priority_set.keys())[:5]}")
-
-                # Check keywords_master (library)
+                priority_set = {row[0]: row[1] for row in c.fetchall()}
                 c.execute(f'SELECT LOWER(keyword) FROM keywords_master WHERE LOWER(keyword) IN ({placeholders})', tuple(all_kws))
-                library_rows = c.fetchall()
-                library_set = {row[0] for row in library_rows}
-                print(f"[RESEARCH] Found {len(library_set)} library matches: {list(library_set)[:5]}")
-
+                library_set = {row[0] for row in c.fetchall()}
                 release_db(conn)
+                print(f"[RESEARCH] SQL: {len(priority_set)} priority, {len(library_set)} library matches")
+            except Exception as e:
+                print(f"[RESEARCH] SQL failed ({e}), trying REST API fallback...")
+                try:
+                    # REST API fallback for priority_keywords
+                    priority_rows = supabase_rest_select('priority_keywords', 'keyword,niche', {'is_active': 'eq.true'})
+                    if priority_rows:
+                        all_kws_set = set(all_kws)
+                        priority_set = {r['keyword'].lower(): r.get('niche', '') for r in priority_rows if r['keyword'].lower() in all_kws_set}
 
-                for kw in results['keywords']:
-                    kw_lower = kw['keyword'].lower()
-                    if kw_lower in priority_set:
-                        kw['portfolio_status'] = 'priority'
-                        kw['priority_niche'] = priority_set[kw_lower] or ''
-                    elif kw_lower in library_set:
-                        kw['portfolio_status'] = 'in_library'
-                        kw['priority_niche'] = ''
-                    else:
-                        kw['portfolio_status'] = 'new'
-                        kw['priority_niche'] = ''
-        except Exception as e:
-            import traceback
-            print(f"[RESEARCH] Portfolio status check error: {e}")
-            print(traceback.format_exc())
-            for kw in results['keywords']:
+                    # REST API fallback for keywords_master
+                    # For large tables, check each keyword individually via or filter
+                    or_filter = ','.join([f'keyword.eq.{kw}' for kw in all_kws])
+                    library_rows = supabase_rest_select('keywords_master', 'keyword', {'or': f'({or_filter})'})
+                    if library_rows:
+                        library_set = {r['keyword'].lower() for r in library_rows}
+
+                    print(f"[RESEARCH] REST: {len(priority_set)} priority, {len(library_set)} library matches")
+                except Exception as e2:
+                    print(f"[RESEARCH] REST fallback also failed: {e2}")
+
+        for kw in results['keywords']:
+            kw_lower = kw['keyword'].lower()
+            if kw_lower in priority_set:
+                kw['portfolio_status'] = 'priority'
+                kw['priority_niche'] = priority_set[kw_lower] or ''
+            elif kw_lower in library_set:
+                kw['portfolio_status'] = 'in_library'
+                kw['priority_niche'] = ''
+            else:
                 kw['portfolio_status'] = 'new'
                 kw['priority_niche'] = ''
 
