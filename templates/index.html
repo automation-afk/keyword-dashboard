@@ -3140,7 +3140,7 @@
                 const pNiche = kw.priority_niche || '';
                 let addBtnHtml = '';
                 if (pStatus === 'priority') {
-                    addBtnHtml = `<button class="add-to-library-btn in-portfolio" id="research-add-btn-${kwIdx}" disabled title="Already in portfolio${pNiche ? ' (' + escapeHtml(pNiche) + ')' : ''}">✓ Portfolio</button>`;
+                    addBtnHtml = `<button class="add-to-library-btn" id="research-add-btn-${kwIdx}" onclick="addResearchKeywordToLibrary('${escapeHtml(kw.keyword).replace(/'/g, "\\'")}', researchResultsData[${kwIdx}], this)">+ Library</button>`;
                 } else if (pStatus === 'in_library') {
                     addBtnHtml = `<span class="silo-picker-inline" id="research-add-btn-${kwIdx}">
                         <select id="research-silo-${kwIdx}" title="Select silo for priority">
