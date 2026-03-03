@@ -4948,6 +4948,9 @@
             5: 5    // Position 5 = 5%
         };
 
+        // YouTube CTR benchmarks by SERP position
+        const YT_CTR_BY_POSITION = { 1: 30, 2: 18, 3: 12, 4: 8, 5: 6 };
+
         // Channel mapping: abbreviated name -> patterns to match in YouTube channel names
         const CHANNEL_MAP = {
             'SH':   ['security hero', 'securityhero', 'home security heroes'],
@@ -4980,6 +4983,25 @@
                 }
             }
             return null;
+        }
+
+        // Distribute keyword-level CM_Rev across owned positions using DOMINATION_WEIGHTS
+        function distributePositionRevenue(kwRevenue, positions) {
+            if (!kwRevenue || kwRevenue <= 0 || !positions) return {};
+            let ownedWeightSum = 0;
+            const ownedPositions = [];
+            for (let pos = 1; pos <= 5; pos++) {
+                if (positions[pos] && positions[pos].isYours) {
+                    ownedWeightSum += DOMINATION_WEIGHTS[pos];
+                    ownedPositions.push(pos);
+                }
+            }
+            if (ownedWeightSum === 0) return {};
+            const result = {};
+            for (const pos of ownedPositions) {
+                result[pos] = Math.round(kwRevenue * (DOMINATION_WEIGHTS[pos] / ownedWeightSum));
+            }
+            return result;
         }
 
         function showImportModal() {
@@ -5165,7 +5187,7 @@
             }
         }
 
-        function calculateDominationScore(keywordResult) {
+        function calculateDominationScore(keywordResult, videoRevenueList) {
             if (!keywordResult || !keywordResult.top_10) return { score: 0, positions: {}, channels: [] };
 
             let score = 0;
@@ -5188,11 +5210,22 @@
                     }
                 }
 
+                // Try to match with real BQ revenue data by video_id
+                let bqMatch = null;
+                if (isYours && videoRevenueList && video.video_id) {
+                    bqMatch = matchVideoRevenue(video.video_id, videoRevenueList);
+                }
+
                 positions[pos] = {
                     channel: channel,
                     title: video.title || '',
+                    video_id: video.video_id || '',
                     views: video.views || 'N/A',
-                    isYours: isYours
+                    isYours: isYours,
+                    bqRevenue: bqMatch ? bqMatch.revenue : null,
+                    bqClicks: bqMatch ? bqMatch.clicks : null,
+                    bqSales: bqMatch ? bqMatch.sales : null,
+                    bqViews: bqMatch ? bqMatch.total_views : null,
                 };
 
                 if (isYours) {
@@ -5207,12 +5240,22 @@
         const SILO_LABELS = {id_theft:'ID Theft',dog:'Dog',data_broker:'Data Broker',parental_control:'Parental Control',new_keywords:'New Keywords'};
         const SILO_COLORS = {id_theft:'#818cf8',dog:'#fb923c',data_broker:'#34d399',parental_control:'#f472b6',new_keywords:'#facc15'};
 
+        // Match a SERP video to BQ revenue data by video_id
+        function matchVideoRevenue(videoId, videoRevenueList) {
+            if (!videoRevenueList || !videoRevenueList.length || !videoId) return null;
+            for (const v of videoRevenueList) {
+                if (v.video_id && v.video_id === videoId) return v;
+            }
+            return null;
+        }
+
         function displayDominationData(apiResp) {
-            // apiResp has: tracking, targets, audit_data, audit_results_by_keyword
+            // apiResp has: tracking, targets, audit_data, audit_results_by_keyword, video_revenue
             const tracking = apiResp.tracking || apiResp;
             const targets = apiResp.targets || domTargets;
             const auditByKw = apiResp.audit_results_by_keyword || {};
             const auditData = apiResp.audit_data;
+            const videoRevenue = apiResp.video_revenue || {};
 
             // Build processed keywords from tracking config (if available)
             const processedKeywords = [];
@@ -5224,7 +5267,8 @@
                         for (const kwEntry of group.keywords || []) {
                             const keyword = kwEntry.keyword;
                             const result = auditByKw[keyword];
-                            const domination = result ? calculateDominationScore(result) : {score:0, positions:{1:null,2:null,3:null,4:null,5:null}, channels:[]};
+                            const kwVideoRev = videoRevenue[keyword.toLowerCase()] || null;
+                            const domination = result ? calculateDominationScore(result, kwVideoRev) : {score:0, positions:{1:null,2:null,3:null,4:null,5:null}, channels:[]};
                             const revenue = kwEntry.revenue || result?._revenue || 0;
                             const targetInfo = targets[keyword];
                             const target = targetInfo ? targetInfo.target : 100;
@@ -5244,6 +5288,7 @@
                                 silo: silo.id, siloLabel: silo.label,
                                 group: group.name, is_secondary: false,
                                 positions: domination.positions,
+                                positionRevenue: distributePositionRevenue(revenue, domination.positions),
                                 yourChannels: domination.channels,
                                 top10: result?.top_10 || [],
                                 targetUpdatedBy: targetInfo?.updated_by || null,
@@ -5254,7 +5299,8 @@
                             // Process secondary keywords
                             for (const sec of kwEntry.secondary || []) {
                                 const secResult = auditByKw[sec];
-                                const secDom = secResult ? calculateDominationScore(secResult) : {score:0, positions:{1:null,2:null,3:null,4:null,5:null}, channels:[]};
+                                const secVideoRev = videoRevenue[sec.toLowerCase()] || null;
+                                const secDom = secResult ? calculateDominationScore(secResult, secVideoRev) : {score:0, positions:{1:null,2:null,3:null,4:null,5:null}, channels:[]};
                                 const secTarget = (targets[sec] || {}).target ?? 100;
                                 processedKeywords.push({
                                     keyword: sec, revenue: 0, domination: secDom.score,
@@ -5262,6 +5308,7 @@
                                     silo: silo.id, siloLabel: silo.label,
                                     group: group.name, is_secondary: true,
                                     positions: secDom.positions,
+                                    positionRevenue: {},
                                     yourChannels: secDom.channels,
                                     top10: secResult?.top_10 || [],
                                     targetUpdatedBy: null, targetUpdatedAt: null,
@@ -5276,7 +5323,8 @@
                 for (const result of auditData.all_results) {
                     if (result.error) continue;
                     const keyword = result.keyword;
-                    const domination = calculateDominationScore(result);
+                    const legacyVideoRev = videoRevenue[keyword.toLowerCase()] || null;
+                    const domination = calculateDominationScore(result, legacyVideoRev);
                     const kwInfo = auditData.ranking?.find(r => r.keyword === keyword) || auditData.not_ranking?.find(r => r.keyword === keyword);
                     const revenue = kwInfo?.revenue || 0;
                     const target = (targets[keyword] || {}).target ?? 100;
@@ -5289,6 +5337,7 @@
                         silo: result.silo || '', siloLabel: SILO_LABELS[result.silo] || '',
                         group: result.group || '', is_secondary: result.is_secondary || false,
                         positions: domination.positions,
+                        positionRevenue: distributePositionRevenue(revenue, domination.positions),
                         yourChannels: domination.channels,
                         top10: result.top_10 || [],
                         targetUpdatedBy: null, targetUpdatedAt: null
@@ -5449,6 +5498,42 @@
             return '#f87171';                // Far from target
         }
 
+        // Build HTML for a single position cell in dom score tables
+        function buildPositionCell(posData, pos, estRevenue) {
+            if (!posData) return '<td style="color:#64748b;font-size:0.7rem;">-</td>';
+            const vid = posData.video_id || '';
+            const vidLine = vid ? `<div style="font-size:0.5rem;color:#475569;margin-top:1px;font-family:monospace;">${vid}</div>` : '';
+            if (posData.isYours) {
+                // Revenue: real BQ data (green) or estimated (gold)
+                let revLine = '';
+                if (posData.bqRevenue != null && posData.bqRevenue > 0) {
+                    revLine = `<div style="font-size:0.6rem;color:#4ade80;font-weight:600;margin-top:1px;">$${Math.round(posData.bqRevenue).toLocaleString()}</div>`;
+                } else if (estRevenue && estRevenue > 0) {
+                    revLine = `<div style="font-size:0.6rem;color:#fbbf24;font-weight:600;margin-top:1px;">~$${estRevenue.toLocaleString()}</div>`;
+                }
+                // CR: real (sales/clicks) or estimated CTR benchmark
+                let ctrLine = '';
+                if (posData.bqClicks != null && posData.bqClicks > 0 && posData.bqSales != null) {
+                    const cr = ((posData.bqSales / posData.bqClicks) * 100).toFixed(1);
+                    ctrLine = `<div style="font-size:0.55rem;color:#94a3b8;margin-top:1px;">CR ${cr}%</div>`;
+                } else {
+                    const ctr = YT_CTR_BY_POSITION[pos] || 0;
+                    ctrLine = `<div style="font-size:0.55rem;color:#64748b;margin-top:1px;">CR ~${ctr}%</div>`;
+                }
+                return `<td style="background:rgba(34,197,94,0.15);border-left:3px solid #22c55e;">
+                    <div style="font-size:0.7rem;color:#4ade80;font-weight:600;">${escapeHtml(posData.channel.substring(0, 18))}</div>
+                    <div style="font-size:0.6rem;color:#64748b;margin-top:2px;">${escapeHtml(posData.title.substring(0, 28))}...</div>
+                    ${vidLine}${revLine}${ctrLine}
+                </td>`;
+            } else {
+                return `<td style="background:rgba(239,68,68,0.05);">
+                    <div style="font-size:0.7rem;color:#94a3b8;">${escapeHtml(posData.channel.substring(0, 18))}</div>
+                    <div style="font-size:0.6rem;color:#64748b;margin-top:2px;">${escapeHtml(posData.title.substring(0, 28))}...</div>
+                    ${vidLine}
+                </td>`;
+            }
+        }
+
         function renderDomSummaryTable(keywords) {
             const tbody = document.getElementById('dom-summary-body');
 
@@ -5465,21 +5550,11 @@
                 const siloLabel = SILO_LABELS[k.silo] || k.silo;
                 const targetTitle = k.targetUpdatedBy ? `Last changed by ${k.targetUpdatedBy}${k.targetUpdatedAt ? ' on ' + new Date(k.targetUpdatedAt).toLocaleDateString() : ''}` : 'Click to edit target';
 
-                // Position cells
+                // Position cells with revenue & CTR
                 const positionCells = [1, 2, 3, 4, 5].map(pos => {
                     const posData = k.positions ? k.positions[pos] : null;
-                    if (!posData) return '<td style="color:#64748b;font-size:0.7rem;">-</td>';
-                    if (posData.isYours) {
-                        return `<td style="background:rgba(34,197,94,0.15);border-left:3px solid #22c55e;">
-                            <div style="font-size:0.7rem;color:#4ade80;font-weight:600;">${escapeHtml(posData.channel.substring(0, 18))}</div>
-                            <div style="font-size:0.6rem;color:#64748b;margin-top:2px;">${escapeHtml(posData.title.substring(0, 28))}...</div>
-                        </td>`;
-                    } else {
-                        return `<td style="background:rgba(239,68,68,0.05);">
-                            <div style="font-size:0.7rem;color:#94a3b8;">${escapeHtml(posData.channel.substring(0, 18))}</div>
-                            <div style="font-size:0.6rem;color:#64748b;margin-top:2px;">${escapeHtml(posData.title.substring(0, 28))}...</div>
-                        </td>`;
-                    }
+                    const estRev = k.positionRevenue ? k.positionRevenue[pos] : undefined;
+                    return buildPositionCell(posData, pos, estRev);
                 }).join('');
 
                 const channelSummary = k.yourChannels && k.yourChannels.length > 0
@@ -5553,21 +5628,11 @@
                 const hasSecondaries = secondaries.length > 0;
                 const kwId = k.keyword.replace(/[^a-z0-9]/gi, '_');
 
-                // Position cells
+                // Position cells with revenue & CTR
                 const positionCells = [1, 2, 3, 4, 5].map(pos => {
                     const posData = k.positions[pos];
-                    if (!posData) return '<td style="color:#64748b;font-size:0.7rem;">-</td>';
-                    if (posData.isYours) {
-                        return `<td style="background:rgba(34,197,94,0.15);border-left:3px solid #22c55e;">
-                            <div style="font-size:0.7rem;color:#4ade80;font-weight:600;">${escapeHtml(posData.channel.substring(0, 18))}</div>
-                            <div style="font-size:0.6rem;color:#64748b;margin-top:2px;">${escapeHtml(posData.title.substring(0, 28))}...</div>
-                        </td>`;
-                    } else {
-                        return `<td style="background:rgba(239,68,68,0.05);">
-                            <div style="font-size:0.7rem;color:#94a3b8;">${escapeHtml(posData.channel.substring(0, 18))}</div>
-                            <div style="font-size:0.6rem;color:#64748b;margin-top:2px;">${escapeHtml(posData.title.substring(0, 28))}...</div>
-                        </td>`;
-                    }
+                    const estRev = k.positionRevenue ? k.positionRevenue[pos] : undefined;
+                    return buildPositionCell(posData, pos, estRev);
                 }).join('');
 
                 const channelSummary = k.yourChannels.length > 0

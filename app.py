@@ -5894,6 +5894,7 @@ def fetch_domination_from_bigquery(keywords):
         Rank,
         Views,
         Video_title,
+        video_id,
         Search_Volume,
         Scrape_date,
         competitor_checker
@@ -5935,6 +5936,7 @@ def fetch_domination_from_bigquery(keywords):
             keyword_data[kw_key]['top_10'].append({
                 'channel': row.Channel_title or '',
                 'title': row.Video_title or '',
+                'video_id': row.video_id or '',
                 'views': row.Views or 0,
                 'rank': row.Rank,
                 'link': '',
@@ -6141,6 +6143,70 @@ def fetch_current_month_revenue_from_bq():
     except Exception as e:
         print(f"[BQ] Error fetching current month revenue: {e}")
         return _bq_revenue_cache.get('data') or {}
+
+
+_bq_video_revenue_cache = {'data': None, 'timestamp': None}
+
+def fetch_video_revenue_from_bq():
+    """Fetch current month per-video revenue from BQ Metrics_by_Month table.
+
+    Returns dict keyed by keyword_lower, each containing a list of video dicts:
+    {keyword_lower: [{video_title, channel, revenue, clicks, sales, total_views}]}
+    Cached for 30 minutes.
+    """
+    global _bq_video_revenue_cache
+    now = datetime.now()
+    if _bq_video_revenue_cache['data'] is not None and _bq_video_revenue_cache['timestamp']:
+        age = (now - _bq_video_revenue_cache['timestamp']).total_seconds()
+        if age < BQ_REVENUE_CACHE_TTL:
+            return _bq_video_revenue_cache['data']
+
+    client = get_bq_client()
+    if not client:
+        print("[BQ] No BigQuery client available for video revenue query")
+        return {}
+
+    try:
+        query = f"""
+        SELECT
+            LOWER(Video_main_keyword) as keyword,
+            video_id,
+            Video_title,
+            channel,
+            revenue,
+            clicks,
+            sales,
+            total_views
+        FROM {BQ_METRICS_TABLE}
+        WHERE Metrics_month_year = DATE_TRUNC(CURRENT_DATE(), MONTH)
+          AND Video_main_keyword IS NOT NULL
+          AND Video_main_keyword != ''
+          AND revenue > 0
+        ORDER BY LOWER(Video_main_keyword), revenue DESC
+        """
+
+        results = {}
+        for row in client.query(query).result():
+            kw = row.keyword
+            if kw not in results:
+                results[kw] = []
+            results[kw].append({
+                'video_id': row.video_id or '',
+                'video_title': row.Video_title or '',
+                'channel': row.channel or '',
+                'revenue': round(row.revenue or 0, 2),
+                'clicks': row.clicks or 0,
+                'sales': row.sales or 0,
+                'total_views': row.total_views or 0,
+            })
+
+        _bq_video_revenue_cache['data'] = results
+        _bq_video_revenue_cache['timestamp'] = now
+        print(f"[BQ] Cached per-video revenue for {len(results)} keywords")
+        return results
+    except Exception as e:
+        print(f"[BQ] Error fetching per-video revenue: {e}")
+        return _bq_video_revenue_cache.get('data') or {}
 
 
 def fetch_daily_revenue_history_from_bq(keyword, days=90):
@@ -6911,7 +6977,63 @@ def get_domination_data():
                         if kw_lower in bq_revenue:
                             kw_entry['revenue'] = bq_revenue[kw_lower]
 
-        # 6. Return combined response
+        # 6. Fetch per-video revenue from BigQuery for position-level display
+        video_revenue = fetch_video_revenue_from_bq()
+
+        # 6b. Enrich audit top_10 entries with video_id if missing
+        #     (old audit data may not have video_id; fetch from SERP table)
+        if audit_results_by_kw:
+            needs_vid = any(
+                not entry.get('video_id')
+                for result in list(audit_results_by_kw.values())[:5]
+                for entry in (result.get('top_10') or [])[:1]
+            )
+            if needs_vid:
+                try:
+                    from google.cloud import bigquery as bq
+                    client = get_bq_client()
+                    if client:
+                        kw_list = list(audit_results_by_kw.keys())
+                        kw_lower = [k.lower() for k in kw_list]
+                        kw_params = [bq.ScalarQueryParameter(f"kw_{i}", "STRING", k) for i, k in enumerate(kw_lower)]
+                        kw_placeholders = ', '.join(f"@kw_{i}" for i in range(len(kw_lower)))
+                        vid_query = f"""
+                        SELECT LOWER(Keyword) as kw, Rank, video_id
+                        FROM {BQ_SERP_TABLE}
+                        WHERE LOWER(Keyword) IN ({kw_placeholders})
+                          AND Scrape_date = BQ_asia_scrape_date
+                          AND Rank BETWEEN 1 AND 10
+                          AND Scrape_date = (
+                              SELECT Scrape_date FROM (
+                                  SELECT Scrape_date, COUNT(*) as row_cnt
+                                  FROM {BQ_SERP_TABLE}
+                                  WHERE Scrape_date = BQ_asia_scrape_date
+                                    AND Scrape_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
+                                  GROUP BY Scrape_date
+                                  HAVING COUNT(*) > 5000
+                                  ORDER BY Scrape_date DESC
+                                  LIMIT 1
+                              )
+                          )
+                        """
+                        vid_config = bq.QueryJobConfig(query_parameters=kw_params)
+                        vid_index = {}  # {kw_lower: {rank: video_id}}
+                        for row in client.query(vid_query, job_config=vid_config).result():
+                            vid_index.setdefault(row.kw, {})[row.Rank] = row.video_id or ''
+                        # Patch video_ids into audit data
+                        patched = 0
+                        for kw, result in audit_results_by_kw.items():
+                            kw_vids = vid_index.get(kw.lower(), {})
+                            for entry in result.get('top_10', []):
+                                if not entry.get('video_id') and entry.get('rank') in kw_vids:
+                                    entry['video_id'] = kw_vids[entry['rank']]
+                                    patched += 1
+                        if patched:
+                            print(f"[DOMINATION] Enriched {patched} audit entries with video_id from BQ")
+                except Exception as vid_err:
+                    print(f"[DOMINATION] Error enriching video_ids: {vid_err}")
+
+        # 7. Return combined response
         response_data = {
             'success': True,
             'source': source,
@@ -6919,6 +7041,7 @@ def get_domination_data():
             'targets': targets,
             'audit_data': audit_data,
             'audit_results_by_keyword': audit_results_by_kw,
+            'video_revenue': video_revenue,
             'timestamp': audit_data.get('timestamp') if audit_data else None,
             'revenue_source': 'bigquery' if bq_revenue else 'config'
         }
