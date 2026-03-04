@@ -5097,13 +5097,33 @@
             document.getElementById('dom-period-cm').classList.toggle('active', period === 'cm');
             document.getElementById('dom-period-lm').classList.toggle('active', period === 'lm');
             if (!domLastApiResponse) { loadDominationData(); return; }
-            // Just refetch video revenue for the new period and re-render
+            // Fetch video revenue for new period, then update position data and re-render tables
             try {
                 const resp = await fetch('/api/domination/video-revenue?period=' + period);
                 const data = await resp.json();
                 if (data.success && data.video_revenue) {
-                    domLastApiResponse.video_revenue = data.video_revenue;
-                    displayDominationData(domLastApiResponse);
+                    const vr = data.video_revenue;
+                    // Update bqRevenue/bqClicks/bqSales on existing processed keywords
+                    for (const k of domAllProcessed) {
+                        const kwVids = vr[k.keyword.toLowerCase()] || null;
+                        for (let pos = 1; pos <= 5; pos++) {
+                            const pd = k.positions ? k.positions[pos] : null;
+                            if (pd && pd.isYours && pd.video_id && kwVids) {
+                                const match = kwVids.find(v => v.video_id === pd.video_id);
+                                pd.bqRevenue = match ? match.revenue : null;
+                                pd.bqClicks = match ? match.clicks : null;
+                                pd.bqSales = match ? match.sales : null;
+                                pd.bqViews = match ? match.total_views : null;
+                            } else if (pd) {
+                                pd.bqRevenue = null;
+                                pd.bqClicks = null;
+                                pd.bqSales = null;
+                                pd.bqViews = null;
+                            }
+                        }
+                    }
+                    renderDomSummaryTable(domProcessedKeywords);
+                    renderDomDetailTable(domProcessedKeywords);
                 }
             } catch (e) { console.error('Period switch error:', e); }
         }
