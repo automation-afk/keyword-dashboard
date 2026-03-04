@@ -5090,13 +5090,22 @@
         }
 
         let domRevenuePeriod = 'cm';
+        let domLastApiResponse = null;
 
-        function switchDomPeriod(period) {
+        async function switchDomPeriod(period) {
             domRevenuePeriod = period;
             document.getElementById('dom-period-cm').classList.toggle('active', period === 'cm');
             document.getElementById('dom-period-lm').classList.toggle('active', period === 'lm');
-            // Reload with new period
-            loadDominationData();
+            if (!domLastApiResponse) { loadDominationData(); return; }
+            // Just refetch video revenue for the new period and re-render
+            try {
+                const resp = await fetch('/api/domination/data?period=' + period);
+                const data = await resp.json();
+                if (data.success && data.video_revenue) {
+                    domLastApiResponse.video_revenue = data.video_revenue;
+                    displayDominationData(domLastApiResponse);
+                }
+            } catch (e) { console.error('Period switch error:', e); }
         }
 
         async function loadDominationData() {
@@ -5117,6 +5126,7 @@
                     domTargets = data.targets || {};
                     domAuditResults = data.audit_results_by_keyword || {};
                     dominationData = data.audit_data;
+                    domLastApiResponse = data;
                     displayDominationData(data);
                 } else {
                     alert('No ranking data found. Run an audit or import results.');
