@@ -6145,26 +6145,35 @@ def fetch_current_month_revenue_from_bq():
         return _bq_revenue_cache.get('data') or {}
 
 
-_bq_video_revenue_cache = {'data': None, 'timestamp': None}
+_bq_video_revenue_cache = {'cm': {'data': None, 'timestamp': None}, 'lm': {'data': None, 'timestamp': None}}
 
-def fetch_video_revenue_from_bq():
-    """Fetch current month per-video revenue from BQ Metrics_by_Month table.
+def fetch_video_revenue_from_bq(period='cm'):
+    """Fetch per-video revenue from BQ Metrics_by_Month table.
+
+    Args:
+        period: 'cm' for current month, 'lm' for last month
 
     Returns dict keyed by keyword_lower, each containing a list of video dicts:
-    {keyword_lower: [{video_title, channel, revenue, clicks, sales, total_views}]}
-    Cached for 30 minutes.
+    {keyword_lower: [{video_id, video_title, channel, revenue, clicks, sales, total_views}]}
+    Cached for 30 minutes per period.
     """
     global _bq_video_revenue_cache
+    cache = _bq_video_revenue_cache.get(period, {'data': None, 'timestamp': None})
     now = datetime.now()
-    if _bq_video_revenue_cache['data'] is not None and _bq_video_revenue_cache['timestamp']:
-        age = (now - _bq_video_revenue_cache['timestamp']).total_seconds()
+    if cache['data'] is not None and cache['timestamp']:
+        age = (now - cache['timestamp']).total_seconds()
         if age < BQ_REVENUE_CACHE_TTL:
-            return _bq_video_revenue_cache['data']
+            return cache['data']
 
     client = get_bq_client()
     if not client:
-        print("[BQ] No BigQuery client available for video revenue query")
+        print(f"[BQ] No BigQuery client available for video revenue query ({period})")
         return {}
+
+    if period == 'lm':
+        date_filter = "Metrics_month_year = DATE_TRUNC(DATE_SUB(CURRENT_DATE(), INTERVAL 1 MONTH), MONTH)"
+    else:
+        date_filter = "Metrics_month_year = DATE_TRUNC(CURRENT_DATE(), MONTH)"
 
     try:
         query = f"""
@@ -6178,7 +6187,7 @@ def fetch_video_revenue_from_bq():
             sales,
             total_views
         FROM {BQ_METRICS_TABLE}
-        WHERE Metrics_month_year = DATE_TRUNC(CURRENT_DATE(), MONTH)
+        WHERE {date_filter}
           AND Video_main_keyword IS NOT NULL
           AND Video_main_keyword != ''
           AND revenue > 0
@@ -6200,13 +6209,13 @@ def fetch_video_revenue_from_bq():
                 'total_views': row.total_views or 0,
             })
 
-        _bq_video_revenue_cache['data'] = results
-        _bq_video_revenue_cache['timestamp'] = now
-        print(f"[BQ] Cached per-video revenue for {len(results)} keywords")
+        _bq_video_revenue_cache[period] = {'data': results, 'timestamp': now}
+        label = 'current month' if period == 'cm' else 'last month'
+        print(f"[BQ] Cached per-video revenue ({label}) for {len(results)} keywords")
         return results
     except Exception as e:
-        print(f"[BQ] Error fetching per-video revenue: {e}")
-        return _bq_video_revenue_cache.get('data') or {}
+        print(f"[BQ] Error fetching per-video revenue ({period}): {e}")
+        return cache.get('data') or {}
 
 
 def fetch_daily_revenue_history_from_bq(keyword, days=90):
@@ -6978,7 +6987,8 @@ def get_domination_data():
                             kw_entry['revenue'] = bq_revenue[kw_lower]
 
         # 6. Fetch per-video revenue from BigQuery for position-level display
-        video_revenue = fetch_video_revenue_from_bq()
+        period = request.args.get('period', 'cm')  # 'cm' or 'lm'
+        video_revenue = fetch_video_revenue_from_bq(period=period)
 
         # 6b. Enrich audit top_10 entries with video_id if missing
         #     (old audit data may not have video_id; fetch from SERP table)
