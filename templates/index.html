@@ -5099,7 +5099,7 @@
             if (!domLastApiResponse) { loadDominationData(); return; }
             // Just refetch video revenue for the new period and re-render
             try {
-                const resp = await fetch('/api/domination/data?period=' + period);
+                const resp = await fetch('/api/domination/video-revenue?period=' + period);
                 const data = await resp.json();
                 if (data.success && data.video_revenue) {
                     domLastApiResponse.video_revenue = data.video_revenue;

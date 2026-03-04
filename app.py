@@ -7060,6 +7060,17 @@ def get_domination_data():
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
+@app.route('/api/domination/video-revenue', methods=['GET'])
+@login_required
+def get_video_revenue():
+    """Lightweight endpoint: just return per-video revenue for a given period."""
+    try:
+        period = request.args.get('period', 'cm')
+        video_revenue = fetch_video_revenue_from_bq(period=period)
+        return jsonify({'success': True, 'video_revenue': video_revenue, 'period': period})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
 @app.route('/api/domination/targets', methods=['GET'])
 @login_required
 def get_domination_targets():
