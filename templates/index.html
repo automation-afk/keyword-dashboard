@@ -61,6 +61,12 @@
 
         .tab:hover { color: #e2e8f0; }
         .tab.active { background: #3b82f6; color: white; }
+        .dom-period-btn {
+            padding: 4px 12px; border-radius: 8px; border: none; background: transparent;
+            color: #94a3b8; cursor: pointer; font-size: 0.75rem; font-weight: 500; transition: all 0.2s;
+        }
+        .dom-period-btn:hover { color: #e2e8f0; }
+        .dom-period-btn.active { background: #3b82f6; color: white; }
 
         .tab-content { display: none; }
         .tab-content.active { display: block; }
@@ -1952,8 +1958,8 @@
                         <div class="spinner" id="manage-kw-spinner" style="display:none;"></div>
                     </button>
                     <div style="display:flex;gap:4px;margin-left:12px;background:#1e293b;border-radius:8px;padding:3px;">
-                        <button id="dom-period-cm" class="tab active" onclick="switchDomPeriod('cm')" style="padding:4px 12px;font-size:0.75rem;">CM</button>
-                        <button id="dom-period-lm" class="tab" onclick="switchDomPeriod('lm')" style="padding:4px 12px;font-size:0.75rem;">LM</button>
+                        <button id="dom-period-cm" class="dom-period-btn active" onclick="switchDomPeriod('cm')" style="padding:4px 12px;font-size:0.75rem;">CM</button>
+                        <button id="dom-period-lm" class="dom-period-btn" onclick="switchDomPeriod('lm')" style="padding:4px 12px;font-size:0.75rem;">LM</button>
                     </div>
                 </div>
                 <div id="keyword-source-banner" style="display:none;padding:8px 16px;border-radius:8px;margin-bottom:8px;font-size:0.8rem;background:#1e293b;border:1px solid #334155;color:#94a3b8;"></div>
