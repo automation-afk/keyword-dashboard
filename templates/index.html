@@ -6711,10 +6711,11 @@
                 });
             }
 
-            // Process all keywords with their domination scores
+            // Process only primary (core priority) keywords — exclude secondaries
             const plannerKeywords = [];
+            const primaryResults = data.all_results.filter(r => !r.is_secondary);
 
-            for (const result of data.all_results) {
+            for (const result of primaryResults) {
                 const keyword = result.keyword;
                 const domScore = calculateDominationScore(result);
 
