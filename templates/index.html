@@ -5783,15 +5783,37 @@
             if (!anchor) return;
 
             const fmtMoney = n => '$' + (Number(n) || 0).toLocaleString(undefined, {maximumFractionDigits: 0});
+
+            // One inner <table> with shared <colgroup> so header + body columns align.
+            let bodyRows = '';
+            for (const p of (data.pairs || [])) {
+                const revColor = p.rev_30d > 0 ? '#4ade80' : '#64748b';
+                bodyRows += `
+                    <tr>
+                        <td style="text-align:left;padding:3px 8px;color:#cbd5e1;">↳ ${escapeHtml(p.pair)}</td>
+                        <td style="text-align:right;padding:3px 8px;color:${revColor};font-weight:600;">${fmtMoney(p.rev_30d)}</td>
+                        <td style="text-align:right;padding:3px 8px;color:#94a3b8;">${fmtMoney(p.rev_prior_30d)}</td>
+                        <td style="text-align:right;padding:3px 8px;color:#94a3b8;">${fmtMoney(p.lifetime_rev)}</td>
+                        <td style="text-align:right;padding:3px 8px;color:#94a3b8;">${p.video_count}</td>
+                    </tr>`;
+            }
+
             const headerHtml = `
                 <tr class="pair-row-${kwId}" style="background:rgba(59,130,246,0.08);">
-                    <td colspan="12" style="padding:8px 12px 4px 40px;">
-                        <div style="font-size:0.7rem;color:#60a5fa;font-weight:600;margin-bottom:4px;letter-spacing:0.5px;">
+                    <td colspan="12" style="padding:8px 12px 8px 40px;">
+                        <div style="font-size:0.7rem;color:#60a5fa;font-weight:600;margin-bottom:6px;letter-spacing:0.5px;">
                             PAIRWISE BREAKDOWN · ${data.pair_count} pairs · period ${data.period_date}
                         </div>
-                        <table style="width:100%;font-size:0.75rem;border-collapse:collapse;">
+                        <table style="width:100%;font-size:0.75rem;border-collapse:collapse;table-layout:fixed;">
+                            <colgroup>
+                                <col style="width:34%;">
+                                <col style="width:16%;">
+                                <col style="width:18%;">
+                                <col style="width:18%;">
+                                <col style="width:14%;">
+                            </colgroup>
                             <thead>
-                                <tr style="color:#64748b;">
+                                <tr style="color:#64748b;border-bottom:1px solid rgba(71,85,105,0.3);">
                                     <th style="text-align:left;padding:4px 8px;font-weight:500;">Pair</th>
                                     <th style="text-align:right;padding:4px 8px;font-weight:500;">Rev 30d</th>
                                     <th style="text-align:right;padding:4px 8px;font-weight:500;">Rev Prior 30d</th>
@@ -5799,30 +5821,12 @@
                                     <th style="text-align:right;padding:4px 8px;font-weight:500;">Videos</th>
                                 </tr>
                             </thead>
+                            <tbody>${bodyRows}</tbody>
                         </table>
                     </td>
                 </tr>`;
 
-            let bodyHtml = '';
-            for (const p of (data.pairs || [])) {
-                const revColor = p.rev_30d > 0 ? '#4ade80' : '#64748b';
-                bodyHtml += `
-                    <tr class="pair-row-${kwId}" style="background:rgba(15,23,42,0.4);">
-                        <td colspan="12" style="padding:2px 12px 2px 40px;">
-                            <table style="width:100%;font-size:0.75rem;border-collapse:collapse;">
-                                <tr>
-                                    <td style="text-align:left;padding:3px 8px;color:#cbd5e1;">↳ ${escapeHtml(p.pair)}</td>
-                                    <td style="text-align:right;padding:3px 8px;color:${revColor};font-weight:600;width:12%;">${fmtMoney(p.rev_30d)}</td>
-                                    <td style="text-align:right;padding:3px 8px;color:#94a3b8;width:12%;">${fmtMoney(p.rev_prior_30d)}</td>
-                                    <td style="text-align:right;padding:3px 8px;color:#94a3b8;width:12%;">${fmtMoney(p.lifetime_rev)}</td>
-                                    <td style="text-align:right;padding:3px 8px;color:#94a3b8;width:10%;">${p.video_count}</td>
-                                </tr>
-                            </table>
-                        </td>
-                    </tr>`;
-            }
-
-            anchor.insertAdjacentHTML('afterend', headerHtml + bodyHtml);
+            anchor.insertAdjacentHTML('afterend', headerHtml);
             el.textContent = 'Pairs ▾';
         }
 
