@@ -5604,9 +5604,15 @@
 
                 const newBadge = k.isNew ? ' <span style="background:#facc15;color:#1e1b4b;padding:1px 6px;border-radius:4px;font-size:0.6rem;font-weight:700;margin-left:4px;">NEW</span>' : '';
 
+                const sumKwId = 'sum_' + k.keyword.replace(/[^a-z0-9]/gi, '_');
+                const sumHasPairs = countVsBrands(k.keyword) >= 3;
+                const sumPairChip = sumHasPairs
+                    ? `<span class="pair-chip" style="cursor:pointer;margin-left:8px;font-size:0.65rem;font-weight:600;background:rgba(59,130,246,0.15);color:#60a5fa;padding:2px 8px;border-radius:10px;border:1px solid rgba(59,130,246,0.3);" onclick="event.stopPropagation();togglePairs('${sumKwId}','${escapeHtml(k.keyword).replace(/'/g, "\\'")}',this)">Pairs ▸</span>`
+                    : '';
+
                 rows += `<tr${k.isNew ? ' style="background:rgba(250,204,21,0.05);"' : ''}>
                     <td class="keyword-cell">
-                        <span style="cursor:pointer;border-bottom:1px dashed #64748b;" onclick="showKeywordHistory('${escapeHtml(k.keyword).replace(/'/g, "\\'")}')">${escapeHtml(k.keyword)}</span>${newBadge}
+                        <span style="cursor:pointer;border-bottom:1px dashed #64748b;" onclick="showKeywordHistory('${escapeHtml(k.keyword).replace(/'/g, "\\'")}')">${escapeHtml(k.keyword)}</span>${newBadge}${sumPairChip}
                     </td>
                     <td><span style="background:${siloColor}22;color:${siloColor};padding:2px 8px;border-radius:10px;font-size:0.7rem;font-weight:600;">${siloLabel}</span></td>
                     <td class="number-cell" style="color:#4ade80;font-weight:600;">${k.isNew ? '<span style="color:#64748b;font-size:0.75rem;">-</span>' : '$' + k.revenue.toLocaleString()}</td>
@@ -5779,7 +5785,7 @@
             const fmtMoney = n => '$' + (Number(n) || 0).toLocaleString(undefined, {maximumFractionDigits: 0});
             const headerHtml = `
                 <tr class="pair-row-${kwId}" style="background:rgba(59,130,246,0.08);">
-                    <td colspan="9" style="padding:8px 12px 4px 40px;">
+                    <td colspan="12" style="padding:8px 12px 4px 40px;">
                         <div style="font-size:0.7rem;color:#60a5fa;font-weight:600;margin-bottom:4px;letter-spacing:0.5px;">
                             PAIRWISE BREAKDOWN · ${data.pair_count} pairs · period ${data.period_date}
                         </div>
@@ -5802,7 +5808,7 @@
                 const revColor = p.rev_30d > 0 ? '#4ade80' : '#64748b';
                 bodyHtml += `
                     <tr class="pair-row-${kwId}" style="background:rgba(15,23,42,0.4);">
-                        <td colspan="9" style="padding:2px 12px 2px 40px;">
+                        <td colspan="12" style="padding:2px 12px 2px 40px;">
                             <table style="width:100%;font-size:0.75rem;border-collapse:collapse;">
                                 <tr>
                                     <td style="text-align:left;padding:3px 8px;color:#cbd5e1;">↳ ${escapeHtml(p.pair)}</td>
