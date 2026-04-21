@@ -6261,6 +6261,254 @@ def fetch_daily_revenue_history_from_bq(keyword, days=90):
 
 
 # ============================================
+# PAIRWISE "VS" KEYWORD ATTRIBUTION
+# ============================================
+# Splits a multi-brand compound keyword like "aura vs incogni vs deleteme vs optery"
+# into its C(n,2) pair combinations and attributes per-pair revenue from BQ.
+# Ported from banyan-tree-ai-era/src/data/pairwise-keywords-v2.ts.
+
+BQ_PAIRWISE_SRC = "`company-wide-370010.1_Daily_Metrics_Dump.Daily_ALL_Time_Revenue_and_Traffic`"
+
+BRAND_ALIASES_PAIRWISE = {
+    "Aura": "aura", "Aura Inc": "aura",
+    "Incogni": "incogni", "Incogni Influencers": "incogni",
+    "Incogni Influencers Revenue Share": "incogni", "Incogni CPA (L)": "incogni",
+    "DeleteMe": "deleteme",
+    "Optery": "optery",
+    "LifeLock Identity Theft Services": "lifelock", "LifeLock": "lifelock",
+    "SpotOn Virtual Fence": "spoton",
+    "SpotOn GPS Fence - Amazon Affiliate Program": "spoton",
+    "Halo Collar": "halo",
+    "Bark Parental Controls": "bark",
+    "Qustodio": "qustodio",
+    "NordProtect Revenue Share": "nordprotect",
+    "NordProtect Influencers CPA 200": "nordprotect", "NordProtect": "nordprotect",
+    "Gusto": "gusto",
+    "Bizee.com": "bizee", "Bizee": "bizee",
+}
+
+BRAND_TOKEN_MAP_PAIRWISE = {
+    "aura": "aura", "incogni": "incogni",
+    "deleteme": "deleteme", "delete me": "deleteme",
+    "optery": "optery",
+    "lifelock": "lifelock", "life lock": "lifelock",
+    "spoton": "spoton", "spot on": "spoton", "spoton virtual fence": "spoton",
+    "halo": "halo", "halo collar": "halo",
+    "bark": "bark", "bark technologies": "bark",
+    "qustodio": "qustodio", "guardio": "guardio",
+    "nordprotect": "nordprotect", "nord protect": "nordprotect",
+    "gusto": "gusto",
+    "bizee": "bizee", "bizee.com": "bizee",
+}
+
+def parse_keyword_brands(kw):
+    import re
+    parts = [p.strip() for p in re.split(r'\s+vs\s+', kw or '') if p.strip()]
+    brands = []
+    for part in parts:
+        if part in BRAND_TOKEN_MAP_PAIRWISE:
+            brands.append(BRAND_TOKEN_MAP_PAIRWISE[part])
+            continue
+        matched = None
+        for token, slug in BRAND_TOKEN_MAP_PAIRWISE.items():
+            if re.search(rf'\b{re.escape(token)}\b', part):
+                matched = slug
+                break
+        if matched:
+            brands.append(matched)
+    seen = set()
+    out = []
+    for b in brands:
+        if b not in seen:
+            seen.add(b)
+            out.append(b)
+    return out
+
+def canonical_pair(a, b):
+    ba, bb = sorted([a, b])
+    return f"{ba} vs {bb}", ba, bb
+
+def all_pairs(brands):
+    from itertools import combinations
+    return [canonical_pair(a, b) for a, b in combinations(brands, 2)]
+
+def pairs_containing_brand(brands, brand):
+    return [p for p in all_pairs(brands) if p[1] == brand or p[2] == brand]
+
+_pairwise_cache = {'data': None, 'timestamp': None}
+PAIRWISE_CACHE_TTL = 1800  # 30 min
+
+def _build_pairwise_sql():
+    rows = []
+    for aff, brand in BRAND_ALIASES_PAIRWISE.items():
+        aff_esc = aff.replace("\\", "\\\\").replace("'", "\\'")
+        rows.append(f"STRUCT('{aff_esc}' AS affiliate, '{brand}' AS brand)")
+    brand_map_cte = "brand_map AS (SELECT * FROM UNNEST([" + ", ".join(rows) + "]))"
+    return f"""
+WITH {brand_map_cte}
+SELECT
+  r.URL_ID,
+  ANY_VALUE(r.Title) AS title,
+  LOWER(TRIM(r.Main_KW)) AS main_kw,
+  r.Affiliate,
+  ANY_VALUE(b.brand) AS affiliate_brand,
+  SUM(IF(r.Date >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
+         AND r.Date <= CURRENT_DATE(),
+         r.Daily_Revenue, 0)) AS rev_30d,
+  SUM(IF(r.Date >= DATE_SUB(CURRENT_DATE(), INTERVAL 60 DAY)
+         AND r.Date <  DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY),
+         r.Daily_Revenue, 0)) AS rev_prior_30d,
+  SUM(r.Daily_Revenue) AS lifetime_rev
+FROM {BQ_PAIRWISE_SRC} r
+LEFT JOIN brand_map b ON b.affiliate = r.Affiliate
+WHERE (LOWER(r.Main_KW) LIKE '% vs %' OR LOWER(r.Title) LIKE '% vs %')
+  AND r.URL_ID IS NOT NULL
+GROUP BY r.URL_ID, main_kw, r.Affiliate
+HAVING rev_30d > 0 OR rev_prior_30d > 0 OR lifetime_rev > 0
+"""
+
+def compute_pairwise_attribution():
+    """Returns dict[pair_key] -> {brand_a, brand_b, rev_30d, rev_prior_30d, lifetime_rev, video_count}.
+
+    Attribution: 2-brand rows → 100% to the canonical pair. 3+ brand rows → split
+    equally across the pairs containing that row's affiliate brand (unmapped
+    affiliates dropped as unattributed). Matches the banyan-tree attributeV2 logic.
+    """
+    global _pairwise_cache
+    now = datetime.now()
+    if _pairwise_cache['data'] is not None and _pairwise_cache['timestamp']:
+        age = (now - _pairwise_cache['timestamp']).total_seconds()
+        if age < PAIRWISE_CACHE_TTL:
+            return _pairwise_cache['data']
+
+    client = get_bq_client()
+    if not client:
+        print("[BQ] No BigQuery client for pairwise query")
+        return _pairwise_cache.get('data') or {}
+
+    try:
+        bq_rows = list(client.query(_build_pairwise_sql()).result())
+    except Exception as e:
+        print(f"[BQ] Error fetching pairwise data: {e}")
+        return _pairwise_cache.get('data') or {}
+
+    pairs = {}
+    kw_brand_cache = {}
+
+    def _cached_parse(kw):
+        if kw not in kw_brand_cache:
+            kw_brand_cache[kw] = parse_keyword_brands(kw)
+        return kw_brand_cache[kw]
+
+    def _add_to_pair(key, brand_a, brand_b, url_id, src, share):
+        p = pairs.get(key)
+        if p is None:
+            p = {'brand_a': brand_a, 'brand_b': brand_b,
+                 'rev_30d': 0.0, 'rev_prior_30d': 0.0, 'lifetime_rev': 0.0,
+                 'urls': set()}
+            pairs[key] = p
+        p['rev_30d'] += src['rev_30d'] * share
+        p['rev_prior_30d'] += src['rev_prior_30d'] * share
+        p['lifetime_rev'] += src['lifetime_rev'] * share
+        p['urls'].add(url_id)
+
+    for row in bq_rows:
+        url_id = row.URL_ID
+        if not url_id:
+            continue
+        kw = (row.main_kw or '').lower()
+        title_lower = (row.title or '').lower()
+        kw_has_vs = ' vs ' in kw
+        title_has_vs = ' vs ' in title_lower
+        if not kw_has_vs and not title_has_vs:
+            continue
+
+        mapped_kw = _cached_parse(kw) if kw else []
+        mapped_title = _cached_parse(title_lower) if title_has_vs else []
+        mapped = []
+        seen = set()
+        for b in list(mapped_kw) + list(mapped_title):
+            if b not in seen:
+                seen.add(b)
+                mapped.append(b)
+
+        src = {
+            'rev_30d': float(row.rev_30d or 0),
+            'rev_prior_30d': float(row.rev_prior_30d or 0),
+            'lifetime_rev': float(row.lifetime_rev or 0),
+        }
+        if src['rev_30d'] == 0 and src['rev_prior_30d'] == 0 and src['lifetime_rev'] == 0:
+            continue
+
+        aff_brand = row.affiliate_brand
+
+        if len(mapped) == 2:
+            key, ba, bb = canonical_pair(mapped[0], mapped[1])
+            _add_to_pair(key, ba, bb, url_id, src, 1.0)
+        elif len(mapped) >= 3:
+            if not aff_brand or aff_brand not in mapped:
+                continue  # unattributed
+            containing = pairs_containing_brand(mapped, aff_brand)
+            if containing:
+                share = 1.0 / len(containing)
+                for key, ba, bb in containing:
+                    _add_to_pair(key, ba, bb, url_id, src, share)
+
+    result = {}
+    for key, p in pairs.items():
+        result[key] = {
+            'brand_a': p['brand_a'],
+            'brand_b': p['brand_b'],
+            'rev_30d': round(p['rev_30d'], 2),
+            'rev_prior_30d': round(p['rev_prior_30d'], 2),
+            'lifetime_rev': round(p['lifetime_rev'], 2),
+            'video_count': len(p['urls']),
+        }
+
+    _pairwise_cache['data'] = result
+    _pairwise_cache['timestamp'] = now
+    print(f"[BQ] Cached pairwise attribution: {len(result)} pairs from {len(bq_rows)} rows")
+    return result
+
+
+@app.route('/api/domination/pairwise')
+def api_domination_pairwise():
+    """Return the pairwise breakdown for a compound 'vs' keyword."""
+    from datetime import date
+    keyword = (request.args.get('keyword') or '').strip().lower()
+    if not keyword:
+        return jsonify({'error': 'keyword required'}), 400
+    brands = parse_keyword_brands(keyword)
+    if len(brands) < 2:
+        return jsonify({'error': 'could not parse 2+ mapped brands from keyword',
+                        'keyword': keyword, 'brands': brands}), 400
+
+    attr = compute_pairwise_attribution()
+    period_date = date.today().isoformat()
+    pair_rows = []
+    for key, ba, bb in all_pairs(brands):
+        row = attr.get(key)
+        pair_rows.append({
+            'pair': key,
+            'brand_a': ba,
+            'brand_b': bb,
+            'rev_30d': (row or {}).get('rev_30d', 0),
+            'rev_prior_30d': (row or {}).get('rev_prior_30d', 0),
+            'lifetime_rev': (row or {}).get('lifetime_rev', 0),
+            'video_count': (row or {}).get('video_count', 0),
+            'period_date': period_date,
+        })
+    pair_rows.sort(key=lambda r: (-r['rev_30d'], -r['lifetime_rev']))
+    return jsonify({
+        'keyword': keyword,
+        'brands': brands,
+        'pair_count': len(pair_rows),
+        'period_date': period_date,
+        'pairs': pair_rows,
+    })
+
+
+# ============================================
 # PRIORITY KEYWORD MANAGEMENT ENDPOINTS
 # ============================================
 
